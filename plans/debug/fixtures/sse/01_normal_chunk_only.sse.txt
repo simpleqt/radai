@@ -1,0 +1,4 @@
+data: {"type": "chunk", "content": "你好"}
+
+data: [DONE]
+

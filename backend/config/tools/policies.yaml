@@ -1,0 +1,66 @@
+policies:
+  ne_default:
+    include:
+      - multi_kb_search
+      - chat_file_search
+      - web_search
+    include_when_skill_selected:
+      academic-search:
+        - academic_search
+      html-ppt:
+        - generate_html_ppt
+      general-table-analysis:
+        - excel_data_analysis
+        - inspect_excel_data
+        - query_excel_data
+        - summarize_excel_data
+        - visualize_excel_data
+      excel-experiment-analysis:
+        - list_experiment_datasets
+        - inspect_excel_data
+        - query_excel_data
+        - summarize_excel_data
+        - visualize_excel_data
+      deep-research:
+        - save_deep_research_report
+    exclude: []
+
+  csh_default:
+    include:
+      - multi_kb_search
+      - chat_file_search
+      - web_search
+    include_when_skill_selected:
+      academic-search:
+        - academic_search
+      html-ppt:
+        - generate_html_ppt
+      general-table-analysis:
+        - excel_data_analysis
+        - inspect_excel_data
+        - query_excel_data
+        - summarize_excel_data
+        - visualize_excel_data
+      excel-experiment-analysis:
+        - list_experiment_datasets
+        - inspect_excel_data
+        - query_excel_data
+        - summarize_excel_data
+        - visualize_excel_data
+      deep-research:
+        - save_deep_research_report
+    exclude: []
+
+  groundwater_default:
+    include:
+      - multi_kb_search
+      - chat_file_search
+      - web_search
+      - groundwater_project_skill_read
+      - inspect_project_tables
+      - query_project_tables
+      - summarize_project_table
+      - groundwater_prediction
+      - groundwater_quality_check
+    include_when_skill_selected: {}
+    exclude: []

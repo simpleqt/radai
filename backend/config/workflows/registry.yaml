@@ -1,0 +1,63 @@
+workflows:
+  lightweight:
+    provider: backend.application.agent_workflows.factories:create_standard_workflow
+    aliases:
+      - lightweight
+    capabilities:
+      - lightweight
+    full_capability: false
+    subagent_enabled: false
+
+  full:
+    provider: backend.application.agent_workflows.factories:create_standard_workflow
+    aliases:
+      - full
+    capabilities:
+      - full
+    full_capability: true
+    subagent_enabled: false
+
+  deep_research:
+    provider: backend.application.agent_workflows.factories:create_coordinated_workflow
+    aliases:
+      - deep-research
+      - deep_research
+    capabilities:
+      - deep_research
+      - plan_solve
+      - full
+    full_capability: true
+    subagent_enabled: true
+
+  plan_solve:
+    provider: backend.application.agent_workflows.factories:create_coordinated_workflow
+    aliases:
+      - plan-solve
+      - plan_solve
+    capabilities:
+      - plan_solve
+      - full
+    full_capability: true
+    subagent_enabled: true
+
+  multi_agent_parallel:
+    provider: backend.application.agent_workflows.factories:create_coordinated_workflow
+    aliases:
+      - multi-agent-parallel
+      - multi_agent_parallel
+    capabilities:
+      - multi_agent_parallel
+      - full
+    full_capability: true
+    subagent_enabled: true
+
+  multi_agent_alternating:
+    provider: backend.application.agent_workflows.factories:create_coordinated_workflow
+    aliases:
+      - multi-agent-alternating
+      - multi_agent_alternating
+    capabilities:
+      - multi_agent_alternating
+      - full
+    full_capability: true
+    subagent_enabled: true

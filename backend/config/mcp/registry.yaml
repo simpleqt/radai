@@ -1,0 +1,15 @@
+services:
+  default:
+    name: 智能体知识库 MCP 服务
+    instructions: |
+      智能体知识库 MCP 服务
+
+      该服务通过平台 Agent Runtime 查询配置绑定的智能体。
+      更换行业智能体时，修改本配置中的 agent_code/workflow 即可。
+    agent_code: ne
+    workflow: full
+    user_id: mcp
+    use_search: true
+    thinking_enabled: false
+    tool_name: query_knowledge_base
+    tool_description: 查询配置绑定智能体的知识库并返回回答

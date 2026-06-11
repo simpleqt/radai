@@ -1,0 +1,6 @@
+data: {"type": "status", "content": "检索中"}
+
+data: {"type": "status", "status": "草案已生成"}
+
+data: [DONE]
+

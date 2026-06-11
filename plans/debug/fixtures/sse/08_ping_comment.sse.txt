@@ -1,0 +1,6 @@
+: ping 1710000000000
+
+data: {"type": "chunk", "content": "x"}
+
+data: [DONE]
+

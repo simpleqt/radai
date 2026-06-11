@@ -1,0 +1,1 @@
+"""Suggestion generation application resources."""

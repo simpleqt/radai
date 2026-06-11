@@ -1,0 +1,162 @@
+tools:
+  multi_kb_search:
+    provider: backend.application.tools.providers.multi_kb_search_tool:multi_kb_search_tool
+    description: 搜索当前请求范围内的知识库并返回证据片段
+    domains: [nuclear-electronics, csh-hydrogeology, groundwater-project-analysis]
+    workflows: [lightweight, full, deep_research, plan_solve]
+    required_skills: []
+    risk_level: safe
+    enabled_by_default: true
+
+  chat_file_search:
+    provider: backend.application.tools.providers.chat_file_search_tool:create_scoped_chat_file_search_tool
+    description: 检索当前会话上传的长文档索引
+    domains: [nuclear-electronics, csh-hydrogeology, groundwater-project-analysis]
+    workflows: [lightweight, full, deep_research, plan_solve]
+    required_skills: []
+    risk_level: safe
+    enabled_by_default: true
+
+  web_search:
+    provider: backend.application.tools.providers.async_web_search_tool:get_async_web_search_tool
+    description: 联网搜索公开网页信息
+    domains: [nuclear-electronics, csh-hydrogeology, groundwater-project-analysis]
+    workflows: [full, deep_research, plan_solve]
+    required_skills: []
+    risk_level: network
+    enabled_by_default: false
+
+  academic_search:
+    provider: backend.application.tools.providers.academic_search_tool:academic_search
+    description: 学术检索工具
+    domains: [nuclear-electronics, csh-hydrogeology]
+    workflows: [full, deep_research, plan_solve]
+    required_skills: [academic-search]
+    risk_level: network
+    enabled_by_default: false
+
+  generate_html_ppt:
+    provider: backend.application.tools.providers.html_ppt_tool:generate_html_ppt_tool
+    description: 生成 HTML/PPT 风格演示产物
+    domains: [nuclear-electronics, csh-hydrogeology]
+    workflows: [full, deep_research]
+    required_skills: [html-ppt]
+    risk_level: write
+    enabled_by_default: false
+
+  excel_data_analysis:
+    provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
+    description: Excel 实验数据分析工具集
+    domains: [nuclear-electronics, csh-hydrogeology]
+    workflows: [full, deep_research]
+    required_skills: [general-table-analysis, excel-experiment-analysis]
+    risk_level: safe
+    enabled_by_default: false
+
+  list_experiment_datasets:
+    provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
+    description: 列出可用实验数据集
+    domains: [nuclear-electronics, csh-hydrogeology]
+    workflows: [full, deep_research]
+    required_skills: [general-table-analysis, excel-experiment-analysis]
+    risk_level: safe
+    enabled_by_default: false
+
+  inspect_excel_data:
+    provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
+    description: 查看 Excel 数据结构和字段信息
+    domains: [nuclear-electronics, csh-hydrogeology]
+    workflows: [full, deep_research]
+    required_skills: [general-table-analysis, excel-experiment-analysis]
+    risk_level: safe
+    enabled_by_default: false
+
+  query_excel_data:
+    provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
+    description: 使用 SQL 查询 Excel 数据
+    domains: [nuclear-electronics, csh-hydrogeology]
+    workflows: [full, deep_research]
+    required_skills: [general-table-analysis, excel-experiment-analysis]
+    risk_level: safe
+    enabled_by_default: false
+
+  summarize_excel_data:
+    provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
+    description: 汇总分析 Excel 数据
+    domains: [nuclear-electronics, csh-hydrogeology]
+    workflows: [full, deep_research]
+    required_skills: [general-table-analysis, excel-experiment-analysis]
+    risk_level: safe
+    enabled_by_default: false
+
+  visualize_excel_data:
+    provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
+    description: 生成 Excel 数据可视化图表
+    domains: [nuclear-electronics, csh-hydrogeology]
+    workflows: [full, deep_research]
+    required_skills: [general-table-analysis, excel-experiment-analysis]
+    risk_level: safe
+    enabled_by_default: false
+
+  save_deep_research_report:
+    provider: backend.application.tools.providers.deep_research_report_tool:save_deep_research_report_tool
+    description: 保存深度研究报告工件
+    domains: [nuclear-electronics, csh-hydrogeology]
+    workflows: [deep_research, plan_solve]
+    required_skills: [deep-research]
+    risk_level: write
+    enabled_by_default: false
+
+  groundwater_project_skill_read:
+    provider: backend.application.tools.providers.groundwater_project_tools:get_groundwater_project_skill_read_tool
+    description: 读取当前地下水项目的 Skill、清单、背景和标准化数据
+    domains: [groundwater-project-analysis]
+    workflows: [full]
+    required_skills: [groundwater-project-analysis]
+    risk_level: safe
+    enabled_by_default: true
+
+  inspect_project_tables:
+    provider: backend.application.tools.providers.project_table_tools:get_inspect_project_tables_tool
+    description: 查看当前授权项目的 DuckDB 表结构
+    domains: [groundwater-project-analysis]
+    workflows: [full]
+    required_skills: [groundwater-project-analysis]
+    risk_level: safe
+    enabled_by_default: true
+
+  query_project_tables:
+    provider: backend.application.tools.providers.project_table_tools:get_query_project_tables_tool
+    description: 使用只读 DuckDB SQL 查询当前授权项目表格
+    domains: [groundwater-project-analysis]
+    workflows: [full]
+    required_skills: [groundwater-project-analysis]
+    risk_level: safe
+    enabled_by_default: true
+
+  summarize_project_table:
+    provider: backend.application.tools.providers.project_table_tools:get_summarize_project_table_tool
+    description: 使用 DuckDB 检查当前项目表格总行数
+    domains: [groundwater-project-analysis]
+    workflows: [full]
+    required_skills: [groundwater-project-analysis]
+    risk_level: safe
+    enabled_by_default: true
+
+  groundwater_prediction:
+    provider: backend.application.tools.providers.groundwater_project_tools:get_groundwater_prediction_tool
+    description: 基于同坐标组邻近井进行新井深度和水位范围初步预测
+    domains: [groundwater-project-analysis]
+    workflows: [full]
+    required_skills: [groundwater-project-analysis]
+    risk_level: safe
+    enabled_by_default: true
+
+  groundwater_quality_check:
+    provider: backend.application.tools.providers.groundwater_project_tools:get_groundwater_quality_check_tool
+    description: 检查当前项目数据质量、坐标确认状态和疑似错误记录
+    domains: [groundwater-project-analysis]
+    workflows: [full]
+    required_skills: [groundwater-project-analysis]
+    risk_level: safe
+    enabled_by_default: true

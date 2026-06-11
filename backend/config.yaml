@@ -1,0 +1,58 @@
+# 后端模型与运行时配置（由应用统一加载，供模型工厂与扩展解析使用）
+config_version: 6
+
+log_level: info
+
+token_usage:
+  enabled: false
+
+# ============================================================================
+# 模型配置
+# ============================================================================
+models:
+  - name: default-model
+    display_name: default-model
+    use: langchain_openai:ChatOpenAI
+    model: default-model
+    api_key: $LLM_API_KEY
+    base_url: $LLM_API_BASE
+    request_timeout: 600.0
+    max_retries: 2
+    max_tokens: 4096
+    max_input_tokens: 65536
+    temperature: 0.1
+    supports_vision: true
+    supports_thinking: false
+
+tool_groups: []
+
+tools: []
+
+skills:
+  path: backend/skills
+
+title:
+  enabled: true
+  max_words: 6
+  max_chars: 60
+  model_name: null
+
+summarization:
+  enabled: false
+
+memory:
+  enabled: false
+  storage_path: memory.json
+  debounce_seconds: 30
+  model_name: null
+  max_facts: 100
+  fact_confidence_threshold: 0.7
+  injection_enabled: true
+  max_injection_tokens: 2000
+
+checkpointer:
+  type: sqlite
+  connection_string: app_checkpoints.db
+
+tool_search:
+  enabled: false

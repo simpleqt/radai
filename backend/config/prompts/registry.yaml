@@ -1,0 +1,19 @@
+prompt_profiles:
+  ne:
+    provider: backend.application.agents.prompt_templates.ne:build_system_prompt
+    aliases:
+      - ne
+      - nuclear-electronics
+
+  csh:
+    provider: backend.application.agents.prompt_templates.csh:build_system_prompt
+    aliases:
+      - csh
+      - csh-hydrogeology
+      - hydrogeology
+
+  groundwater:
+    provider: backend.application.agents.prompt_templates.groundwater:build_system_prompt
+    aliases:
+      - groundwater
+      - groundwater-project-analysis

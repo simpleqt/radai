@@ -1,0 +1,26 @@
+# 包含所有核心依赖
+-r requirements.txt
+
+# 测试框架
+pytest>=9.0.0
+pytest-asyncio>=1.3.0
+pytest-cov>=7.0.0
+pytest-mock>=3.12.0
+
+# 代码格式化
+black>=25.11.0
+isort>=5.13.0
+
+# 代码检查
+flake8>=7.3.0
+mypy>=1.19.0
+pre-commit>=3.6.0
+
+# 类型检查
+types-requests>=2.31.0
+types-aiofiles>=23.2.0
+
+# 文档生成
+mkdocs>=1.5.0
+mkdocs-material>=9.5.0
+mkdocstrings[python]>=0.24.0

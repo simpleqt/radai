@@ -1,0 +1,22 @@
+code: ne
+name: 核电子学智能助手
+domain: nuclear-electronics
+description: 面向核电子学领域的专业问答、检索和研究智能体
+default_model: null
+default_kb_ids: []
+default_skills:
+  - nuclear-electronics
+  - general-table-analysis
+default_workflow: lightweight
+allowed_workflows:
+  - lightweight
+  - full
+  - deep_research
+  - plan_solve
+  - multi_agent_parallel
+  - multi_agent_alternating
+prompt_profile: ne
+tool_policy: ne_default
+kb_policy: bound_or_selected
+guardrail_policy: ne_domain_scope
+ui_profile: ne

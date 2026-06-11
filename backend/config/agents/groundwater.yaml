@@ -1,0 +1,17 @@
+code: groundwater
+name: 地下水项目分析助手
+domain: groundwater-project-analysis
+description: 面向地下水项目资料、钻井数据、质量检查和新井预测的专业分析助手
+default_model: null
+default_kb_ids: []
+default_skills:
+  - groundwater-project-analysis
+default_workflow: full
+allowed_workflows:
+  - full
+prompt_profile: groundwater
+tool_policy: groundwater_default
+kb_policy: bound_or_selected
+guardrail_policy: groundwater_project_scope
+ui_profile: groundwater
+domain_context_provider: backend.application.groundwater.runtime_context:resolve_groundwater_domain_context

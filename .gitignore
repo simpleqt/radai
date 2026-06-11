@@ -1,0 +1,139 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+*.venv
+venv314/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+eval/datasets/paper_kb/eval_llm.env
+
+# 日志
+*.log
+*.zip
+logs/
+backend/logs/
+*.log.*
+nohup.out
+
+# 数据库
+*.db
+*.sqlite
+*.sqlite3
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+node_modules/
+frontend\ copy/
+deer-flow-main/
+.roo/
+*.pdf
+backend/scripts/certs/
+优化*.md
+结果.txt
+计划.md
+
+# 数据存储
+data/
+data/documents/
+data/results/
+data/cache/
+data/uploads_temp/
+
+# 本地计划与项目副本（用户要求排除）
+# plans/
+
+# MinIO
+minio_data/
+
+# Kafka
+kafka_logs/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+.directory
+
+# 文档生成
+site/
+docs/_build/
+
+# 缓存
+.cache/
+.mypy_cache/
+.ruff_cache/
+.black_cache/
+
+# 部署
+.docker/
+*.tar.gz
+*.zip
+backend/scripts/
+
+# 忽略代理目录（本地敏感或代理配置）
+代理/
+CAS对接资料/
+eval/
+.github/
+.trae/
+成都理工大学2026证书/
+六塘项目数据信息/

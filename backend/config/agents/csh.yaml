@@ -1,0 +1,22 @@
+code: csh
+name: 成理水文地质智学助手
+domain: csh-hydrogeology
+description: 面向污染场地、水文地质与地下水修复的专业智能体
+default_model: null
+default_kb_ids: []
+default_skills:
+  - csh-hydrogeology
+  - general-table-analysis
+default_workflow: lightweight
+allowed_workflows:
+  - lightweight
+  - full
+  - deep_research
+  - plan_solve
+  - multi_agent_parallel
+  - multi_agent_alternating
+prompt_profile: csh
+tool_policy: csh_default
+kb_policy: bound_or_selected
+guardrail_policy: csh_domain_scope
+ui_profile: csh

@@ -1,0 +1,6 @@
+data: {"type": "draft_chunk", "content": "## 维度1\n"}
+
+data: {"type": "event", "event": {"kind": "research_draft_created", "metadata": {"draft_id": "d1", "plan_content": {"outline_text": "## 维度1\n"}}}}
+
+data: [DONE]
+

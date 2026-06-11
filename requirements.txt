@@ -1,0 +1,84 @@
+# 核心依赖
+fastapi>=0.121.0
+uvicorn[standard]>=0.38.0
+python-multipart>=0.0.6
+
+# LangChain 生态系统
+langchain>=1.1.0
+langchain-core>=1.1.0
+langchain-openai>=1.1.0
+langchain-deepseek>=1.0.0
+langchain-community>=0.4.0
+langchain-text-splitters>=1.0.0
+
+# LangGraph 工作流编排
+langgraph>=1.0.0
+langgraph-checkpoint>=3.0.0
+langgraph-checkpoint-sqlite>=3.0.0
+langgraph-checkpoint-redis>=0.4.0
+langchain-mcp-adapters==0.2.2
+lightrag-hku==1.4.13
+
+# MCP / SSE 服务
+fastmcp==3.2.0
+mcp==1.27.0
+
+# 数据验证
+pydantic>=2.12.0
+pydantic-settings>=2.12.0
+pydantic-extra-types>=2.10.0
+# 密码哈希
+werkzeug>=3.0.0
+# 数据库
+sqlalchemy>=2.0.0
+aiomysql>=0.3.0
+pymysql>=1.1.0
+redis==7.1.0
+pymilvus==2.6.11
+
+# 消息队列
+aiokafka>=0.12.0
+kafka-python>=2.3.0
+
+# 对象存储
+minio>=7.2.0
+
+# HTTP 客户端
+httpx>=0.28.0
+httpx-retries>=0.4.0
+
+# 日志
+loguru>=0.7.0
+
+# 工具库
+python-dotenv>=1.0.0
+aiofiles>=23.0.0
+tenacity>=8.2.0
+orjson>=3.9.0
+ddgs==9.2.3
+agent-sandbox>=0.3.0
+
+# 图像处理
+pillow>=10.0.0
+
+# 图计算和数值计算
+networkx>=3.0
+numpy>=1.21.0
+scipy>=1.15.0
+
+# 文档处理
+python-docx>=1.1.0
+pypandoc_binary>=1.13
+pypdf>=4.0.0
+markdown>=3.5.0
+markdownify>=1.2.0
+readabilipy>=0.3.0
+
+# 向量数据库
+faiss-cpu>=1.7.0
+
+# 图数据库
+nebula3-python>=3.8.0
+
+# 监控
+prometheus-fastapi-instrumentator>=7.1.0

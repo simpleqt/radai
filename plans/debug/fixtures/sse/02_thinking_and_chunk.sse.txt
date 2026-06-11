@@ -1,0 +1,6 @@
+data: {"type": "thinking", "content": "推理片段"}
+
+data: {"type": "chunk", "content": "答案"}
+
+data: [DONE]
+

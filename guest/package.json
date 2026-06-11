@@ -1,0 +1,24 @@
+{
+  "name": "guest-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 8085",
+    "build": "vite build",
+    "preview": "vite preview --port 8085"
+  },
+  "dependencies": {
+    "dompurify": "^3.3.3",
+    "katex": "^0.16.45",
+    "lucide-vue-next": "^1.0.0",
+    "marked": "^17.0.6",
+    "vue": "^3.5.32"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.2",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "tailwindcss": "^4.2.2",
+    "vite": "^5.4.21"
+  }
+}

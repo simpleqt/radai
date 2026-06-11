@@ -1,0 +1,69 @@
+@import "tailwindcss";
+@source "../../frontend/src";
+@import "katex/dist/katex.min.css";
+
+@theme {
+  --color-primary: #3b82f6;
+  --color-primary-foreground: #ffffff;
+  --font-family-sans: 'Inter', 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+@layer base {
+  :root {
+    --radius: 0.75rem;
+    --background: #f8fafc;
+    --foreground: #0f172a;
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    margin: 0;
+  }
+
+  ::-webkit-scrollbar {
+    @apply w-1.5 h-1.5;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-slate-300 dark:bg-slate-700 rounded-full hover:bg-slate-400;
+  }
+
+  .fade-enter-active, .fade-leave-active {
+    @apply transition-opacity duration-300;
+  }
+  .fade-enter-from, .fade-leave-to {
+    @apply opacity-0;
+  }
+}
+
+@layer components {
+  .prose {
+    @apply max-w-none leading-relaxed text-slate-700 dark:text-slate-300;
+  }
+  .prose h1, .prose h2, .prose h3 {
+    @apply font-bold text-slate-900 dark:text-slate-100 mt-6 mb-4 tracking-tight;
+  }
+  .prose p {
+    @apply mb-4;
+  }
+  .prose code {
+    @apply bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded text-sm font-mono text-indigo-600 dark:text-indigo-400;
+  }
+  .prose pre {
+    @apply bg-slate-900 text-slate-100 p-4 rounded-xl my-4 overflow-x-auto;
+  }
+  .prose pre code {
+    @apply bg-transparent p-0 text-slate-100;
+  }
+}
+
+#app {
+  min-height: 100vh;
+  width: 100vw;
+  margin: 0;
+  padding: 0;
+  background-color: var(--color-background);
+}
