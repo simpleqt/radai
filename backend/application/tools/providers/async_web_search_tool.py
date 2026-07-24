@@ -1,105 +1,227 @@
-"""异步 Web 搜索工具 - 必应中国国内搜索
+"""异步 Web 搜索工具。
 
-通过 ddgs 调用必应（backend=bing, region=cn-zh）。
+搜索词由调用该工具的智能体自主决定；本模块只负责执行单次检索。
 """
 
 import asyncio
 import json
 import logging
+import os
 import re
+import threading
 from typing import Any
+from weakref import WeakKeyDictionary
 
+import httpx
 from langchain.tools import tool
 
 logger = logging.getLogger(__name__)
 
-BING_BACKEND = "bing"
-SEARCH_REGION = "cn-zh"
+SEARCH_PROVIDER = "firecrawl"
 DEFAULT_TIMEOUT = 20
 MAX_RESULTS = 5
+SEARCH_ATTEMPTS = 2
+FIRECRAWL_API_URL = os.getenv(
+    "FIRECRAWL_API_URL",
+    "http://127.0.0.1:3002",
+).strip()
+FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "").strip()
+FIRECRAWL_LOCATION = os.getenv("FIRECRAWL_SEARCH_LOCATION", "China").strip()
+FIRECRAWL_RESULT_CONTENT_CHARS = 4000
+FIRECRAWL_SEARCH_CONCURRENCY = 3
+MAX_SEARCH_QUERY_CHARS = 2000
+_SEARCH_LIMITERS_LOCK = threading.Lock()
+_SEARCH_LIMITERS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    dict[str, asyncio.Semaphore],
+] = WeakKeyDictionary()
+
+
+def _firecrawl_search_limiter() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    with _SEARCH_LIMITERS_LOCK:
+        loop_limiters = _SEARCH_LIMITERS.get(loop)
+        if loop_limiters is None:
+            loop_limiters = {}
+            _SEARCH_LIMITERS[loop] = loop_limiters
+        limiter = loop_limiters.get(SEARCH_PROVIDER)
+        if limiter is None:
+            limiter = asyncio.Semaphore(FIRECRAWL_SEARCH_CONCURRENCY)
+            loop_limiters[SEARCH_PROVIDER] = limiter
+        return limiter
 
 
 def _sanitize_search_query(query: str) -> str:
-    cleaned = re.sub(r"<runtime_current_time>[\s\S]*?</runtime_current_time>", "", query or "", flags=re.IGNORECASE)
-    cleaned = re.sub(r"<(?:think|thought)>[\s\S]*?</(?:think|thought)>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"<runtime_current_time>[\s\S]*?</runtime_current_time>",
+        "",
+        query or "",
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"<(?:think|thought)>[\s\S]*?</(?:think|thought)>",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     cleaned = re.sub(r"<(?:think|thought)>[\s\S]*$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", cleaned.strip())
-    cleaned = re.sub(r'["\'""'']', "", cleaned)
-    cleaned = re.sub(r"^(?:搜索词|检索词|query|search query)\s*[:：]\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'["\'“”‘’]', "", cleaned)
+    cleaned = re.sub(
+        r"^(?:搜索词|检索词|query|search query)\s*[:：]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     lines = [line.strip(" \t-:：") for line in cleaned.splitlines() if line.strip()]
     return (lines[-1] if lines else "").strip()
 
 
-async def _search_bing_async(
+def _firecrawl_search_endpoint() -> str:
+    base_url = FIRECRAWL_API_URL.rstrip("/")
+    if base_url.endswith("/v2"):
+        return f"{base_url}/search"
+    return f"{base_url}/v2/search"
+
+
+def _firecrawl_tbs(timelimit: str | None) -> str | None:
+    if timelimit in {"d", "w", "m", "y"}:
+        return f"qdr:{timelimit}"
+    return None
+
+
+async def _search_firecrawl_async(
+    query: str,
+    *,
+    max_results: int,
+    timeout: int,
+    timelimit: str | None,
+) -> list[dict[str, str]]:
+    """Search and scrape result pages through the configured Firecrawl service."""
+
+    payload: dict[str, Any] = {
+        "query": query,
+        "limit": max_results,
+        "scrapeOptions": {
+            "formats": ["markdown"],
+            "onlyMainContent": True,
+        },
+    }
+    if FIRECRAWL_LOCATION:
+        payload["location"] = FIRECRAWL_LOCATION
+    if tbs := _firecrawl_tbs(timelimit):
+        payload["tbs"] = tbs
+    headers = {"Content-Type": "application/json"}
+    if FIRECRAWL_API_KEY:
+        headers["Authorization"] = f"Bearer {FIRECRAWL_API_KEY}"
+
+    async with httpx.AsyncClient(timeout=timeout + 10, trust_env=True) as client:
+        response = await client.post(
+            _firecrawl_search_endpoint(),
+            json=payload,
+            headers=headers,
+        )
+    response.raise_for_status()
+    body = response.json()
+    data = body.get("data") if isinstance(body, dict) else None
+    if isinstance(data, dict):
+        raw_results = data.get("web") or []
+    elif isinstance(data, list):
+        raw_results = data
+    else:
+        raw_results = []
+    results: list[dict[str, str]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        content = str(item.get("markdown") or item.get("description") or "").strip()
+        results.append(
+            {
+                "title": str(item.get("title") or "").strip(),
+                "url": url,
+                "content": content[:FIRECRAWL_RESULT_CONTENT_CHARS],
+                "provider": "firecrawl",
+            }
+        )
+    return results
+
+
+async def _search_web_async(
     query: str,
     max_results: int = 5,
-    region: str = SEARCH_REGION,
-    safesearch: str = "moderate",
     timeout: int = DEFAULT_TIMEOUT,
-    timelimit: str | None = "y",
-) -> list[dict]:
-    """必应国内搜索（ddgs backend=bing, region=cn-zh）。"""
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        logger.error("ddgs library not installed. Run: pip install ddgs")
-        return []
+    timelimit: str | None = None,
+    *,
+    isolated: bool = False,
+) -> list[dict[str, str]]:
+    """Execute all general web discovery through the local Firecrawl service."""
 
-    def _sync_search():
-        ddgs = DDGS(timeout=timeout)
-        try:
-            results = ddgs.text(
-                query,
-                region=region,
-                safesearch=safesearch,
-                max_results=max_results,
-                backend=BING_BACKEND,
-                timelimit=timelimit,
-            )
-            return list(results) if results else []
-        except Exception as e:
-            logger.error("必应搜索失败: %s", e)
-            return []
-
-    try:
-        raw = await asyncio.wait_for(
-            asyncio.to_thread(_sync_search),
-            timeout=timeout + 5,
+    del isolated  # Compatibility argument; Firecrawl is already an isolated service.
+    if len(query) > MAX_SEARCH_QUERY_CHARS:
+        raise ValueError(
+            f"Search query exceeds the {MAX_SEARCH_QUERY_CHARS}-character limit"
         )
-    except asyncio.TimeoutError:
-        logger.warning("必应搜索超时 (>%ss): %s", timeout, query)
-        return []
-    except Exception as e:
-        logger.error("必应搜索异常: %s", e)
-        return []
-
-    return [
-        {
-            "title": r.get("title", ""),
-            "url": r.get("href", r.get("link", "")),
-            "content": r.get("body", r.get("snippet", "")),
-        }
-        for r in raw
-    ]
+    async with _firecrawl_search_limiter():
+        for attempt in range(1, SEARCH_ATTEMPTS + 1):
+            try:
+                results = await _search_firecrawl_async(
+                    query,
+                    max_results=max_results,
+                    timeout=timeout,
+                    timelimit=timelimit,
+                )
+                if results:
+                    return results
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Firecrawl 搜索失败(attempt=%s/%s): %s",
+                    attempt,
+                    SEARCH_ATTEMPTS,
+                    exc,
+                )
+    logger.warning("Firecrawl 两次尝试后仍无可用结果: %s", query)
+    return []
 
 
 async def execute_web_search(
     query: str,
     *,
     max_results: int = MAX_RESULTS,
-    timelimit: str | None = "y",
+    timelimit: str | None = None,
+    isolated: bool = False,
 ) -> str:
     """Execute web search for workflow orchestration without tool-call indirection."""
     sanitized_query = _sanitize_search_query(query)
     if not sanitized_query:
-        return json.dumps({"error": "Empty search query", "query": ""}, ensure_ascii=False)
+        return json.dumps(
+            {"error": "Empty search query", "query": ""}, ensure_ascii=False
+        )
+    if len(sanitized_query) > MAX_SEARCH_QUERY_CHARS:
+        return json.dumps(
+            {
+                "error": (
+                    f"Search query exceeds the {MAX_SEARCH_QUERY_CHARS}-character limit"
+                ),
+                "query": sanitized_query[:MAX_SEARCH_QUERY_CHARS],
+            },
+            ensure_ascii=False,
+        )
 
     bounded_results = max(1, min(max_results, MAX_RESULTS))
-    logger.info("[AsyncWebSearch] 编排层开始搜索: %s", sanitized_query)
-    results = await _search_bing_async(
+    logger.info(
+        "[AsyncWebSearch] 开始 Firecrawl 搜索: %s",
+        sanitized_query,
+    )
+    results = await _search_web_async(
         query=sanitized_query,
         max_results=bounded_results,
         timelimit=timelimit,
+        isolated=isolated,
     )
     if not results:
         return json.dumps(
@@ -109,7 +231,7 @@ async def execute_web_search(
     return json.dumps(
         {
             "query": sanitized_query,
-            "engine": "bing(cn-zh)",
+            "engine": SEARCH_PROVIDER,
             "total_results": len(results),
             "results": results,
         },
@@ -122,31 +244,53 @@ async def execute_web_search(
 async def async_web_search_tool(
     query: str,
     max_results: int = MAX_RESULTS,
-    timelimit: str | None = "y",
+    timelimit: str | None = None,
 ) -> str:
-    """Search the web for information. Use this tool to find current information, news, articles, and facts from the internet.
+    """Search the web for one focused intent, returning titles, URLs, and page evidence.
 
     Args:
-        query: Search keywords describing what you want to find. Be specific for better results. When asked for "latest" or recent information, ALWAYS include the current year (e.g., "2026") in the query string, do NOT use "2024" or "2025".
+        query: One focused search intent expressed with specific entities and constraints. For multi-part research, call this tool separately for each intent, inspect the returned snippets, and revise the next query when results are off-topic. When asked for current information, include the current year (2026) only when it improves the specific query.
         max_results: Maximum number of results to return. Default is 5.
-        timelimit: Time range limit for search. Options: 'd' (day), 'w' (week), 'm' (month), 'y' (year).
-                   Defaults to 'y' (recent year) if not specified.
+        timelimit: Optional time range limit. Options: 'd' (day), 'w' (week), 'm' (month), 'y' (year).
+                   Leave unset for comprehensive research; use a limit only when recency is part of the intent.
     """
-    from backend.core.tools.request_limits import consume_tool_budget
+    from backend.core.tools.request_limits import (
+        consume_tool_budget,
+        get_web_search_max_results,
+    )
 
     allowed, _remaining = consume_tool_budget("web_search")
     if not allowed:
         logger.warning("[AsyncWebSearch] 尝试调用被拦截，预算为0")
         return json.dumps(
-            {"error": f"⚠️ web_search 调用次数已达上限（剩余: {_remaining}）。请基于已有检索结果回答，或结束本轮对话。"},
+            {
+                "error": f"⚠️ web_search 调用次数已达上限（剩余: {_remaining}）。请基于已有检索结果回答，或结束本轮对话。"
+            },
             ensure_ascii=False,
         )
 
-    return await execute_web_search(
+    runtime_max_results = get_web_search_max_results()
+    if runtime_max_results is not None:
+        max_results = min(max_results, runtime_max_results)
+
+    result = await execute_web_search(
         query,
         max_results=max_results,
         timelimit=timelimit,
     )
+    if _remaining == 0:
+        try:
+            payload = json.loads(result)
+        except (TypeError, json.JSONDecodeError):
+            return result
+        if isinstance(payload, dict) and not payload.get("error"):
+            payload["retrieval_budget"] = {
+                "remaining": 0,
+                "exhausted": True,
+                "instruction": "停止继续检索，立即基于现有网页证据整理结论。",
+            }
+            return json.dumps(payload, indent=2, ensure_ascii=False)
+    return result
 
 
 def get_async_web_search_tool() -> Any:

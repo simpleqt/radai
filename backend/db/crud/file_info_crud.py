@@ -2,7 +2,7 @@
 
 from typing import List, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import Session
 
 from backend.db.models import FileInfo
@@ -34,6 +34,31 @@ class FileInfoCRUD:
         result = self.session.execute(stmt)
         return result.scalars().all()
 
+    def get_statistics(self) -> dict[str, int]:
+        """Count ingestion states in SQL without loading ORM rows."""
+        stmt = select(
+            func.count(FileInfo.task_id),
+            func.sum(case((FileInfo.parse_status == 1, 1), else_=0)),
+            func.sum(case((FileInfo.storage_status == 1, 1), else_=0)),
+            func.sum(
+                case(
+                    (
+                        (FileInfo.parse_status == 1)
+                        & (FileInfo.storage_status == 0),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+        )
+        total, parsed, stored, pending = self.session.execute(stmt).one()
+        return {
+            "total": int(total or 0),
+            "parsed": int(parsed or 0),
+            "stored": int(stored or 0),
+            "pending": int(pending or 0),
+        }
+
     def claim_pending_files(self, limit: int = 100) -> List[FileInfo]:
         """
         原子获取并认领待入库的文件列表
@@ -45,7 +70,7 @@ class FileInfoCRUD:
             .where(FileInfo.parse_status == 1)
             .where(FileInfo.storage_status == 0)
             .limit(limit)
-            .with_for_update(skip_locked=True)
+            .with_for_update()
         )
         files = self.session.execute(stmt).scalars().all()
         

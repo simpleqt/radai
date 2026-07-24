@@ -6,6 +6,7 @@ upload it to MinIO, and expose it as an artifact for UI rendering.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -27,9 +28,14 @@ from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml.ns import qn
 from docx.shared import Pt
 
+from backend.application.blocking import run_blocking
+from backend.application.tools.execution import invoke_sync_with_timeout
+from backend.application.tools.runtime_resolution import (
+    resolve_runtime_thread_id as _resolve_runtime_thread_id,
+)
 from backend.config.loggers import get_logger
 from backend.core.agents.state import ThreadState
-from backend.core.agents.thread_key import parse_internal_thread_key
+from backend.core.thread_key import parse_internal_thread_key
 from backend.core.config import get_paths
 from backend.storage import (
     get_user_minio_bucket_name,
@@ -270,7 +276,16 @@ def _render_report_docx_bytes(*, title: str, content: str) -> bytes:
             if shift_heading_level:
                 cmd.append("--shift-heading-level-by=-1")
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            pandoc_timeout = max(
+                1.0,
+                float(os.getenv("DEEP_RESEARCH_PANDOC_TIMEOUT_SECONDS", "45") or "45"),
+            )
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=pandoc_timeout,
+            )
             if result.returncode != 0:
                 raise RuntimeError(f"Pandoc conversion failed: {result.stderr.strip() or 'unknown error'}")
             return output_docx.read_bytes()
@@ -287,25 +302,6 @@ def _save_report_locally(*, thread_id: str, filename: str, content: bytes) -> Pa
     return output_path
 
 
-def _resolve_runtime_thread_id(runtime: ToolRuntime[ContextT, ThreadState]) -> str | None:
-    """Resolve internal thread_id from runtime context/config.
-
-    In some LangGraph executions, thread_id is placed under
-    runtime.config['configurable']['thread_id'] instead of runtime.context.
-    """
-    thread_id = runtime.context.get("thread_id") if runtime.context else None
-    if thread_id:
-        return str(thread_id)
-
-    config = getattr(runtime, "config", None) or {}
-    configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
-    thread_id = configurable.get("thread_id") if isinstance(configurable, dict) else None
-    if thread_id:
-        return str(thread_id)
-
-    return None
-
-
 async def save_deep_research_report_direct(
     *,
     thread_id: str,
@@ -317,9 +313,12 @@ async def save_deep_research_report_direct(
     final_content = content.strip()
     if not final_content:
         final_content = f"# {title.strip() or DEFAULT_DOCX_TITLE}\n\n(No content)"
-    # Keep report generation synchronous so fallback logging and file writes
-    # remain in the same request context.
-    docx_bytes = _render_report_docx_bytes(title=title, content=final_content)
+    docx_bytes = await run_blocking(
+        _render_report_docx_bytes,
+        title=title,
+        content=final_content,
+        timeout_seconds=60,
+    )
 
     # If no explicit filename given, derive it from the title so that
     # Chinese titles like "成都理工大学深度研究报告" produce readable filenames
@@ -335,21 +334,26 @@ async def save_deep_research_report_direct(
     )
 
     try:
-        uploaded_object = await upload_bytes_to_minio(
-            docx_bytes,
-            object_name,
-            content_type=DOCX_MIME_TYPE,
-            bucket_name=bucket_name,
+        uploaded_object = await asyncio.wait_for(
+            upload_bytes_to_minio(
+                docx_bytes,
+                object_name,
+                content_type=DOCX_MIME_TYPE,
+                bucket_name=bucket_name,
+            ),
+            timeout=30,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DeepResearchReport] MinIO upload failed, using local fallback: %s", exc)
         uploaded_object = None
     local_path: Path | None = None
     if not uploaded_object:
-        local_path = _save_report_locally(
+        local_path = await run_blocking(
+            _save_report_locally,
             thread_id=thread_id,
             filename=report_filename,
             content=docx_bytes,
+            timeout_seconds=20,
         )
 
     logger.info(
@@ -388,7 +392,11 @@ def save_deep_research_report_tool(
     final_content = content.strip()
     if not final_content:
         final_content = f"# {title.strip() or DEFAULT_DOCX_TITLE}\n\n(No content)"
-    docx_bytes = _render_report_docx_bytes(title=title, content=final_content)
+    docx_bytes = invoke_sync_with_timeout(
+        lambda: _render_report_docx_bytes(title=title, content=final_content),
+        timeout=60,
+        label="save_deep_research_report.render",
+    )
 
     report_filename = _safe_report_filename(filename)
 
@@ -407,21 +415,29 @@ def save_deep_research_report_tool(
     )
 
     try:
-        uploaded_object = upload_bytes_to_minio_sync(
-            docx_bytes,
-            object_name,
-            content_type=DOCX_MIME_TYPE,
-            bucket_name=bucket_name,
+        uploaded_object = invoke_sync_with_timeout(
+            lambda: upload_bytes_to_minio_sync(
+                docx_bytes,
+                object_name,
+                content_type=DOCX_MIME_TYPE,
+                bucket_name=bucket_name,
+            ),
+            timeout=35,
+            label="save_deep_research_report.upload",
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("[DeepResearchReport] MinIO upload failed, using local fallback: %s", exc)
         uploaded_object = None
     local_path: Path | None = None
     if not uploaded_object:
-        local_path = _save_report_locally(
-            thread_id=thread_id,
-            filename=report_filename,
-            content=docx_bytes,
+        local_path = invoke_sync_with_timeout(
+            lambda: _save_report_locally(
+                thread_id=thread_id,
+                filename=report_filename,
+                content=docx_bytes,
+            ),
+            timeout=20,
+            label="save_deep_research_report.local_fallback",
         )
 
     payload = {

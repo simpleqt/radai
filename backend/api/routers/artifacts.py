@@ -1,6 +1,5 @@
+import asyncio
 import mimetypes
-from pathlib import Path
-
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy import select
@@ -34,13 +33,20 @@ async def get_thread_artifact(
 
     paths = get_paths()
     try:
-        actual_path = (paths.thread_artifacts_dir(internal_thread_id) / path).resolve()
-        outputs_root = paths.thread_artifacts_dir(internal_thread_id).resolve()
+        output_dir = paths.thread_artifacts_dir(internal_thread_id)
+        actual_path, outputs_root = await asyncio.gather(
+            asyncio.to_thread((output_dir / path).resolve),
+            asyncio.to_thread(output_dir.resolve),
+        )
         actual_path.relative_to(outputs_root)
     except ValueError:
         raise HTTPException(status_code=403, detail="非法路径越权拦截")
 
-    if not actual_path.exists() or not actual_path.is_file():
+    exists, is_file = await asyncio.gather(
+        asyncio.to_thread(actual_path.exists),
+        asyncio.to_thread(actual_path.is_file),
+    )
+    if not exists or not is_file:
         raise HTTPException(status_code=404, detail="工件不存在")
 
     mime_type, _ = mimetypes.guess_type(str(actual_path))

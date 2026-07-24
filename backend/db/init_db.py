@@ -1,6 +1,8 @@
 """数据库初始化脚本"""
 
 import argparse
+import re
+import uuid
 
 from backend.config.settings import settings
 from backend.db.connection import close_db, get_engine
@@ -21,11 +23,15 @@ def create_database():
 
     cursor = conn.cursor()
     database_name = settings.mysql_database
+    if not re.fullmatch(r"[A-Za-z0-9_]+", database_name or ""):
+        raise ValueError("MYSQL_DATABASE 只能包含字母、数字和下划线")
+    quoted_database = f"`{database_name}`"
 
     cursor.execute(
-        f"CREATE DATABASE IF NOT EXISTS {database_name} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+        f"CREATE DATABASE IF NOT EXISTS {quoted_database} "
+        "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
     )
-    cursor.execute(f"USE {database_name}")
+    cursor.execute(f"USE {quoted_database}")
 
     print(f"数据库 '{database_name}' 创建/确认成功")
 
@@ -42,12 +48,8 @@ def create_tables():
     """
 
     engine = get_engine()
-    try:
-        Base.metadata.create_all(bind=engine)
-        print("所有表创建成功！")
-    except Exception as e:
-        print(f"部分表创建失败（通常为 agent_kb_bindings FK 排序规则冲突）：{e}")
-        print("请参考 docs/docs_backend/agent_kb_binding_module.md 手动建表。")
+    Base.metadata.create_all(bind=engine)
+    print("所有表创建成功！")
 
     tables = [
         "users",
@@ -56,8 +58,20 @@ def create_tables():
         "tasks",
         "extraction_results",
         "task_logs",
+        "admin_audit_logs",
         "agents",
         "agent_kb_bindings",
+        "skills",
+        "skill_versions",
+        "skill_acl",
+        "agent_skill_bindings",
+        "skill_audit_logs",
+        "learning_style_attempts",
+        "learning_style_profiles",
+        "learning_plans",
+        "learning_plan_nodes",
+        "learning_node_attempts",
+        "learning_plan_adjustments",
     ]
 
     for table in tables:
@@ -65,41 +79,42 @@ def create_tables():
 
 
 def create_default_user():
-    """创建默认用户（如果不存在）
-
-    注意：生成的 API Key 为随机值，创建后会在控制台打印一次。
-    请及时保存，不会再次显示。
-    """
-    import secrets
-    import uuid
+    """创建默认管理员（如果不存在）。"""
+    import os
 
     from backend.db.connection import get_session
+    from werkzeug.security import generate_password_hash
 
     session = get_session()
 
     try:
         from backend.db.models import ApiKey, User
 
-        existing_user = session.query(User).first()
+        existing_user = session.query(User).filter(User.username == "admin").first()
+        initial_password = os.getenv("ADMIN_INITIAL_PASSWORD")
+        initial_api_key = os.getenv("ADMIN_INITIAL_API_KEY")
 
         if not existing_user:
-            # 生成随机 API Key，不再使用硬编码默认值
-            generated_api_key = f"radai-{secrets.token_hex(24)}"
-
+            if not initial_password:
+                raise RuntimeError("创建默认管理员必须显式设置 ADMIN_INITIAL_PASSWORD")
+            if not initial_api_key:
+                raise RuntimeError("创建默认管理员必须显式设置 ADMIN_INITIAL_API_KEY")
             user = User(
                 user_id=str(uuid.uuid4()),
                 username="admin",
-                email="",
-                api_key=generated_api_key,
+                password=generate_password_hash(initial_password),
+                email="admin@example.com",
+                api_key=initial_api_key,
+                role="admin",
                 is_active=True,
             )
             session.add(user)
             session.flush()
 
             api_key = ApiKey(
-                api_key=generated_api_key,
+                api_key=initial_api_key,
                 user_id=user.user_id,
-                key_name="初始化默认 Key",
+                key_name="初始化管理员 Key",
                 is_active=True,
                 rate_limit=1000,
             )
@@ -107,14 +122,27 @@ def create_default_user():
 
             session.commit()
             print("创建默认用户: admin")
-            print(f"创建默认 API Key: {generated_api_key}")
-            print("⚠️  请立即保存上述 API Key，不会再次显示！")
+            print("默认密码和 API Key 来自安全环境变量")
         else:
-            print(f"用户已存在: {existing_user.username}")
+            repaired = []
+            if existing_user.role != "admin":
+                existing_user.role = "admin"
+                repaired.append("管理员角色")
+            if not existing_user.password:
+                if not initial_password:
+                    raise RuntimeError("修复管理员密码必须显式设置 ADMIN_INITIAL_PASSWORD")
+                existing_user.password = generate_password_hash(initial_password)
+                repaired.append("登录密码")
+            if repaired:
+                session.commit()
+                print(f"修复默认管理员: {', '.join(repaired)}")
+            else:
+                print(f"管理员已存在: {existing_user.username}")
 
     except Exception as e:
         session.rollback()
         print(f"创建默认用户失败: {e}")
+        raise
     finally:
         session.close()
 
@@ -162,7 +190,10 @@ def main():
     args = parser.parse_args()
 
     print("=" * 50)
-    print("数据库初始化工具")
+    print("文档处理智能体 - 数据库初始化工具")
+    print("=" * 50)
+    print(f"MySQL Host: {settings.mysql_host}:{settings.mysql_port}")
+    print(f"Database: {settings.mysql_database}")
     print("=" * 50)
 
     if args.drop_tables:

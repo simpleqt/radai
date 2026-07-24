@@ -1,4 +1,4 @@
-"""Middleware to enforce maximum concurrent subagent tool calls per model response."""
+"""Record delegated subagent bursts; execution is queued by AgentControl."""
 
 import logging
 from typing_extensions import override
@@ -9,9 +9,9 @@ from langgraph.runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_CONCURRENT_SUBAGENTS = 3
-MIN_SUBAGENT_LIMIT = 2
-MAX_SUBAGENT_LIMIT = 4
+DEFAULT_MAX_CONCURRENT_SUBAGENTS = 5
+MIN_SUBAGENT_LIMIT = 1
+MAX_SUBAGENT_LIMIT = 5
 
 
 def _clamp_subagent_limit(value: int) -> int:
@@ -19,13 +19,18 @@ def _clamp_subagent_limit(value: int) -> int:
 
 
 class SubagentLimitMiddleware(AgentMiddleware[AgentState]):
-    """Truncates excess 'task' tool calls from a single model response."""
+    """Preserve task calls and let the request-tree control plane bound them.
+
+    Previous behavior removed calls beyond the configured limit.  That made a
+    model's fifth task disappear when the product was configured for five
+    workers, and lost work rather than applying backpressure.
+    """
 
     def __init__(self, max_concurrent: int = DEFAULT_MAX_CONCURRENT_SUBAGENTS):
         super().__init__()
         self.max_concurrent = _clamp_subagent_limit(max_concurrent)
 
-    def _truncate_task_calls(self, state: AgentState) -> dict | None:
+    def _observe_task_calls(self, state: AgentState) -> dict | None:
         messages = state.get("messages", [])
         if not messages:
             return None
@@ -39,22 +44,17 @@ class SubagentLimitMiddleware(AgentMiddleware[AgentState]):
         task_indices = [i for i, tc in enumerate(tool_calls) if tc.get("name") == "task"]
         if len(task_indices) <= self.max_concurrent:
             return None
-
-        indices_to_drop = set(task_indices[self.max_concurrent:])
-        truncated_tool_calls = [tc for i, tc in enumerate(tool_calls) if i not in indices_to_drop]
-
-        dropped_count = len(indices_to_drop)
         logger.warning(
-            f"Truncated {dropped_count} excess task tool call(s) from model response (limit: {self.max_concurrent})"
+            "Received %d task tool calls (concurrency=%d); preserving all calls and queueing excess work",
+            len(task_indices),
+            self.max_concurrent,
         )
-
-        updated_msg = last_msg.model_copy(update={"tool_calls": truncated_tool_calls})
-        return {"messages": [updated_msg]}
+        return None
 
     @override
     def after_model(self, state: AgentState, runtime: Runtime) -> dict | None:
-        return self._truncate_task_calls(state)
+        return self._observe_task_calls(state)
 
     @override
     async def aafter_model(self, state: AgentState, runtime: Runtime) -> dict | None:
-        return self._truncate_task_calls(state)
+        return self._observe_task_calls(state)

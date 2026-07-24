@@ -32,8 +32,6 @@ def patch_apply_token_truncation():
     import lightrag.operate as operate_module
     import time
     
-    original_func = operate_module._apply_token_truncation
-    
     async def patched_func(
         search_result: dict,
         query_param,
@@ -50,7 +48,7 @@ def patch_apply_token_truncation():
         relation_id_to_original = {}
         
         entities_context = []
-        for i, entity in enumerate(final_entities):
+        for entity in final_entities:
             entity_name = entity["entity_name"]
             created_at = entity.get("created_at", "UNKNOWN")
             if isinstance(created_at, (int, float)):
@@ -69,7 +67,7 @@ def patch_apply_token_truncation():
             )
         
         relations_context = []
-        for i, relation in enumerate(final_relations):
+        for relation in final_relations:
             created_at = relation.get("created_at", "UNKNOWN")
             if isinstance(created_at, (int, float)):
                 created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at))
@@ -121,8 +119,6 @@ def patch_build_context_str():
     - 让 chunk_top_k 和 rerank 控制最终 chunk 数量
     """
     import lightrag.operate as operate_module
-    
-    original_func = operate_module._build_context_str
     
     async def patched_func(
         entities_context: list[dict],
@@ -219,7 +215,7 @@ def patch_build_context_str():
         )
         
         chunks_context = []
-        for i, chunk in enumerate(truncated_chunks):
+        for chunk in truncated_chunks:
             chunks_context.append(
                 {
                     "reference_id": chunk["reference_id"],

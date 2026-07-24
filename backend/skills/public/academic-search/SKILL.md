@@ -1,6 +1,7 @@
 ---
 name: academic-search
 description: 学术文献多源检索技能。当用户搜索论文、查找引用/DOI/arXiv、梳理研究现状、写综述或 related work、查作者/方法/高被引文献时使用。触发词包括「论文」「文献」「引用」「DOI」「arXiv」「PubMed」「预印本」「综述」「related work」「research paper」「citation」「literature review」。通过 `academic_search` 并发检索 arXiv、Crossref、OpenAlex、Semantic Scholar、PubMed，输出结构化 Markdown；时效新闻/政策类问题用 `web_search` 补充，不得用网页搜索替代学术检索。
+domain: "*"
 tools:
   - academic_search
   - web_search

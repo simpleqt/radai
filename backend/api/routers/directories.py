@@ -1,8 +1,9 @@
 """知识库目录管理 API 路由"""
 
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,12 +38,19 @@ class DirectoryUpdateRequest(BaseModel):
 class DirectoryRenameRequest(BaseModel):
     """重命名目录请求"""
 
+    # ``old_path`` is used by the body-based endpoint below.  It remains
+    # optional so the legacy path-based endpoint can keep accepting its
+    # original payload.
+    old_path: Optional[str] = Field(None, description="原目录路径")
     new_name: str = Field(..., description="新目录名称", min_length=1, max_length=100)
 
 
 class DirectoryMoveRequest(BaseModel):
     """移动目录请求"""
 
+    # ``source_path`` is used by the body-based endpoint below.  It remains
+    # optional for compatibility with the legacy path-based endpoint.
+    source_path: Optional[str] = Field(None, description="源目录路径")
     target_parent_path: Optional[str] = Field(None, description="目标父目录路径，None 表示移动到根目录")
 
 
@@ -50,6 +58,13 @@ class DirectoryDeleteRequest(BaseModel):
     """删除目录请求"""
 
     delete_documents: bool = Field(False, description="是否同时删除目录下的文档")
+
+
+class DirectoryReorderRequest(BaseModel):
+    """同级目录重排请求"""
+
+    parent_path: Optional[str] = Field(None, description="父目录路径，空表示根目录")
+    paths: List[str] = Field(..., min_length=1, description="同级目录路径，按新顺序排列")
 
 
 class DirectoryResponse(BaseModel):
@@ -84,6 +99,7 @@ class DirectoryTreeNode(BaseModel):
     sort_order: int = 0
     doc_count: int = 0
     total_doc_count: int = 0
+    is_virtual: bool = False
     children: List["DirectoryTreeNode"] = []
 
 
@@ -100,7 +116,11 @@ DirectoryTreeNode.model_rebuild()
 
 def _normalize_path(path: str) -> str:
     """规范化路径"""
-    return "/".join(part for part in (path or "").split("/") if part).strip()
+    # Path parameters may be percent-encoded by the browser.  Decode once
+    # here so paths containing Chinese characters or nested segments resolve
+    # to the same database value as paths sent in a JSON body.
+    decoded = unquote(path or "")
+    return "/".join(part for part in decoded.split("/") if part).strip()
 
 
 @router.get(
@@ -142,6 +162,7 @@ async def get_directory_tree(
             sort_order=node.get("sort_order", 0),
             doc_count=node.get("doc_count", 0),
             total_doc_count=node.get("total_doc_count", 0),
+            is_virtual=node.get("is_virtual", False),
             children=[_to_tree_node(child) for child in node.get("children", [])],
         )
 
@@ -304,6 +325,44 @@ async def update_directory(
     )
 
 
+@router.post("/knowledge_bases/{kb_id}/directories/rename")
+async def rename_directory_by_body(
+    kb_id: str,
+    request: DirectoryRenameRequest,
+    auth: ApiKeyAuth = Depends(require_admin),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """通过请求体重命名目录，避免将完整路径放入 URL 路径参数。"""
+    manager = get_kb_manager()
+    kb = await manager.get_knowledge_base(session, kb_id)
+    if not kb:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+    old_path = _normalize_path(request.old_path or "")
+    if not old_path:
+        raise HTTPException(status_code=400, detail="原目录路径不能为空")
+
+    success, affected, new_path = await directory_service.rename_directory(
+        session=session,
+        kb_id=kb_id,
+        old_path=old_path,
+        new_name=request.new_name,
+    )
+
+    if not success:
+        raise HTTPException(
+            status_code=400,
+            detail=f"重命名失败，目标路径可能已存在: {new_path}",
+        )
+
+    return {
+        "success": True,
+        "old_path": old_path,
+        "new_path": new_path,
+        "affected_directories": affected,
+    }
+
+
 @router.post(
     "/knowledge_bases/{kb_id}/directories/{category_path:path}/rename",
 )
@@ -324,6 +383,7 @@ async def rename_directory(
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
 
+    category_path = _normalize_path(category_path)
     success, affected, new_path = await directory_service.rename_directory(
         session=session,
         kb_id=kb_id,
@@ -365,11 +425,13 @@ async def move_directory(
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
 
+    category_path = _normalize_path(category_path)
+    target_parent_path = _normalize_path(request.target_parent_path or "") or None
     success, affected, new_path = await directory_service.move_directory(
         session=session,
         kb_id=kb_id,
         source_path=category_path,
-        target_parent_path=request.target_parent_path,
+        target_parent_path=target_parent_path,
     )
 
     if not success:
@@ -381,6 +443,45 @@ async def move_directory(
     return {
         "success": True,
         "old_path": category_path,
+        "new_path": new_path,
+        "affected_directories": affected,
+    }
+
+
+@router.post("/knowledge_bases/{kb_id}/directories/move")
+async def move_directory_by_body(
+    kb_id: str,
+    request: DirectoryMoveRequest,
+    auth: ApiKeyAuth = Depends(require_admin),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """通过请求体移动目录，支持将目录拖入另一个目录。"""
+    manager = get_kb_manager()
+    kb = await manager.get_knowledge_base(session, kb_id)
+    if not kb:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+    source_path = _normalize_path(request.source_path or "")
+    target_parent_path = _normalize_path(request.target_parent_path or "") or None
+    if not source_path:
+        raise HTTPException(status_code=400, detail="源目录路径不能为空")
+
+    success, affected, new_path = await directory_service.move_directory(
+        session=session,
+        kb_id=kb_id,
+        source_path=source_path,
+        target_parent_path=target_parent_path,
+    )
+
+    if not success:
+        raise HTTPException(
+            status_code=400,
+            detail=f"移动失败，目标路径可能已存在或不能移动到子目录: {new_path}",
+        )
+
+    return {
+        "success": True,
+        "old_path": source_path,
         "new_path": new_path,
         "affected_directories": affected,
     }
@@ -406,6 +507,7 @@ async def delete_directory(
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
 
+    category_path = _normalize_path(category_path)
     success, deleted_dirs, deleted_docs = await directory_service.delete_directory(
         session=session,
         kb_id=kb_id,
@@ -424,6 +526,33 @@ async def delete_directory(
         "deleted_directories": deleted_dirs,
         "deleted_documents": deleted_docs,
     }
+
+
+@router.post("/knowledge_bases/{kb_id}/directories/reorder")
+async def reorder_directories(
+    kb_id: str,
+    request: DirectoryReorderRequest,
+    auth: ApiKeyAuth = Depends(require_admin),
+    session: AsyncSession = Depends(get_db_session),
+):
+    """批量更新同级目录的展示顺序。"""
+    manager = get_kb_manager()
+    kb = await manager.get_knowledge_base(session, kb_id)
+    if not kb:
+        raise HTTPException(status_code=404, detail="知识库不存在")
+
+    try:
+        updated = await directory_service.reorder_directories(
+            session=session,
+            kb_id=kb_id,
+            parent_path=request.parent_path,
+            paths=request.paths,
+        )
+        await session.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"success": True, "updated": updated}
 
 
 @router.post(

@@ -1,405 +1,125 @@
 import asyncio
-import concurrent.futures
-import contextlib
+import hashlib
 import os
-from contextlib import asynccontextmanager
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
-from typing import Awaitable
-
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import ClientDisconnect
 
-from backend.application.mcp import create_mcp_sse_app
-from backend.application.blocking import (
-    initialize_blocking_executor,
-    shutdown_blocking_executor,
+from backend.api.dependencies.auth import ApiKeyAuth, require_admin
+from backend.api.startup import (
+    ALLOW_QUERY_TOKEN_AUTH,
+    main_lifespan as lifespan,
+    service_role,
 )
+from backend.application.auth_service import api_key_scope_allows_path, auth_service
+from backend.application.auth_security import consume_sliding_window_quota
+from backend.application.exceptions import ApplicationError
 from backend.config.filters import clear_user_context, set_user_context
 from backend.config.loggers import get_logger
-from backend.config.logging import setup_logging
 from backend.config.settings import settings
-from backend.db.connection import get_async_session_factory
-from backend.db.models.knowledge_base import KnowledgeBase
-from backend.rag.knowledge_base.manager import get_kb_manager
-from backend.rag.service import get_rag_service
-from backend.rag.sync import get_rag_index_sync_manager, get_rag_index_sync_scheduler
-from backend.services.startup_task_processor import get_startup_task_processor
-from sqlalchemy import select
+from backend.db.redis import get_redis
 
 logger = get_logger(__name__)
 
-STARTUP_INIT_TIMEOUT_SECONDS = float(os.getenv("STARTUP_INIT_TIMEOUT_SECONDS", "12"))
-STARTUP_TASK_PROCESSOR_ENABLED = os.getenv("STARTUP_TASK_PROCESSOR_ENABLED", "false").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-STARTUP_RAG_PREWARM_ENABLED = os.getenv("STARTUP_RAG_PREWARM_ENABLED", "true").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-STARTUP_KEYWORD_GRAPH_PREWARM_ENABLED = os.getenv(
-    "STARTUP_KEYWORD_GRAPH_PREWARM_ENABLED", "true"
-).lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-STARTUP_KEYWORD_GRAPH_PREWARM_TIMEOUT_SECONDS = float(
-    os.getenv("STARTUP_KEYWORD_GRAPH_PREWARM_TIMEOUT_SECONDS", "180")
-)
-TLS_CERT_SANDBOX_ENABLED = os.getenv("TLS_CERT_SANDBOX_ENABLED", "true").lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-ASYNCIO_THREAD_POOL_MAX_WORKERS = int(
-    os.getenv("ASYNCIO_THREAD_POOL_MAX_WORKERS", "64") or "64"
-)
 
-def setup_app_dirs():
-    """设置应用目录"""
-    base_dir = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-    data_dir = os.path.join(base_dir, "data")
-    os.makedirs(data_dir, exist_ok=True)
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default)) or default))
+    except (TypeError, ValueError):
+        return default
 
 
-def _configure_tls_cert_loading() -> None:
-    """Configure deterministic TLS cert loading for rust reqwest clients.
-
-    Some third-party clients (via reqwest/rustls) scan system cert directories on Linux,
-    which may include unreadable files such as `/etc/ssl/certs/caddy-root.pem` and produce
-    noisy permission warnings. We pin cert loading to a known readable CA bundle and force
-    SSL_CERT_DIR to an empty app-owned directory to avoid scanning system cert directories.
-    """
-    if not TLS_CERT_SANDBOX_ENABLED:
-        logger.info("[TLS] 证书受控加载已禁用（TLS_CERT_SANDBOX_ENABLED=false）")
-        return
-
-    backend_dir = Path(__file__).resolve().parents[1]
-    empty_cert_dir = backend_dir / "data" / "tls-empty-cert-dir"
-    empty_cert_dir.mkdir(parents=True, exist_ok=True)
-
-    cert_candidates = [
-        os.getenv("TLS_CERT_FILE", "").strip(),
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-    ]
-
-    chosen_cert_file = ""
-    for candidate in cert_candidates:
-        if candidate and os.path.isfile(candidate) and os.access(candidate, os.R_OK):
-            chosen_cert_file = candidate
-            break
-
-    if chosen_cert_file:
-        os.environ["SSL_CERT_FILE"] = chosen_cert_file
-        # Keep Python requests stack aligned as well.
-        os.environ.setdefault("REQUESTS_CA_BUNDLE", chosen_cert_file)
-        os.environ.setdefault("CURL_CA_BUNDLE", chosen_cert_file)
-    else:
-        logger.warning("[TLS] 未找到可读 CA 证书文件，将仅设置空 SSL_CERT_DIR")
-
-    # Force reqwest/rustls native cert probing to skip unreadable system cert directories.
-    os.environ["SSL_CERT_DIR"] = str(empty_cert_dir)
-
-    logger.info(
-        "[TLS] 已启用受控证书加载: SSL_CERT_FILE=%s, SSL_CERT_DIR=%s",
-        os.environ.get("SSL_CERT_FILE", "<unset>"),
-        os.environ.get("SSL_CERT_DIR", "<unset>"),
-    )
+@dataclass
+class _RateBucket:
+    tokens: float
+    updated_at: float
 
 
-def _configure_asyncio_default_executor() -> concurrent.futures.ThreadPoolExecutor | None:
-    if ASYNCIO_THREAD_POOL_MAX_WORKERS <= 0:
-        logger.info("[线程池] 使用 Python 默认线程池大小")
-        return None
+class _RequestRateLimiter:
+    """Redis-backed HTTP admission control with an outage-only local fallback."""
 
-    loop = asyncio.get_running_loop()
-    executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=ASYNCIO_THREAD_POOL_MAX_WORKERS,
-        thread_name_prefix="api-worker",
-    )
-    loop.set_default_executor(executor)
-    logger.info("[线程池] 已设置 asyncio 默认线程池大小: %d", ASYNCIO_THREAD_POOL_MAX_WORKERS)
-    return executor
+    def __init__(self) -> None:
+        self._buckets: OrderedDict[str, _RateBucket] = OrderedDict()
+        self._lock = asyncio.Lock()
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    setup_app_dirs()
-    _configure_tls_cert_loading()
-    setup_logging()
-    logger.info("文档处理服务启动")
-    logger.info(f"服务配置: host={settings.server_host}, port={settings.server_port}")
-    logger.info(f"LLM Provider: {settings.llm_provider}")
-    default_executor = _configure_asyncio_default_executor()
-    initialize_blocking_executor()
-
-    startup_background_tasks: list[asyncio.Task] = []
-
-    # 订阅 Redis 模型配置变更
-    from backend.core.models.model_cache import subscribe_model_changes
-    startup_background_tasks.append(asyncio.create_task(subscribe_model_changes()))
-
-    async def _wait_with_timeout(
-        name: str,
-        coro: Awaitable[None],
-        timeout_seconds: float = STARTUP_INIT_TIMEOUT_SECONDS,
-    ) -> None:
-        task = asyncio.create_task(coro)
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
-        except asyncio.TimeoutError:
-            startup_background_tasks.append(task)
-            logger.warning(
-                "[%s] 初始化超过 %.1fs，切换为后台继续执行",
-                name,
-                timeout_seconds,
-            )
-
-    async def _init_rag() -> None:
-        try:
-            await get_rag_service().initialize()
-            logger.info("RAGAnything 初始化完成")
-        except Exception as e:
-            logger.exception(f"RAGAnything 初始化失败: {e}")
-
-    async def _prewarm_rag_instances() -> None:
-        if not STARTUP_RAG_PREWARM_ENABLED:
-            logger.info("[RAG预热] 已禁用（STARTUP_RAG_PREWARM_ENABLED=false）")
-            return
-
-        try:
-            rag_service = get_rag_service()
-            await rag_service.initialize()
-
-            factory = get_async_session_factory()
-            async with factory() as session:
-                result = await session.execute(
-                    select(KnowledgeBase.kb_id).where(KnowledgeBase.status == "active")
+    async def allow(self, key: str, limit_per_minute: int) -> tuple[bool, int]:
+        limit = max(1, limit_per_minute)
+        if settings.redis_host:
+            client = get_redis()
+            quota_key = "http:rate:" + hashlib.sha256(
+                key.encode("utf-8")
+            ).hexdigest()
+            try:
+                return await consume_sliding_window_quota(
+                    client,
+                    quota_key,
+                    window_seconds=60,
+                    max_requests=limit,
                 )
-                active_kb_ids = [row[0] for row in result.all() if row and row[0]]
-
-            if not active_kb_ids:
-                logger.info("[RAG预热] 无活跃知识库")
-                return
-
-            started_at = asyncio.get_running_loop().time()
-            for kb_id in active_kb_ids:
-                try:
-                    await rag_service._get_rag_instance(kb_id)
-                except Exception as e:
-                    logger.warning(f"[RAG预热] 预热失败: kb_id={kb_id}, error={e}")
-
-            elapsed = asyncio.get_running_loop().time() - started_at
-            logger.info("[RAG预热] 完成: 预热知识库=%d, 耗时=%.2fs", len(active_kb_ids), elapsed)
-        except Exception as e:
-            logger.warning(f"[RAG预热] 执行失败: {e}")
-
-    async def _init_keyword_index() -> None:
-        try:
-            factory = get_async_session_factory()
-            async with factory() as session:
-                result = await session.execute(
-                    select(KnowledgeBase).where(KnowledgeBase.status == "active")
+            except Exception as exc:
+                logger.warning(
+                    "Redis HTTP 限流不可用，回退到进程内限流: %s",
+                    type(exc).__name__,
                 )
-                kbs = result.scalars().all()
-                
-                if not kbs:
-                    logger.info("[关键词索引] 无活跃知识库")
-                    return
-                
-                kb_manager = get_kb_manager()
-                init_tasks = []
-                
-                for kb in kbs:
-                    async def _init_single_kb(kb_code: str, kb_id: str):
-                        try:
-                            index = await kb_manager._keyword_index_manager.get_index(kb_code, kb_id)
-                            logger.info(f"[关键词索引] 预加载完成: {kb_code}, 实体数={len(index.entity_names)}")
-                        except Exception as e:
-                            logger.warning(f"[关键词索引] 预加载失败: {kb_code}, {e}")
-                    
-                    init_tasks.append(_init_single_kb(kb.kb_code, kb.kb_id))
-                
-                await asyncio.gather(*init_tasks, return_exceptions=True)
-                logger.info(f"[关键词索引] 所有知识库预加载完成, 共 {len(kbs)} 个")
-        except Exception as e:
-            logger.warning(f"[关键词索引] 预加载失败: {e}")
+            finally:
+                await client.aclose()
 
-    async def _prewarm_keyword_graph_cache() -> None:
-        if not STARTUP_KEYWORD_GRAPH_PREWARM_ENABLED:
-            logger.info("[关键词图缓存预热] 已禁用（STARTUP_KEYWORD_GRAPH_PREWARM_ENABLED=false）")
-            return
-
-        try:
-            factory = get_async_session_factory()
-            async with factory() as session:
-                result = await session.execute(
-                    select(KnowledgeBase).where(KnowledgeBase.status == "active")
+        now = time.monotonic()
+        refill_per_second = limit / 60.0
+        async with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = _RateBucket(tokens=float(limit), updated_at=now)
+                self._buckets[key] = bucket
+            else:
+                bucket.tokens = min(
+                    float(limit),
+                    bucket.tokens + (now - bucket.updated_at) * refill_per_second,
                 )
-                kbs = result.scalars().all()
+                bucket.updated_at = now
+                self._buckets.move_to_end(key)
+            allowed = bucket.tokens >= 1.0
+            if allowed:
+                bucket.tokens -= 1.0
+            retry_after = 0 if allowed else max(1, int((1.0 - bucket.tokens) / refill_per_second) + 1)
+            while len(self._buckets) > 10000:
+                self._buckets.popitem(last=False)
+            return allowed, retry_after
 
-                if not kbs:
-                    logger.info("[关键词图缓存预热] 无活跃知识库")
-                    return
 
-                kb_manager = get_kb_manager()
-                started_at = asyncio.get_running_loop().time()
+_request_rate_limiter = _RequestRateLimiter()
 
-                for kb in kbs:
-                    try:
-                        extractor = await kb_manager.get_keyword_extractor(session, kb.kb_id)
-                        await extractor._build_full_graph()
 
-                        node_count = extractor._graph.number_of_nodes() if extractor._graph is not None else 0
-                        edge_count = extractor._graph.number_of_edges() if extractor._graph is not None else 0
-                        logger.info(
-                            "[关键词图缓存预热] 完成: kb=%s, 节点=%d, 边=%d",
-                            kb.kb_code,
-                            node_count,
-                            edge_count,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "[关键词图缓存预热] 失败: kb=%s, error=%s",
-                            kb.kb_code,
-                            e,
-                        )
+class SPAStaticFiles(StaticFiles):
+    """Serve built assets and fall back to index.html for client-side routes."""
 
-                elapsed = asyncio.get_running_loop().time() - started_at
-                logger.info("[关键词图缓存预热] 全部完成: 知识库=%d, 耗时=%.2fs", len(kbs), elapsed)
-        except Exception as e:
-            logger.warning(f"[关键词图缓存预热] 执行失败: {e}")
-
-    async def _init_index_sync_scheduler() -> None:
+    async def get_response(self, path: str, scope):
         try:
-            scheduler = get_rag_index_sync_scheduler()
-            await get_rag_index_sync_manager().initialize()
-            
-            factory = get_async_session_factory()
-            async with factory() as session:
-                result = await session.execute(
-                    select(KnowledgeBase).where(KnowledgeBase.status == "active")
-                )
-                kbs = result.scalars().all()
-                
-                if kbs:
-                    kb_codes = [kb.kb_code for kb in kbs]
-                    kb_ids = {kb.kb_code: kb.kb_id for kb in kbs}
-                    await scheduler.start(kb_codes, kb_ids)
-                    logger.info(f"[索引同步调度器] 已启动, 知识库: {kb_codes}")
-                else:
-                    logger.info("[索引同步调度器] 无活跃知识库")
-        except Exception as e:
-            logger.warning(f"[索引同步调度器] 启动失败: {e}")
+            response = await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            response = None
 
-    async def _cleanup_index_sync_scheduler() -> None:
-        try:
-            scheduler = get_rag_index_sync_scheduler()
-            await scheduler.stop()
-            logger.info("[索引同步调度器] 已停止")
-        except Exception as e:
-            logger.warning(f"[索引同步调度器] 停止失败: {e}")
-
-    async def _init_startup_task_processor() -> None:
-        try:
-            processor = get_startup_task_processor()
-            await processor.initialize()
-            processor.start_background_processor()
-            logger.info("[启动任务处理器] 已在主事件循环启动")
-        except Exception as e:
-            logger.warning(f"[启动任务处理器] 启动失败: {e}")
-
-    async def _cleanup_startup_task_processor() -> None:
-        try:
-            processor = get_startup_task_processor()
-            await processor.stop_background_processor()
-            logger.info("[启动任务处理器] 已停止")
-        except Exception as e:
-            logger.warning(f"[启动任务处理器] 停止失败: {e}")
-
-    async def _init_checkpointer() -> None:
-        try:
-            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-            import aiosqlite
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            db_path = os.path.join(base_dir, "data", "checkpoints.db")
-            os.makedirs(os.path.dirname(db_path), exist_ok=True)
-            
-            conn = await aiosqlite.connect(db_path)
-            saver = AsyncSqliteSaver(conn)
-            await saver.setup()
-            app.state.checkpointer = saver
-            app.state.checkpointer_conn = conn
-            logger.info(f"Checkpointer (SQLite) 初始化完成: {db_path}")
-        except Exception as e:
-            logger.exception(f"Checkpointer 初始化失败: {e}")
-
-    async def _cleanup_checkpointer() -> None:
-        try:
-            if hasattr(app.state, "checkpointer_conn"):
-                await app.state.checkpointer_conn.close()
-                logger.info("Checkpointer 数据库连接已关闭")
-        except Exception as e:
-            logger.warning(f"Checkpointer 关闭失败: {e}")
-
-    async def _init_experiment_datasets() -> None:
-        """初始化实验数据集表并预注册默认数据集"""
-        try:
-            from backend.db.init_datasets import init_dataset_table, register_default_datasets
-            await init_dataset_table()
-            await register_default_datasets()
-            logger.info("[实验数据集] 初始化完成")
-        except Exception as e:
-            logger.warning("[实验数据集] 初始化失败: %s", e)
-
-    await asyncio.gather(
-        _wait_with_timeout("RAG", _init_rag()),
-        _wait_with_timeout("RAG实例预热", _prewarm_rag_instances()),
-        _wait_with_timeout("关键词索引", _init_keyword_index()),
-        _wait_with_timeout(
-            "关键词图缓存预热",
-            _prewarm_keyword_graph_cache(),
-            timeout_seconds=STARTUP_KEYWORD_GRAPH_PREWARM_TIMEOUT_SECONDS,
-        ),
-        _wait_with_timeout("索引同步调度器", _init_index_sync_scheduler()),
-        _wait_with_timeout("Checkpointer", _init_checkpointer()),
-        _wait_with_timeout("实验数据集", _init_experiment_datasets()),
-    )
-
-    if STARTUP_TASK_PROCESSOR_ENABLED:
-        await _init_startup_task_processor()
-    else:
-        logger.info("[启动任务处理器] 已禁用（STARTUP_TASK_PROCESSOR_ENABLED=false）")
-
-    yield
-
-    for task in startup_background_tasks:
-        if not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-
-    if STARTUP_TASK_PROCESSOR_ENABLED:
-        await _cleanup_startup_task_processor()
-    await _cleanup_index_sync_scheduler()
-    await _cleanup_checkpointer()
-    shutdown_blocking_executor()
-    if default_executor is not None:
-        default_executor.shutdown(wait=False, cancel_futures=True)
-
-    logger.info("文档处理服务关闭")
+        should_fallback = (
+            response is None
+            and scope.get("method") in {"GET", "HEAD"}
+            and not path.startswith(("api/", "mcp/"))
+            and not Path(path).suffix
+        )
+        if should_fallback:
+            return await super().get_response("index.html", scope)
+        if response is None:
+            raise StarletteHTTPException(status_code=404)
+        return response
 
 
 app = FastAPI(
@@ -412,7 +132,10 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        o.strip() for o in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        # Additional CORS origins should be configured via environment variable
+        # CORS_ALLOWED_ORIGINS (comma-separated)
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -429,70 +152,124 @@ async def user_context_middleware(request: Request, call_next):
     1. Authorization: Bearer <session_token>  → Redis 直接取 user_id/username（无 DB 查询）
     2. X-API-Key: <api_key>                  → 数据库查询 API Key 绑定的用户
     3. Authorization: Bearer <api_key>        → 兼容旧客户端（DB 查询）
+    默认不接受 URL query token，避免认证凭据进入访问日志；如需迁移兼容可显式设置
+    ALLOW_QUERY_TOKEN_AUTH=1。
     未认证请求静默跳过，不影响正常流程。
     """
-    import json
     import secrets as _secrets
 
-    request_id = _secrets.token_hex(8)
+    supplied_request_id = request.headers.get("X-Request-ID", "").strip()
+    # Keep correlation IDs useful across browser/API logs while rejecting
+    # control characters and unbounded values supplied by a client.
+    request_id = (
+        supplied_request_id
+        if supplied_request_id
+        and len(supplied_request_id) <= 128
+        and all(char.isalnum() or char in "._:-" for char in supplied_request_id)
+        else _secrets.token_hex(8)
+    )
     set_user_context(request_id=request_id)
+    request.state.request_id = request_id
     request.state.user_id = None
+    request.state.auth = None
 
     try:
         auth_header = request.headers.get("Authorization", "")
         x_api_key = request.headers.get("X-API-Key", "").strip()
         bearer = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
-        # 兼容 ?token= 查询参数（WebSocket / SSE 场景）
-        if not bearer:
+        if not bearer and ALLOW_QUERY_TOKEN_AUTH:
             bearer = request.query_params.get("token", "").strip()
 
-        resolved_user_id: str | None = None
-        resolved_username: str | None = None
+        try:
+            auth = await auth_service.resolve_credentials(
+                x_api_key=x_api_key,
+                bearer=bearer,
+            )
+        except ApplicationError as exc:
+            # Credential infrastructure failures must not silently turn an
+            # authenticated request into an anonymous one.
+            logger.warning(
+                "请求认证服务不可用: code=%s path=%s",
+                exc.error_code,
+                request.url.path,
+            )
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.public_detail, "code": exc.error_code},
+            )
+        except Exception as exc:
+            logger.exception("请求身份解析发生未分类错误: %s", type(exc).__name__)
+            raise
 
-        if bearer:
-            # 优先尝试 session token（Redis 快速路径，无 DB 查询）
-            try:
-                from backend.db.redis import get_redis
-                redis_client = get_redis()
-                try:
-                    raw = await redis_client.get(f"auth:token:{bearer}")
-                    if raw:
-                        info = json.loads(raw)
-                        resolved_user_id = info.get("user_id")
-                        resolved_username = info.get("username") or info.get("display_name")
-                finally:
-                    await redis_client.aclose()
-            except Exception:
-                pass
+        if (
+            auth
+            and auth.source == "api_key"
+            and not api_key_scope_allows_path(auth.access_scope, request.url.path)
+        ):
+            response = JSONResponse(
+                status_code=403,
+                content={
+                    "detail": "此 API Key 仅允许访问 MCP 服务",
+                    "code": "api_key_scope_forbidden",
+                },
+            )
+            response.headers["X-Request-ID"] = request_id
+            return response
 
-            # Redis 未命中则尝试 API Key（DB 查询）
-            if not resolved_user_id:
-                try:
-                    from backend.api.dependencies.auth import _resolve_api_key_auth
-                    auth = await _resolve_api_key_auth(bearer)
-                    if auth and auth.user_id:
-                        resolved_user_id = auth.user_id
-                except Exception:
-                    pass
+        if auth and auth.user_id:
+            request.state.auth = auth
+            set_user_context(user_id=auth.user_id, username=auth.username)
+            request.state.user_id = auth.user_id
 
-        elif x_api_key:
-            try:
-                from backend.api.dependencies.auth import _resolve_api_key_auth
-                auth = await _resolve_api_key_auth(x_api_key)
-                if auth and auth.user_id:
-                    resolved_user_id = auth.user_id
-            except Exception:
-                pass
-
-        if resolved_user_id:
-            set_user_context(user_id=resolved_user_id, username=resolved_username)
-            request.state.user_id = resolved_user_id
+        if request.url.path not in {"/health", "/api/v1/health"}:
+            if auth and auth.source == "api_key":
+                limit = auth.rate_limit_per_minute or _positive_int_env(
+                    "HTTP_AUTHENTICATED_RATE_LIMIT_PER_MINUTE", 600
+                )
+                identity = "api:" + hashlib.sha256(
+                    auth.api_key.encode("utf-8")
+                ).hexdigest()
+            elif auth and auth.user_id:
+                limit = _positive_int_env("HTTP_AUTHENTICATED_RATE_LIMIT_PER_MINUTE", 600)
+                identity = f"user:{auth.user_id}"
+            else:
+                limit = _positive_int_env("HTTP_ANONYMOUS_RATE_LIMIT_PER_MINUTE", 120)
+                client_ip = request.client.host if request.client else "unknown"
+                if os.getenv("HTTP_TRUST_FORWARDED_FOR", "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    forwarded = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+                    client_ip = forwarded or client_ip
+                identity = f"ip:{client_ip}"
+            allowed, retry_after = await _request_rate_limiter.allow(identity, limit)
+            if not allowed:
+                response = JSONResponse(
+                    status_code=429,
+                    content={"detail": "请求过于频繁，请稍后重试", "code": "rate_limited"},
+                    headers={"Retry-After": str(retry_after), "X-Request-ID": request_id},
+                )
+                return response
 
         response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
     finally:
         clear_user_context()
 
     return response
+
+
+@app.exception_handler(ClientDisconnect)
+async def client_disconnect_handler(request: Request, exc: ClientDisconnect):
+    """客户端主动断开（取消请求/切页）时不记为未捕获 500。"""
+    logger.info(
+        "客户端断开连接: path=%s method=%s",
+        request.url.path,
+        request.method,
+    )
+    return Response(status_code=499)
 
 
 @app.exception_handler(Exception)
@@ -501,30 +278,127 @@ async def global_exception_handler(request: Request, exc: Exception):
     # 流式响应在连接中断或已发送 response.start 后，若再尝试构造 JSONResponse
     # 会触发 "Expected ASGI message 'http.response.body'"。此时应直接上抛，
     # 避免二次发送 response.start。
-    if isinstance(exc, RuntimeError) and "Expected ASGI message 'http.response.body'" in str(exc):
-        logger.warning("检测到已进入 response.body 阶段的协议错误，跳过全局 JSON 异常响应: %s", exc)
+    if isinstance(exc, ClientDisconnect):
+        return await client_disconnect_handler(request, exc)
+
+    if isinstance(
+        exc, RuntimeError
+    ) and "Expected ASGI message 'http.response.body'" in str(exc):
+        logger.warning(
+            "检测到已进入 response.body 阶段的协议错误，跳过全局 JSON 异常响应: %s", exc
+        )
         raise exc
 
-    logger.exception(f"未捕获的异常: {exc}")
+    logger.exception(
+        "未捕获的异常: path=%s method=%s",
+        request.url.path,
+        request.method,
+    )
+    return JSONResponse(status_code=500, content={"detail": "内部服务器错误"})
+
+
+@app.exception_handler(ApplicationError)
+async def application_exception_handler(request: Request, exc: ApplicationError):
+    """Render stable application errors without leaking infrastructure details."""
+    logger.warning(
+        "应用服务错误: code=%s path=%s method=%s",
+        exc.error_code,
+        request.url.path,
+        request.method,
+    )
     return JSONResponse(
-        status_code=500, content={"detail": f"内部服务器错误: {str(exc)}"}
+        status_code=exc.status_code,
+        content={"detail": exc.public_detail, "code": exc.error_code},
     )
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """HTTP异常处理"""
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers,
+    )
 
 
 @app.get("/health")
+@app.get("/ready", include_in_schema=False)
 async def health_check():
-    """健康检查"""
-    return {"status": "healthy", "service": "document-processing-agent"}
+    """Readiness check for dependencies required by the agent runtime.
+
+    Startup state is useful for expensive components, but it is only a
+    snapshot.  Re-check MySQL on every readiness request so an API process is
+    removed from service after a database outage as well as during startup.
+    """
+    components = dict(getattr(app.state, "startup_components", {}) or {})
+
+    db_check_enabled = os.environ.get("HEALTH_DB_CHECK_ENABLED", "true").strip().lower()
+    if db_check_enabled not in {"0", "false", "no", "off"}:
+        try:
+            timeout_seconds = max(
+                float(os.environ.get("HEALTH_DB_TIMEOUT_SECONDS", "2")), 0.1
+            )
+        except ValueError:
+            timeout_seconds = 2.0
+
+        try:
+            from sqlalchemy import text
+
+            from backend.db.connection import (
+                _cancellation_safe_context,
+                get_async_engine,
+            )
+
+            async def check_database_connection() -> None:
+                async with _cancellation_safe_context(
+                    get_async_engine().connect()
+                ) as connection:
+                    await connection.execute(text("SELECT 1"))
+
+            await asyncio.wait_for(check_database_connection(), timeout=timeout_seconds)
+            components["database"] = {"status": "ready", "error": ""}
+        except Exception as exc:
+            logger.warning("数据库就绪检查失败: %s", type(exc).__name__)
+            components["database"] = {
+                "status": "error",
+                "error": type(exc).__name__,
+            }
+
+    if service_role() in {"all", "knowledge"}:
+        try:
+            from backend.rag.service import get_rag_service
+
+            if get_rag_service().is_ready:
+                components["rag"] = {"status": "ready", "error": ""}
+            else:
+                components["rag"] = {"status": "error", "error": "not_ready"}
+        except Exception as exc:
+            logger.warning("RAG 就绪检查失败: %s", type(exc).__name__)
+            components["rag"] = {
+                "status": "error",
+                "error": type(exc).__name__,
+            }
+
+    ready = bool(components) and all(
+        item.get("status") == "ready" for item in components.values()
+    )
+    payload = {
+        "status": "healthy" if ready else "degraded",
+        "service": "document-processing-agent",
+        "components": components,
+    }
+    return JSONResponse(status_code=200 if ready else 503, content=payload)
+
+
+@app.get("/live")
+async def liveness_check():
+    """Process liveness endpoint; dependency readiness is exposed by /health."""
+    return {"status": "alive", "service": "document-processing-agent"}
 
 
 @app.get("/config")
-async def get_config():
+async def get_config(_admin: ApiKeyAuth = Depends(require_admin)):
     """获取当前配置"""
     return {
         "llm_provider": settings.llm_provider,
@@ -539,88 +413,184 @@ async def get_config():
 
 @app.get("/")
 async def home():
-    return RedirectResponse(url="/ui/")
+    if service_role() == "knowledge":
+        return {
+            "service": "document-processing-agent",
+            "role": "knowledge",
+            "health": "/health",
+        }
+    return RedirectResponse(url="/app")
 
 
-mcp_sse_app = create_mcp_sse_app()
+@app.get("/ui", include_in_schema=False)
+@app.get("/ui/", include_in_schema=False)
+async def legacy_ui_redirect():
+    return RedirectResponse(url="/app", status_code=308)
 
 
 def create_app() -> FastAPI:
     """应用工厂函数"""
+    role = service_role()
+    runs_agent_runtime = role in {"all", "agent"}
+    runs_knowledge_runtime = role in {"all", "knowledge"}
+
+    from backend.api.routers.admin import router as admin_router
     from backend.api.routers.auth import router as auth_router
     from backend.api.routers.auth_sms import router as auth_sms_router
-    from backend.api.routers.conversations import router as conversations_router
-    from backend.api.routers.directories import router as directories_router
-    from backend.api.routers.document_ingestion import (
-        router as document_ingestion_router,
-    )
-    from backend.api.routers.document_processing import (
-        router as document_processing_router,
-    )
-    from backend.api.routers.extraction import router as extraction_router
-    from backend.api.routers.knowledge_base import router as kb_router
-    from backend.api.routers.knowledge_base_documents import router as kb_docs_router
-    from backend.api.routers.keywords import router as keywords_router
-    from backend.api.routers.mcp import router as mcp_router
-    from backend.api.routers.rag import router as rag_router
-    from backend.api.routers.uploads import router as uploads_router
-    from backend.api.routers.artifacts import router as artifacts_router
-    from backend.api.routers.files import router as files_router
-    from backend.api.routers.chat_files import router as chat_files_router
-    from backend.api.routers.models import router as models_router
-    from backend.api.routers.my_files import router as my_files_router
-    from backend.api.routers.asr import router as asr_router
-    from backend.api.routers.agents import router as agents_router
-    from backend.api.routers.datasets import router as datasets_router
-    from backend.api.routers.chart_images import router as chart_images_router
-    from backend.api.routers.admin_conversations import router as admin_conv_router
-    from backend.api.routers.groundwater_projects import (
-        router as groundwater_projects_router,
-    )
 
-    app.include_router(kb_docs_router, prefix="/api/v1", tags=["知识库文档"])
     app.include_router(auth_router, prefix="/api/v1", tags=["认证"])
     app.include_router(auth_sms_router, prefix="", tags=["短信认证"])
-    app.include_router(conversations_router, prefix="/api/v2", tags=["对话管理"])
-    app.include_router(
-        document_processing_router, prefix="/api/v1/documents", tags=["文档处理"]
-    )
-    app.include_router(
-        extraction_router, prefix="/api/v1/extraction", tags=["内容抽取"]
-    )
-    app.include_router(kb_router, prefix="/api/v1", tags=["知识库管理"])
-    app.include_router(directories_router, prefix="/api/v1", tags=["知识库目录"])
-    app.include_router(keywords_router, prefix="/api/v1", tags=["关键词管理"])
-    app.include_router(rag_router, prefix="/api/v1/rag", tags=["RAG服务"])
-    app.include_router(
-        document_ingestion_router, prefix="/api/v1/ingestion", tags=["文档入库"]
-    )
-    app.include_router(mcp_router, prefix="/api/v1/mcp", tags=["MCP服务"])
-    app.include_router(uploads_router, prefix="/api/v1", tags=["文件上传"])
-    app.include_router(artifacts_router, prefix="/api/v2/threads", tags=["线程工件"])
-    app.include_router(files_router, prefix="/api/v2", tags=["文件中心"])
-    app.include_router(chat_files_router, prefix="/api/v2", tags=["对话文件"])
-    app.include_router(models_router, prefix="/api/v1/models", tags=["模型管理"])
-    app.include_router(asr_router, prefix="/api/v1", tags=["语音转写"])
-    app.include_router(my_files_router)
-    app.include_router(agents_router, prefix="/api/v1/agents", tags=["智能体管理"])
-    app.include_router(datasets_router, prefix="/api/v1", tags=["实验数据集"])
-    app.include_router(chart_images_router, prefix="/api/v1", tags=["可视化图表"])
-    app.include_router(admin_conv_router, prefix="/api/v1", tags=["管理员-会话管理"])
-    app.include_router(groundwater_projects_router, prefix="/api/v2")
+    app.include_router(admin_router, prefix="/api/v1", tags=["管理员后台"])
 
-    # 注册 v2 API 路由 (全功能智能体)
-    try:
-        from backend.api.routers.agent_runtime_v2 import api_router as v2_router
+    if role == "agent":
+        from backend.api.routers.knowledge_proxy import (
+            router as knowledge_proxy_router,
+        )
 
-        app.include_router(v2_router)
-        logger.info("[路由] v2 API 路由已注册: /api/v2/agent-runtime, /api/v2/guest, /api/v2/explore")
-    except Exception as e:
-        logger.warning(f"[路由] v2 API 路由注册失败 (智能体模块可能未配置): {e}")
+        app.include_router(
+            knowledge_proxy_router,
+            prefix="/api/v1",
+            tags=["知识库服务代理"],
+        )
 
-    frontend_dir = Path(__file__).resolve().parents[2] / "frontend"
-    if frontend_dir.exists() and frontend_dir.is_dir():
-        app.mount("/ui", StaticFiles(directory=str(frontend_dir), html=True), name="ui")
+    if runs_knowledge_runtime:
+        from backend.api.dependencies.auth import get_db_session
+        from backend.api.routers.directories import router as directories_router
+        from backend.api.routers.document_ingestion import (
+            router as document_ingestion_router,
+        )
+        from backend.api.routers.document_processing import (
+            router as document_processing_router,
+        )
+        from backend.api.routers.keywords import router as keywords_router
+        from backend.api.routers.knowledge_base import router as kb_router
+        from backend.api.routers.knowledge_base_documents import (
+            router as kb_docs_router,
+        )
+        from backend.api.routers.rag import router as rag_router
+        from backend.api.routers.self_ingestion_admin import (
+            router as self_ingestion_admin_router,
+        )
+        from backend.api.routers.uploads import router as uploads_router
+
+        app.include_router(kb_docs_router, prefix="/api/v1", tags=["知识库文档"])
+        app.include_router(
+            document_processing_router,
+            prefix="/api/v1/documents",
+            tags=["文档处理"],
+        )
+        app.include_router(kb_router, prefix="/api/v1", tags=["知识库管理"])
+        app.include_router(directories_router, prefix="/api/v1", tags=["知识库目录"])
+        app.include_router(keywords_router, prefix="/api/v1", tags=["关键词管理"])
+        app.include_router(rag_router, prefix="/api/v1/rag", tags=["RAG服务"])
+        app.include_router(
+            document_ingestion_router,
+            prefix="/api/v1/ingestion",
+            tags=["文档入库"],
+        )
+        app.include_router(uploads_router, prefix="/api/v1", tags=["文件上传"])
+        app.include_router(
+            self_ingestion_admin_router,
+            prefix="/api/v1",
+            tags=["自研入库管理"],
+        )
+
+        @app.get("/api/v1/health/self-ingestion")
+        async def health_self_ingestion_alias(
+            session=Depends(get_db_session),
+            admin: ApiKeyAuth = Depends(require_admin),
+        ):
+            from backend.api.routers.self_ingestion_admin import self_ingestion_health
+
+            return await self_ingestion_health(session, admin)
+
+    if runs_agent_runtime:
+        from backend.api.routers.admin_conversations import (
+            router as admin_conv_router,
+        )
+        from backend.api.routers.agent_skills import router as agent_skills_router
+        from backend.api.routers.agents import router as agents_router
+        from backend.api.routers.artifacts import router as artifacts_router
+        from backend.api.routers.asr import router as asr_router
+        from backend.api.routers.chart_images import router as chart_images_router
+        from backend.api.routers.chat_files import router as chat_files_router
+        from backend.api.routers.conversations import (
+            router as conversations_router,
+            shared_router as shared_conversations_router,
+        )
+        from backend.api.routers.custom_learning import router as custom_learning_router
+        from backend.api.routers.datasets import router as datasets_router
+        from backend.api.routers.files import router as files_router
+        from backend.api.routers.groundwater_projects import (
+            router as groundwater_projects_router,
+        )
+        from backend.api.routers.learning_style import router as learning_style_router
+        from backend.api.routers.mcp import router as mcp_router
+        from backend.api.routers.models import router as models_router
+        from backend.api.routers.my_files import router as my_files_router
+        from backend.api.routers.prompts import router as prompts_router
+        from backend.api.routers.skills import router as skills_router
+        from backend.application.mcp import create_mcp_sse_app
+
+        app.include_router(conversations_router, prefix="/api/v2", tags=["对话管理"])
+        app.include_router(
+            shared_conversations_router,
+            prefix="/api/v2",
+            tags=["对话管理"],
+        )
+        app.include_router(mcp_router, prefix="/api/v1/mcp", tags=["MCP服务"])
+        app.include_router(
+            artifacts_router, prefix="/api/v2/threads", tags=["线程工件"]
+        )
+        app.include_router(files_router, prefix="/api/v2", tags=["文件中心"])
+        app.include_router(chat_files_router, prefix="/api/v2", tags=["对话文件"])
+        app.include_router(models_router, prefix="/api/v1/models", tags=["模型管理"])
+        app.include_router(prompts_router, prefix="/api/v1", tags=["提示词管理"])
+        app.include_router(asr_router, prefix="/api/v1", tags=["语音转写"])
+        app.include_router(my_files_router)
+        app.include_router(agents_router, prefix="/api/v1/agents", tags=["智能体管理"])
+        app.include_router(
+            agent_skills_router,
+            prefix="/api/v1/agents",
+            tags=["智能体 Skill 绑定"],
+        )
+        app.include_router(skills_router, prefix="/api/v1")
+        app.include_router(datasets_router, prefix="/api/v1", tags=["实验数据集"])
+        app.include_router(chart_images_router, prefix="/api/v1", tags=["可视化图表"])
+        app.include_router(
+            admin_conv_router, prefix="/api/v1", tags=["管理员-会话管理"]
+        )
+        app.include_router(groundwater_projects_router, prefix="/api/v2")
+        app.include_router(learning_style_router, prefix="/api/v1")
+        app.include_router(custom_learning_router, prefix="/api/v1")
+        # The v2 runtime is required in production agent processes.  Reload
+        # mode may tolerate a temporarily incomplete module while editing.
+        try:
+            from backend.api.routers.agent_runtime_v2 import api_router as v2_router
+
+            app.include_router(v2_router)
+            logger.info(
+                "[路由] v2 API 路由已注册: "
+                "/api/v2/agent-runtime, /api/v2/guest, /api/v2/explore"
+            )
+        except Exception:
+            logger.exception("[路由] v2 API 路由注册失败")
+            if not settings.server_reload:
+                raise
+
+        app.mount("/mcp/sse", create_mcp_sse_app())
+
+    @app.get("/metrics")
+    async def prometheus_metrics(_admin: ApiKeyAuth = Depends(require_admin)):
+        from fastapi.responses import Response
+
+        try:
+            from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+        except ImportError:
+            return Response(
+                content="prometheus_client not installed\n", media_type="text/plain"
+            )
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     html_ppt_assets_dir = (
         Path(__file__).resolve().parents[2]
@@ -630,19 +600,29 @@ def create_app() -> FastAPI:
         / "html-ppt"
         / "assets"
     )
-    if html_ppt_assets_dir.exists() and html_ppt_assets_dir.is_dir():
+    if (
+        runs_agent_runtime
+        and html_ppt_assets_dir.exists()
+        and html_ppt_assets_dir.is_dir()
+    ):
         app.mount(
             "/static/html-ppt-assets",
             StaticFiles(directory=str(html_ppt_assets_dir)),
             name="html-ppt-assets",
         )
 
-    # 挂载本地图表文件目录（MinIO 不可用时的降级方案）
-    charts_dir = Path(__file__).resolve().parents[1] / "data" / "charts"
-    charts_dir.mkdir(parents=True, exist_ok=True)
-    app.mount("/data/charts", StaticFiles(directory=str(charts_dir)), name="charts")
-
-    app.mount("/mcp/sse", mcp_sse_app)
+    # Keep this mount last so API and static skill routes always take precedence.
+    frontend_dist_dir = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    if (
+        runs_agent_runtime
+        and frontend_dist_dir.exists()
+        and frontend_dist_dir.is_dir()
+    ):
+        app.mount(
+            "/",
+            SPAStaticFiles(directory=str(frontend_dist_dir), html=True),
+            name="frontend",
+        )
 
     return app
 
@@ -674,9 +654,12 @@ if __name__ == "__main__":
             "backend/logs/*",
         ]
     else:
-        kwargs["workers"] = int(os.environ.get("SERVER_WORKERS", "4"))
+        requested_workers = int(os.environ.get("SERVER_WORKERS", "1"))
+        if requested_workers != 1:
+            raise RuntimeError(
+                "SERVER_WORKERS must be 1 while reconnectable agent tasks use "
+                "the in-process task registry"
+            )
+        kwargs["workers"] = 1
 
-    uvicorn.run(
-        "backend.api.http_server:app",
-        **kwargs
-    )
+    uvicorn.run("backend.api.http_server:app", **kwargs)

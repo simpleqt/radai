@@ -1,0 +1,21 @@
+code: fmca
+name: 基础力学课程智能体
+domain: fundamental-mechanics-course
+description: 面向基础力学课程的概念讲解、公式推导、例题分析与学习答疑智能体
+default_model: null
+default_kb_ids: []
+default_skills:
+  - general-table-analysis
+default_workflow: lightweight
+allowed_workflows:
+  - lightweight
+  - full
+  - deep_research
+  - plan_solve
+  - multi_agent_parallel
+  - multi_agent_alternating
+prompt_profile: fmca
+tool_policy: fmca_default
+kb_policy: disabled
+guardrail_policy: default
+ui_profile: fmca

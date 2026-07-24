@@ -14,7 +14,7 @@ _LEGACY_INTERNAL_THREAD_KEY_RE = re.compile(
 )
 
 
-def _validate_thread_id(thread_id: str) -> str:
+def validate_external_thread_id(thread_id: str) -> str:
     if not _SAFE_THREAD_ID_RE.match(thread_id):
         raise ValueError(
             f"Invalid thread_id {thread_id!r}: only alphanumeric, dots, hyphens, underscores allowed."
@@ -31,7 +31,7 @@ def _validate_user_id(user_id: str) -> str:
 
 
 def build_internal_thread_key(user_id: str, thread_id: str) -> str:
-    return f"u_{_validate_user_id(user_id)}__t_{_validate_thread_id(thread_id)}"
+    return f"u_{_validate_user_id(user_id)}__t_{validate_external_thread_id(thread_id)}"
 
 
 def parse_internal_thread_key(thread_id: str) -> tuple[str | None, str]:
@@ -39,4 +39,4 @@ def parse_internal_thread_key(thread_id: str) -> tuple[str | None, str]:
         return match.group("user_id"), match.group("thread_id")
     if match := _LEGACY_INTERNAL_THREAD_KEY_RE.match(thread_id):
         return match.group("user_id"), match.group("thread_id")
-    return None, _validate_thread_id(thread_id)
+    return None, validate_external_thread_id(thread_id)

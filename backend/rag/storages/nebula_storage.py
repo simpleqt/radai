@@ -6,6 +6,7 @@ NebulaGraph 存储实现
 """
 
 import asyncio
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -96,8 +97,12 @@ class NebulaGraphStorage(BaseGraphStorage):
             config = NebulaConfig()
             config.max_connection_pool_size = self._max_connection_pool_size
 
-            self._pool = await asyncio.get_event_loop().run_in_executor(
-                _executor, self._sync_init_pool, config
+            context = contextvars.copy_context()
+            self._pool = await asyncio.get_running_loop().run_in_executor(
+                _executor,
+                context.run,
+                self._sync_init_pool,
+                config,
             )
 
             await self._ensure_space_and_schema()
@@ -223,8 +228,9 @@ class NebulaGraphStorage(BaseGraphStorage):
 
     async def _execute_async(self, func, *args):
         """在线程池中执行同步函数"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(_executor, func, *args)
+        context = contextvars.copy_context()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_executor, context.run, func, *args)
 
     def _get_session(self):
         """获取会话（已执行 USE space）"""

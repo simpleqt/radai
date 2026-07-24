@@ -4,19 +4,19 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
 
 from backend.application.groundwater import GroundwaterProjectService
-from backend.config.loggers import get_logger
 from backend.application.tools.providers.excel_engine import (
+    _mask_sql_literals_and_comments,
     execute_named_tables_sql,
     get_named_tables_schema,
 )
+from backend.config.loggers import get_logger
+from backend.core.tools.tool_arguments import clean_malformed_tool_text
 from backend.domain.tools.runtime_context import ToolRuntimeContext
-
 
 logger = get_logger(__name__)
 
@@ -27,6 +27,48 @@ _UNSAFE_SQL = re.compile(
     r"write_csv|write_parquet)\b",
     re.IGNORECASE,
 )
+
+# Project packages are standardized over time, while models often use generic
+# hydrogeology names.  Keep this compatibility layer deliberately small and
+# project-scoped: it only substitutes a relation after FROM/JOIN and only when
+# the target dataset is present in the current authorized project.
+_LEGACY_TABLE_ALIASES: dict[str, tuple[str, str]] = {
+    "well_construction": ("constructed_wells", "constructed_wells"),
+    "wells": ("constructed_wells", "constructed_wells"),
+    "well_locations": ("points", "points"),
+    "monitoring_wells": (
+        "points",
+        "(SELECT * FROM points WHERE point_type = 'monitoring_point')",
+    ),
+    "monitoring_points": (
+        "points",
+        "(SELECT * FROM points WHERE point_type = 'monitoring_point')",
+    ),
+    "boreholes": ("geotechnical_boreholes", "geotechnical_boreholes"),
+    "stratigraphy": ("geology_layers", "geology_layers"),
+    "contamination_assessment": (
+        "water_quality_measurements",
+        "water_quality_measurements",
+    ),
+}
+_PROJECT_CATALOG_QUERY = re.compile(
+    r"\b(?:duckdb_tables|information_schema\s*\.\s*tables|sqlite_master|pg_catalog)\b",
+    re.IGNORECASE,
+)
+_RELATION_REFERENCE = re.compile(
+    r'\b(?:from|join)\s+(?:"(?P<quoted>[^"]+)"|(?P<bare>[A-Za-z_][A-Za-z0-9_$]*))',
+    re.IGNORECASE,
+)
+_CTE_NAME = re.compile(r"\b(?P<name>[A-Za-z_][A-Za-z0-9_$]*)\s+AS\s*\(", re.IGNORECASE)
+
+
+class ProjectSqlValidationError(ValueError):
+    """Raised when a query references a relation outside the project contract."""
+
+    def __init__(self, unknown_tables: list[str], available_tables: list[str]):
+        self.unknown_tables = unknown_tables
+        self.available_tables = available_tables
+        super().__init__(f"项目中不存在表: {', '.join(unknown_tables)}")
 
 
 def _json(value: Any) -> str:
@@ -66,7 +108,7 @@ def _table_paths(context) -> dict[str, str]:
 
 
 def _validate_read_only_sql(sql: str) -> str:
-    normalized = str(sql or "").lstrip("\ufeff").strip()
+    normalized = clean_malformed_tool_text(str(sql or "")).lstrip("\ufeff").strip()
     fenced = re.fullmatch(
         r"```(?:sql|duckdb)?\s*\n?(.*?)\n?```",
         normalized,
@@ -102,7 +144,8 @@ def _validate_read_only_sql(sql: str) -> str:
             len(normalized),
         )
         raise ValueError("项目表格仅允许 SELECT 或 WITH 查询")
-    if ";" in normalized or _UNSAFE_SQL.search(normalized):
+    masked = _mask_sql_literals_and_comments(normalized)
+    if ";" in masked or _UNSAFE_SQL.search(masked):
         logger.warning(
             "[ProjectTableTool] 拒绝不安全 SQL: prefix=%r length=%d",
             normalized[:120],
@@ -112,11 +155,99 @@ def _validate_read_only_sql(sql: str) -> str:
     return normalized
 
 
-def _execute(context, sql: str, max_rows: int):
-    return execute_named_tables_sql(
+def _normalize_project_table_aliases(
+    sql: str,
+    table_names: set[str],
+) -> tuple[str, dict[str, str]]:
+    """Replace documented legacy relation names in FROM/JOIN clauses only."""
+    normalized = sql
+    applied: dict[str, str] = {}
+    available = {name.casefold() for name in table_names}
+
+    for legacy_name, (required_table, replacement) in _LEGACY_TABLE_ALIASES.items():
+        if required_table.casefold() not in available:
+            continue
+        pattern = re.compile(
+            rf"(\b(?:from|join)\s+)(?:\"{re.escape(legacy_name)}\"|{re.escape(legacy_name)})\b",
+            re.IGNORECASE,
+        )
+        normalized, count = pattern.subn(rf"\1{replacement}", normalized)
+        if count:
+            applied[legacy_name] = replacement
+
+    # The legacy strata schema used layer_order; the standardized project uses
+    # layer_no. Only alter this field when the legacy relation was actually used.
+    if "stratigraphy" in applied:
+        normalized = re.sub(r"\blayer_order\b", "layer_no", normalized, flags=re.IGNORECASE)
+        applied["stratigraphy"] = "geology_layers (layer_order -> layer_no)"
+    return normalized, applied
+
+
+def _validate_project_relations(sql: str, table_names: set[str]) -> None:
+    """Reject guessed relation names before DuckDB executes the SQL.
+
+    This deliberately validates only concrete FROM/JOIN relations.  Nested
+    SELECTs and CTEs remain valid, while a typo is turned into a compact,
+    actionable tool response instead of a database catalogue error.
+    """
+    scrubbed = re.sub(r"--[^\n]*|/\*.*?\*/", "", sql, flags=re.DOTALL)
+    available = {name.casefold() for name in table_names}
+    ctes = {match.group("name").casefold() for match in _CTE_NAME.finditer(scrubbed)}
+    unknown = {
+        (match.group("quoted") or match.group("bare") or "").strip()
+        for match in _RELATION_REFERENCE.finditer(scrubbed)
+        if (match.group("quoted") or match.group("bare") or "").casefold()
+        not in available | ctes
+    }
+    if unknown:
+        raise ProjectSqlValidationError(sorted(unknown), sorted(table_names))
+
+
+def _prepare_project_sql(context, sql: str) -> tuple[dict[str, str], str, dict[str, str]]:
+    table_paths = _table_paths(context)
+    validated = _validate_read_only_sql(sql)
+    normalized, applied = _normalize_project_table_aliases(validated, set(table_paths))
+    _validate_project_relations(normalized, set(table_paths))
+    return table_paths, normalized, applied
+
+
+def _is_project_catalog_query(sql: str) -> bool:
+    return bool(_PROJECT_CATALOG_QUERY.search(sql))
+
+
+def _project_catalog_payload(context) -> dict[str, Any]:
+    schema = get_named_tables_schema(
         _table_paths(context),
-        _validate_read_only_sql(sql),
+        authorized_roots=[context.project_root],
+    )
+    rows = [
+        {
+            "table_name": table_name,
+            "row_count": columns[0]["total"] if columns else 0,
+            "column_count": len(columns),
+        }
+        for table_name, columns in sorted(schema.items())
+    ]
+    return {
+        "project_id": context.project_id,
+        "data_version": context.data_version,
+        "engine": "duckdb",
+        "row_count": len(rows),
+        "columns": ["table_name", "row_count", "column_count"],
+        "rows": rows,
+        "query_note": "项目表清单由 inspect_project_tables 提供；已返回当前授权表及行数。",
+        "query_kind": "schema_catalog",
+        "counts_toward_query_budget": False,
+    }
+
+
+def _execute(context, sql: str, max_rows: int):
+    table_paths, prepared_sql, _ = _prepare_project_sql(context, sql)
+    return execute_named_tables_sql(
+        table_paths,
+        prepared_sql,
         max_rows=max(1, min(max_rows, 1000)),
+        authorized_roots=[context.project_root],
     )
 
 
@@ -131,7 +262,10 @@ def get_project_table_tools(*, runtime_context: ToolRuntimeContext | None = None
         """查看当前授权项目的 DuckDB 表名、字段类型和总行数；SQL 查询前先调用。"""
         try:
             context = _project_context(runtime_context)
-            schema = get_named_tables_schema(_table_paths(context))
+            schema = get_named_tables_schema(
+                _table_paths(context),
+                authorized_roots=[context.project_root],
+            )
             if table_name:
                 schema = {table_name: schema[table_name]} if table_name in schema else {}
             return _json(
@@ -143,26 +277,63 @@ def get_project_table_tools(*, runtime_context: ToolRuntimeContext | None = None
                 }
             )
         except Exception as exc:
+            logger.exception("[ProjectTableTool] 检查项目表结构失败")
             return _json({"error": str(exc)})
 
     @tool("query_project_tables")
     def query_project_tables(sql: str, max_rows: int = 200) -> str:
-        """使用只读 DuckDB SQL 查询当前授权项目表。sql 传原始 SELECT/WITH，不要附加解释文字。"""
+        """使用只读 DuckDB SQL 查询当前授权项目表；未知表名会在执行前被拒绝。"""
         try:
             context = _project_context(runtime_context)
-            df = _execute(context, sql, max_rows)
+            if _is_project_catalog_query(sql):
+                return _json(_project_catalog_payload(context))
+            table_paths, prepared_sql, aliases_applied = _prepare_project_sql(context, sql)
+            df = execute_named_tables_sql(
+                table_paths,
+                prepared_sql,
+                max_rows=max(1, min(max_rows, 1000)),
+                authorized_roots=[context.project_root],
+            )
+            payload: dict[str, Any] = {
+                "project_id": context.project_id,
+                "data_version": context.data_version,
+                "engine": "duckdb",
+                "row_count": len(df),
+                "columns": list(df.columns),
+                "rows": _records(df),
+                "query_kind": "data_query",
+                "counts_toward_query_budget": True,
+            }
+            if aliases_applied:
+                payload["table_aliases_applied"] = aliases_applied
+                payload["query_note"] = "已将旧表名映射到当前项目的标准化数据表。"
+            return _json(payload)
+        except ProjectSqlValidationError as exc:
             return _json(
                 {
-                    "project_id": context.project_id,
-                    "data_version": context.data_version,
-                    "engine": "duckdb",
-                    "row_count": len(df),
-                    "columns": list(df.columns),
-                    "rows": _records(df),
+                    "error": "unknown_project_table",
+                    "message": str(exc),
+                    "unknown_tables": exc.unknown_tables,
+                    "available_tables": exc.available_tables,
+                    "instruction": (
+                        "不要猜测表名。请使用 groundwater_project_bootstrap 或 "
+                        "inspect_project_tables 返回的真实表名；监测点查 points，"
+                        "治理井查 constructed_wells，污染物查 water_quality_measurements。"
+                    ),
+                    "query_kind": "validation_error",
+                    "counts_toward_query_budget": False,
                 }
             )
         except Exception as exc:
-            return _json({"error": str(exc)})
+            logger.exception("[ProjectTableTool] 执行项目表查询失败")
+            return _json(
+                {
+                    "error": str(exc),
+                    "instruction": "请调用 inspect_project_tables 后仅使用返回的真实表名和字段。",
+                    "query_kind": "execution_error",
+                    "counts_toward_query_budget": False,
+                }
+            )
 
     @tool("summarize_project_table")
     def summarize_project_table(table_name: str) -> str:
@@ -187,6 +358,7 @@ def get_project_table_tools(*, runtime_context: ToolRuntimeContext | None = None
                 }
             )
         except Exception as exc:
+            logger.exception("[ProjectTableTool] 汇总项目表失败")
             return _json({"error": str(exc)})
 
     return [inspect_project_tables, query_project_tables, summarize_project_table]

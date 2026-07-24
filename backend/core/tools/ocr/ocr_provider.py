@@ -352,6 +352,7 @@ class OCRProvider:
 
 
 _global_ocr_provider: OCRProvider | None = None
+_global_ocr_provider_lock = threading.Lock()
 
 
 def get_ocr_provider() -> OCRProvider:
@@ -362,7 +363,9 @@ def get_ocr_provider() -> OCRProvider:
     """
     global _global_ocr_provider
     if _global_ocr_provider is None:
-        _global_ocr_provider = OCRProvider()
+        with _global_ocr_provider_lock:
+            if _global_ocr_provider is None:
+                _global_ocr_provider = OCRProvider()
     return _global_ocr_provider
 
 

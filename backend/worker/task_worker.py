@@ -5,8 +5,12 @@
 
 import asyncio
 import logging
+import signal
 
+from backend.config.dependency_versions import validate_runtime_dependencies
 from backend.config.loggers import get_logger
+from backend.db.connection import close_db, close_db_async
+from backend.db.redis import close_redis_pool
 from backend.worker.components.doc_processing import DocumentProcessingUseCase
 from backend.worker.components.result_persister import ResultPersister
 from backend.worker.components.result_publisher import ResultPublisher
@@ -29,19 +33,56 @@ async def run_worker():
         publisher=publisher,
     )
 
+    loop = asyncio.get_running_loop()
+    shutdown_requested = asyncio.Event()
+
+    def _request_shutdown(sig: signal.Signals) -> None:
+        logger.info("Received shutdown signal: %s", sig.name)
+        shutdown_requested.set()
+
+    installed_signals: list[signal.Signals] = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, sig)
+            installed_signals.append(sig)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    consumer_wait: asyncio.Task[None] | None = None
+    shutdown_wait: asyncio.Task[bool] | None = None
     try:
         await consumer.start()
-
-        # 保持运行直到收到停止信号
-        while True:
-            await asyncio.sleep(1)
-
-    except KeyboardInterrupt:
-        logger.info("Received shutdown signal")
+        consumer_wait = asyncio.create_task(consumer.wait(), name="task-worker-consumer")
+        shutdown_wait = asyncio.create_task(
+            shutdown_requested.wait(),
+            name="task-worker-shutdown",
+        )
+        done, _ = await asyncio.wait(
+            {consumer_wait, shutdown_wait},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if consumer_wait in done:
+            await consumer_wait
+    except asyncio.CancelledError:
+        logger.info("Worker task cancelled")
+        raise
     except Exception as e:
         logger.error(f"Worker encountered unexpected error: {e}")
+        raise
     finally:
+        for task in (consumer_wait, shutdown_wait):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (consumer_wait, shutdown_wait) if task is not None),
+            return_exceptions=True,
+        )
         await consumer.stop()
+        await close_db_async()
+        await asyncio.to_thread(close_db)
+        await close_redis_pool()
+        for sig in installed_signals:
+            loop.remove_signal_handler(sig)
 
 
 def main():
@@ -50,6 +91,8 @@ def main():
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s:%(lineno)d - %(message)s",
     )
+    report = validate_runtime_dependencies()
+    logger.info("runtime dependency contract validated: %s", report.as_dict())
 
     asyncio.run(run_worker())
 

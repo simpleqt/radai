@@ -1,5 +1,7 @@
 """任务管理路由"""
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,7 +19,6 @@ from backend.storage import (
     get_presigned_url,
     get_user_minio_bucket_name,
     upload_bytes_to_minio,
-    upload_bytes_to_minio_sync,
 )
 
 router = APIRouter()
@@ -83,8 +84,39 @@ async def get_task_result(
             if not md_download_url and md_object_key:
                 md_download_url = get_presigned_url(md_object_key, bucket_name=user_bucket)
             if not md_download_url and markdown:
+                # Serialize the one-time object materialization across API workers.
+                # Re-read after acquiring the row lock because another request may
+                # have completed the upload while this request was waiting.
+                try:
+                    locked_result = await asyncio.wait_for(
+                        extraction_crud.get_by_task_id_for_update(session, task_id),
+                        timeout=10,
+                    )
+                except (asyncio.TimeoutError, TimeoutError) as exc:  # noqa: UP041
+                    await session.rollback()
+                    raise HTTPException(
+                        status_code=503,
+                        detail="结果正在生成，请稍后重试",
+                    ) from exc
+                if locked_result is not None:
+                    extraction_result = locked_result
+                    result_data = (
+                        json.loads(locked_result.result_data)
+                        if locked_result.result_data
+                        else {}
+                    )
+                    md_download_url = result_data.get("md_download_url")
+                    md_object_key = result_data.get("md_object_key")
+                    markdown = result_data.get("markdown") or ""
+                    if not md_download_url and md_object_key:
+                        md_download_url = get_presigned_url(
+                            md_object_key,
+                            bucket_name=user_bucket,
+                        )
+
+            if not md_download_url and markdown:
                 object_name = f"users/{user_id}/results/{task.doc_id}/{task.task_id}.md"
-                uploaded_key = upload_bytes_to_minio_sync(
+                uploaded_key = await upload_bytes_to_minio(
                     markdown.encode("utf-8"),
                     object_name,
                     content_type="text/markdown",
@@ -100,10 +132,9 @@ async def get_task_result(
                 "md_download_url"
             ):
                 result_data["md_download_url"] = md_download_url
-                setattr(
-                    extraction_result,
-                    "result_data",
-                    json.dumps(result_data, ensure_ascii=False),
+                extraction_result.result_data = json.dumps(
+                    result_data,
+                    ensure_ascii=False,
                 )
                 session.add(extraction_result)
                 await session.commit()
@@ -140,11 +171,20 @@ async def get_task_result(
                 "toc": result_data.get("toc", []),
             }
 
+    fallback_result = None
+    if isinstance(task.result, dict):
+        public_items = {
+            key: value
+            for key, value in task.result.items()
+            if not str(key).startswith("_")
+        }
+        fallback_result = public_items or None
+
     return TaskResultResponse(
         task_id=task.task_id,
         doc_id=task.doc_id,
         status=TaskStatus(task.status),
-        result=result_dict or task.result,
+        result=result_dict or fallback_result,
         output_path=task.output_path,
         error=task.error,
     )
@@ -199,8 +239,8 @@ async def delete_task(
             from pathlib import Path
 
             file_path = Path(doc.file_path)
-            if file_path.exists():
-                file_path.unlink()
+            if await asyncio.to_thread(file_path.exists):
+                await asyncio.to_thread(file_path.unlink)
             else:
                 logger.warning(f"文件不存在，跳过删除: {doc.file_path}")
         except Exception as e:

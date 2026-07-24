@@ -11,7 +11,7 @@ from urllib.parse import quote
 from backend.config.loggers import get_logger
 from backend.core.config import parse_internal_thread_key
 from backend.services.user_file_service import (
-    register_local_artifact_for_thread_sync,
+    register_local_artifact_for_thread,
     register_minio_artifact_for_thread_sync,
 )
 from backend.storage import get_user_minio_bucket_name
@@ -204,8 +204,7 @@ async def build_registered_artifact_metadata(
                 mime_type=mime_type,
             )
         else:
-            resolved = await asyncio.to_thread(
-                register_local_artifact_for_thread_sync,
+            resolved = await register_local_artifact_for_thread(
                 internal_thread_id=internal_thread_id,
                 artifact_filename=artifact_path,
             )

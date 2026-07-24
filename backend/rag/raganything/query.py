@@ -5,6 +5,7 @@ Contains all query-related methods for both text and multimodal queries
 """
 
 import base64
+import asyncio
 import hashlib
 import json
 import re
@@ -85,6 +86,13 @@ class QueryMixin:
     def __init__(self):
         pass
 
+    def _query_timeout_seconds(self) -> float:
+        configured = getattr(self.config, "default_llm_timeout", 180)
+        try:
+            return max(1.0, float(configured))
+        except (TypeError, ValueError):
+            return 180.0
+
     async def _adjust_rerank_params_by_length(
         self, query: str, mode: str, **kwargs
     ) -> Dict[str, Any]:
@@ -122,7 +130,10 @@ class QueryMixin:
         )
 
         try:
-            test_context = await self.lightrag.aquery(query, param=test_param)
+            test_context = await asyncio.wait_for(
+                self.lightrag.aquery(query, param=test_param),
+                timeout=self._query_timeout_seconds(),
+            )
             context_length = len(test_context) if test_context else 0
 
             self.logger.info(
@@ -324,8 +335,13 @@ class QueryMixin:
 
         # Call LightRAG's query method
         llm_start_time = time.time()
-        result = await self.lightrag.aquery(
-            query, param=query_param, system_prompt=system_prompt
+        result = await asyncio.wait_for(
+            self.lightrag.aquery(
+                query,
+                param=query_param,
+                system_prompt=system_prompt,
+            ),
+            timeout=self._query_timeout_seconds(),
         )
         llm_end_time = time.time()
         llm_duration = llm_end_time - llm_start_time
@@ -536,7 +552,10 @@ class QueryMixin:
 
         # 获取检索上下文或 prompt
         query_param = QueryParam(mode=mode, only_need_prompt=True, **kwargs)
-        raw_prompt = await self.lightrag.aquery(query, param=query_param)
+        raw_prompt = await asyncio.wait_for(
+            self.lightrag.aquery(query, param=query_param),
+            timeout=self._query_timeout_seconds(),
+        )
 
         self.logger.debug("Retrieved raw prompt from LightRAG")
 
@@ -549,8 +568,13 @@ class QueryMixin:
             self.logger.info("No valid images found, falling back to normal query")
             # Fallback to normal query
             query_param = QueryParam(mode=mode, **kwargs)
-            return await self.lightrag.aquery(
-                query, param=query_param, system_prompt=system_prompt
+            return await asyncio.wait_for(
+                self.lightrag.aquery(
+                    query,
+                    param=query_param,
+                    system_prompt=system_prompt,
+                ),
+                timeout=self._query_timeout_seconds(),
             )
 
         self.logger.info(f"Processed {images_found} images for VLM")
@@ -565,7 +589,10 @@ class QueryMixin:
         )
 
         # 4. Call VLM for question answering
-        result = await self._call_vlm_with_multimodal_content(messages)
+        result = await asyncio.wait_for(
+            self._call_vlm_with_multimodal_content(messages),
+            timeout=self._query_timeout_seconds(),
+        )
 
         self.logger.info("VLM enhanced query completed")
         return result
@@ -864,7 +891,7 @@ class QueryMixin:
         preferred_url = _strip_presigned_query(url) or url
         refreshed_url = ""
         try:
-            async with httpx.AsyncClient(
+            async with httpx.AsyncClient(trust_env=False, 
                 timeout=timeout, follow_redirects=True
             ) as client:
                 resp = await client.get(preferred_url)
@@ -879,7 +906,7 @@ class QueryMixin:
                 status = None
             if status in (401, 403) and preferred_url != url:
                 try:
-                    async with httpx.AsyncClient(
+                    async with httpx.AsyncClient(trust_env=False, 
                         timeout=timeout, follow_redirects=True
                     ) as client:
                         resp = await client.get(url)
@@ -891,7 +918,7 @@ class QueryMixin:
                 refreshed_url = _refresh_minio_presigned_url(url)
                 if refreshed_url and refreshed_url != url:
                     try:
-                        async with httpx.AsyncClient(
+                        async with httpx.AsyncClient(trust_env=False, 
                             timeout=timeout, follow_redirects=True
                         ) as client:
                             resp = await client.get(refreshed_url)

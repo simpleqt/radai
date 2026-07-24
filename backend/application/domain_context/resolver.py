@@ -9,7 +9,6 @@ from typing import Any
 from backend.domain.agents.profile import AgentProfile
 from backend.domain.agents.request import AgentRequest
 
-
 DomainContextProvider = Callable[..., dict[str, Any]]
 
 
@@ -21,11 +20,12 @@ class DomainContextResolver:
         *,
         profile: AgentProfile,
         request: AgentRequest,
+        provider: DomainContextProvider | None = None,
     ) -> dict[str, Any]:
         provider_path = str(profile.domain_context_provider or "").strip()
         if not provider_path:
             return {}
-        provider = self._load_provider(provider_path)
+        provider = provider or self._load_provider(provider_path)
         resolved = provider(
             user_id=request.user_id,
             request_metadata=dict(request.metadata or {}),

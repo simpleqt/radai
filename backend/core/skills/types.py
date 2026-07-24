@@ -18,6 +18,11 @@ class Skill:
     enabled: bool = False
     tool_names: list[str] = field(default_factory=list)
     owner_id: str | None = None
+    version: str = "0.0.0"
+    dependencies: list[str] = field(default_factory=list)
+    conflicts: list[str] = field(default_factory=list)
+    capabilities: list[str] = field(default_factory=list)
+    resource_budget: dict[str, int | float] = field(default_factory=dict)
 
     @property
     def skill_path(self) -> str:

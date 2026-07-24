@@ -16,7 +16,6 @@ from backend.config.settings_sections import (
     StorageSettings,
 )
 
-
 def normalize_milvus_uri(uri: str | None) -> str | None:
     """Normalize Milvus URIs to a pymilvus-compatible scheme."""
     if not uri:
@@ -132,19 +131,31 @@ class Settings(BaseModel):
 
     @property
     def mysql_url(self) -> str:
-        return (
-            f"mysql+pymysql://{self.storage.mysql_user}:{self.storage.mysql_password}"
-            f"@{self.storage.mysql_host}:{self.storage.mysql_port}/"
-            f"{self.storage.mysql_database}?charset=utf8mb4"
-        )
+        from sqlalchemy.engine import URL
+
+        return URL.create(
+            "mysql+pymysql",
+            username=self.storage.mysql_user,
+            password=self.storage.mysql_password,
+            host=self.storage.mysql_host,
+            port=self.storage.mysql_port,
+            database=self.storage.mysql_database,
+            query={"charset": "utf8mb4"},
+        ).render_as_string(hide_password=False)
 
     @property
     def async_mysql_url(self) -> str:
-        return (
-            f"mysql+aiomysql://{self.storage.mysql_user}:{self.storage.mysql_password}"
-            f"@{self.storage.mysql_host}:{self.storage.mysql_port}/"
-            f"{self.storage.mysql_database}?charset=utf8mb4"
-        )
+        from sqlalchemy.engine import URL
+
+        return URL.create(
+            "mysql+aiomysql",
+            username=self.storage.mysql_user,
+            password=self.storage.mysql_password,
+            host=self.storage.mysql_host,
+            port=self.storage.mysql_port,
+            database=self.storage.mysql_database,
+            query={"charset": "utf8mb4"},
+        ).render_as_string(hide_password=False)
 
     def _enrich_llm_config(self, config: dict) -> dict:
         from backend.core.models.context_limits import enrich_llm_config
@@ -253,10 +264,11 @@ class Settings(BaseModel):
                 "entity_extraction_batch_size": rag.entity_extraction_batch_size or 5,
                 "max_concurrent_text_processing": rag.max_concurrent_text_processing or 20,
                 "max_concurrent_vision_processing": rag.max_concurrent_vision_processing or 40,
+                "embedding_max_concurrency": rag.embedding_max_concurrency or 4,
             },
             "chunking": {
-                "rag_chunk_token_size": rag.rag_chunk_token_size or 1000,
-                "rag_chunk_overlap_token_size": rag.rag_chunk_overlap_token_size or 200,
+                "rag_chunk_token_size": rag.rag_chunk_token_size or 600,
+                "rag_chunk_overlap_token_size": rag.rag_chunk_overlap_token_size or 120,
                 "embedding_batch_size": rag.embedding_batch_size or 200,
                 "use_semantic_chunking": (
                     rag.use_semantic_chunking

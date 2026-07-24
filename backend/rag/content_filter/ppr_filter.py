@@ -22,6 +22,7 @@ import networkx as nx
 import numpy as np
 
 from backend.config.loggers import get_logger
+from backend.core.utils.math import cosine_similarity
 from backend.rag.content_filter.models import RawRetrievalData
 
 logger = get_logger(__name__)
@@ -328,68 +329,6 @@ class PPRGraphFilter:
     # 维度2：语义反向边权重
     # ─────────────────────────────────────────────────────────────────────
 
-    def _get_entity_embedding(self, entity_name: str, description: str = "") -> Optional[np.ndarray]:
-        """
-        获取实体嵌入向量（带内存缓存）。
-
-        优先以 entity_name 为 key 查缓存；若未命中则调用 embedding_func。
-        描述文本作为上下文拼接（仅取前80字符），以提升嵌入质量。
-        返回 None 表示无法获取嵌入（降级到固定权重）。
-        """
-        if self.embedding_func is None:
-            return None
-
-        if entity_name in self._entity_embedding_cache:
-            return self._entity_embedding_cache[entity_name]
-
-        text = entity_name
-        if description:
-            text = f"{entity_name}: {description[:80]}"
-
-        try:
-            result = self.embedding_func([text])
-            # 兼容同步函数直接返回 np.ndarray/list的情况
-            if isinstance(result, np.ndarray):
-                emb = result[0] if result.ndim > 1 else result
-            else:
-                emb = np.array(result[0])
-            emb = emb.astype(np.float32)
-            # LRU 缓存大小上限：最多缓存 5000 个实体
-            if len(self._entity_embedding_cache) >= 5000:
-                oldest_key = next(iter(self._entity_embedding_cache))
-                del self._entity_embedding_cache[oldest_key]
-            self._entity_embedding_cache[entity_name] = emb
-            return emb
-        except Exception as e:
-            logger.debug(f"[语义反向边] 实体嵌入计算失败: {entity_name}, {e}")
-            return None
-
-    @staticmethod
-    def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-        """计算两向量的余弦相似度，返回 [-1, 1]"""
-        norm_a = float(np.linalg.norm(a))
-        norm_b = float(np.linalg.norm(b))
-        if norm_a <= 0 or norm_b <= 0:
-            return 0.0
-        return float(np.dot(a, b) / (norm_a * norm_b))
-
-    def _semantic_reverse_weight(
-        self,
-        src_emb: Optional[np.ndarray],
-        tgt_emb: Optional[np.ndarray],
-        base_weight: float,
-    ) -> float:
-        """
-        计算语义反向边权重：
-
-            w_rev = base_weight * f((cos_sim + 1) / 2)
-
-        该方法保留为兼容入口，实际缩放逻辑由 _semantic_reverse_scale 统一实现。
-
-        若任一嵌入不可用，降级为固定 base_weight。
-        """
-        return base_weight * self._semantic_reverse_scale(src_emb, tgt_emb)
-
     def _semantic_reverse_scale(
         self,
         src_emb: Optional[np.ndarray],
@@ -399,7 +338,7 @@ class PPRGraphFilter:
         if src_emb is None or tgt_emb is None:
             return 1.0
 
-        cos_sim = self._cosine_similarity(src_emb, tgt_emb)
+        cos_sim = cosine_similarity(src_emb, tgt_emb)
         mapped = float(np.clip((cos_sim + 1.0) / 2.0, 0.0, 1.0))
         if mapped <= self.reverse_edge_similarity_floor:
             return self.reverse_edge_min_scale
@@ -935,7 +874,6 @@ class PPRGraphFilter:
                 path_relationships_keys.add(f"{r.get('src_id')}->{r.get('tgt_id')}")
         
         # 3. 构建知识路径区 (仅展示结构)
-        path_max_tokens = int(max_tokens * 0.15)
         path_section = self._build_path_section(paths)
         if path_section:
             path_tokens = self._count_tokens(path_section)
@@ -997,33 +935,6 @@ class PPRGraphFilter:
         return "\n\n".join(prompt_parts) if prompt_parts else ""
 
     
-    def _build_entity_section(self, entities: List[Dict[str, Any]]) -> str:
-        if not entities:
-            return ""
-        
-        lines = ["## 相关实体\n"]
-        for entity in entities:
-            name = entity.get("entity_name", "Unknown")
-            etype = entity.get("entity_type", "")
-            desc = entity.get("description", "")[:200]
-            lines.append(f"- **{name}** ({etype}): {desc}")
-        
-        return "\n".join(lines)
-    
-    def _build_relation_section(self, relationships: List[Dict[str, Any]]) -> str:
-        if not relationships:
-            return ""
-        
-        lines = ["## 相关关系\n"]
-        for rel in relationships:
-            src = rel.get("src_id", "")
-            tgt = rel.get("tgt_id", "")
-            desc = rel.get("description", "")[:150]
-            keywords = rel.get("keywords", "")
-            lines.append(f"- {src} -> {tgt}: {desc} ({keywords})")
-        
-        return "\n".join(lines)
-
     def _extract_core_paths(
         self,
         filtered_data: PPRFilteredData,
@@ -1161,7 +1072,7 @@ class PPRGraphFilter:
             return ""
 
         lines = ["## 核心知识路径\n"]
-        for idx, (nodes, rels, score) in enumerate(paths, start=1):
+        for idx, (nodes, _, _) in enumerate(paths, start=1):
             chain = " -> ".join(nodes)
             lines.append(f"- 路径 {idx}: {chain}")
 
@@ -1249,4 +1160,3 @@ class PPRGraphFilter:
 
         logger.info(f"[知识序列化] 提取 {len(serialized)} 条证据链条")
         return serialized
-

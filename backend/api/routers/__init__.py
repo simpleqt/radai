@@ -9,17 +9,12 @@ from typing import Any
 
 __all__ = [
     "document_processing_router",
-    "extraction_router",
 ]
 
 
 def __getattr__(name: str) -> Any:
     if name == "document_processing_router":
         from backend.api.routers.document_processing import router
-
-        return router
-    if name == "extraction_router":
-        from backend.api.routers.extraction import router
 
         return router
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

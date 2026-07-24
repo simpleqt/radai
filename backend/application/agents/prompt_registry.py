@@ -4,13 +4,28 @@ from __future__ import annotations
 
 import importlib
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 import yaml
 
+from backend.core.utils.normalization import normalize_string_set
+
 
 PromptProvider = Callable[..., str]
+
+
+@lru_cache(maxsize=64)
+def _load_prompt_provider(provider_path: str) -> PromptProvider:
+    module_name, sep, attr_name = provider_path.partition(":")
+    if not sep or not module_name or not attr_name:
+        raise ValueError(f"Invalid prompt provider: {provider_path}")
+    module = importlib.import_module(module_name)
+    provider = getattr(module, attr_name)
+    if not callable(provider):
+        raise ValueError(f"Prompt provider is not callable: {provider_path}")
+    return provider
 
 
 @dataclass(frozen=True)
@@ -26,12 +41,20 @@ class PromptTemplateRegistry:
             Path(__file__).resolve().parents[2] / "config" / "prompts" / "registry.yaml"
         )
         self._specs = self._load_specs()
-        self._aliases = {
-            alias.strip().lower(): name
-            for name, spec in self._specs.items()
-            for alias in spec.aliases | {name}
-            if alias.strip()
-        }
+        self._aliases: dict[str, str] = {}
+        for name in sorted(self._specs):
+            spec = self._specs[name]
+            for alias in sorted(spec.aliases | {name}):
+                normalized = alias.strip().lower()
+                if not normalized:
+                    continue
+                existing = self._aliases.get(normalized)
+                if existing is not None and existing != name:
+                    raise ValueError(
+                        "Duplicate prompt profile alias "
+                        f"{normalized!r}: {existing!r} and {name!r}"
+                    )
+                self._aliases[normalized] = name
 
     def resolve_provider(self, prompt_profile: str | None, *, fallback_key: str | None = None) -> PromptProvider:
         profile_name = self.resolve_name(prompt_profile)
@@ -49,6 +72,18 @@ class PromptTemplateRegistry:
 
     def list_specs(self) -> list[PromptProfileSpec]:
         return [self._specs[name] for name in sorted(self._specs)]
+
+    def get_spec(self, prompt_profile: str) -> PromptProfileSpec:
+        """Return the canonical prompt profile declaration.
+
+        Keeping this lookup public lets the agent-definition validator inspect
+        both the resolved callable and its declarative source without reaching
+        into registry internals.
+        """
+        profile_name = self.resolve_name(prompt_profile)
+        if not profile_name or profile_name not in self._specs:
+            raise ValueError(f"Unknown prompt profile: {prompt_profile}")
+        return self._specs[profile_name]
 
     def _load_specs(self) -> dict[str, PromptProfileSpec]:
         if not self._config_path.exists():
@@ -71,25 +106,11 @@ class PromptTemplateRegistry:
             specs[normalized_name] = PromptProfileSpec(
                 name=normalized_name,
                 provider=provider,
-                aliases=self._str_set(value.get("aliases")) | {normalized_name},
+                aliases=normalize_string_set(value.get("aliases")) | {normalized_name},
             )
         if not specs:
             raise ValueError(f"Prompt registry contains no valid prompt profiles: {self._config_path}")
         return specs
 
     def _load_provider(self, provider_path: str) -> PromptProvider:
-        module_name, sep, attr_name = provider_path.partition(":")
-        if not sep or not module_name or not attr_name:
-            raise ValueError(f"Invalid prompt provider: {provider_path}")
-        module = importlib.import_module(module_name)
-        provider = getattr(module, attr_name)
-        if not callable(provider):
-            raise ValueError(f"Prompt provider is not callable: {provider_path}")
-        return provider
-
-    def _str_set(self, value: Any) -> set[str]:
-        if isinstance(value, str):
-            return {value.strip()} if value.strip() else set()
-        if not isinstance(value, list):
-            return set()
-        return {str(item).strip() for item in value if str(item or "").strip()}
+        return _load_prompt_provider(provider_path)

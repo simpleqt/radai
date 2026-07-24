@@ -28,18 +28,8 @@ _KB_CODE_PREFIX_PROFILES: tuple[tuple[str, str], ...] = (
     ("hotpotqa", "general_qa"),
     ("rag_nuclear_electronics", "domain"),
     ("nuclearelectronicspaperrepository", "domain"),
+    ("polluted_site_remediation", "domain"),
 )
-
-# 已知 kb_id → profile（避免子线程无法查 DB 时丢失策略）
-# 通过环境变量 KB_PROFILE_MAP 配置，格式: "kb_id1=profile1,kb_id2=profile2"
-_KNOWN_KB_PROFILES: dict[str, str] = {
-    **dict(
-        item.split("=", 1)
-        for item in os.getenv("KB_PROFILE_MAP", "").split(",")
-        if "=" in item
-    ),
-}
-
 
 @dataclass(frozen=True)
 class RetrievalProfile:
@@ -112,10 +102,6 @@ def _resolve_profile_name(kb_id: str | None, kb_code: str | None) -> str:
         if mapped := _kb_profile_map_from_settings().get(kb_id):
             if mapped in RETRIEVAL_PROFILES:
                 return mapped
-        if mapped := _KNOWN_KB_PROFILES.get(kb_id):
-            if mapped in RETRIEVAL_PROFILES:
-                return mapped
-
     code = (kb_code or "").strip().lower()
     for prefix, profile_name in _KB_CODE_PREFIX_PROFILES:
         if code.startswith(prefix) and profile_name in RETRIEVAL_PROFILES:

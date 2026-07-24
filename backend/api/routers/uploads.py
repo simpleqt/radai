@@ -1,20 +1,40 @@
 """文件上传路由"""
 
+import asyncio
+import hashlib
+import os
 import uuid
-from datetime import date, datetime
+from datetime import date
 from io import BytesIO
+from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.api.dependencies.auth import ApiKeyAuth, verify_api_key, get_db_session
+from backend.api.dependencies.auth import (
+    ApiKeyAuth,
+    get_db_session,
+    require_kb_access,
+    verify_api_key,
+)
+from backend.api.upload_utils import (
+    UploadTooLargeError,
+    read_upload_with_limit,
+    spool_file_with_limit,
+)
 from backend.config import settings
 from backend.config.loggers import get_logger
-from backend.db.models import PendingFile
-from backend.storage import _get_minio_client, get_public_url
+from backend.db.models import KnowledgeBase, PendingFile
+from backend.domain.knowledge_base.backend_policy import (
+    LEGACY_BACKEND,
+    SELF_BACKEND,
+    declared_ingestion_backend,
+)
+from backend.rag.ingestion.delete_service import self_delete_service
+from backend.storage import ChunkedUploadManager, _get_minio_client, get_presigned_url
 
 router = APIRouter(prefix="/uploads", tags=["文件上传"])
 logger = get_logger(__name__)
@@ -31,13 +51,36 @@ ALLOWED_EXTENSIONS = {
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
-MAX_FILE_SIZE = 100 * 1024 * 1024
+# 自研入库 ParserRouter 实际支持的类型；上传阶段即拦截，避免“上传成功、入库才炸”。
+SELF_INGESTION_EXTENSIONS = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tiff": "image/tiff",
+}
+
+DEFAULT_MAX_FILE_SIZE = 600 * 1024 * 1024
+MAX_FILE_SIZE = int(getattr(settings, "max_file_size", DEFAULT_MAX_FILE_SIZE) or DEFAULT_MAX_FILE_SIZE)
+CHUNK_SIZE = 10 * 1024 * 1024
+MAX_BATCH_FILES = 20
+
+_legacy_chunk_manager = ChunkedUploadManager()
+_legacy_chunk_manager.temp_dir = Path(settings.upload_temp_dir) / "kb-pending"
+_legacy_chunk_manager.chunk_size = CHUNK_SIZE
+_legacy_chunk_manager._ensure_directories()
 
 
 class UploadInitRequest(BaseModel):
-    kb_id: str = Field(..., description="知识库ID")
-    filename: str = Field(..., description="文件名")
-    file_size: int = Field(..., description="文件大小")
+    kb_id: str = Field(..., min_length=1, max_length=36, description="知识库ID")
+    filename: str = Field(..., min_length=1, max_length=255, description="文件名")
+    file_size: int = Field(..., gt=0, le=MAX_FILE_SIZE, description="文件大小")
     content_type: Optional[str] = Field(None, description="内容类型")
     category_path: Optional[str] = Field(None, description="自定义分类路径")
 
@@ -145,17 +188,50 @@ class IngestResponse(BaseModel):
     message: str
 
 
-_ingest_tasks = {}
-
-
 def get_file_extension(filename: str) -> str:
     return "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
 
-def validate_file(filename: str, file_size: int) -> tuple[bool, str]:
+def _sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _minio_uri(minio_path: str) -> str:
+    return f"minio://{settings.minio_bucket_name}/{minio_path}"
+
+
+def _allowed_extensions_for_backend(ingestion_backend: str | None) -> dict[str, str]:
+    if ingestion_backend == SELF_BACKEND:
+        return SELF_INGESTION_EXTENSIONS
+    return ALLOWED_EXTENSIONS
+
+
+def validate_file(
+    filename: str,
+    file_size: int,
+    *,
+    ingestion_backend: str | None = None,
+) -> tuple[bool, str]:
     ext = get_file_extension(filename)
-    if ext not in ALLOWED_EXTENSIONS:
+    allowed = _allowed_extensions_for_backend(ingestion_backend)
+    if ext not in allowed:
+        if ingestion_backend == SELF_BACKEND and ext in ALLOWED_EXTENSIONS:
+            return (
+                False,
+                f"自研入库不支持 {ext}，请转换为 pdf/docx/txt/md 或图片后上传"
+                f"（支持: {', '.join(sorted(SELF_INGESTION_EXTENSIONS))}）",
+            )
         return False, f"不支持的文件类型: {ext}"
+    if file_size <= 0:
+        return False, "文件不能为空"
     if file_size > MAX_FILE_SIZE:
         return False, f"文件大小超过限制: {file_size / 1024 / 1024:.1f}MB > {MAX_FILE_SIZE / 1024 / 1024}MB"
     return True, ""
@@ -183,35 +259,78 @@ def upload_to_minio(content: bytes, minio_path: str, content_type: str = "applic
         return False
 
 
+def upload_file_to_minio(
+    local_path: str,
+    minio_path: str,
+    content_type: str = "application/octet-stream",
+) -> bool:
+    """从临时文件流式上传，避免合并分块时再次占用整文件内存。"""
+    try:
+        client = _get_minio_client()
+        client.fput_object(
+            settings.minio_bucket_name,
+            minio_path,
+            local_path,
+            content_type=content_type,
+        )
+        return True
+    except Exception as exc:
+        logger.error("上传临时文件到 MinIO 失败: %s, 错误: %s", minio_path, exc)
+        return False
+
+
+def _safe_filename(filename: str) -> str:
+    safe_name = Path(filename).name.strip()
+    if not safe_name or safe_name in {".", ".."} or safe_name != filename.strip():
+        raise HTTPException(status_code=400, detail="文件名不合法")
+    return safe_name
+
+
+def _validate_upload_id(upload_id: str) -> None:
+    try:
+        uuid.UUID(upload_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(status_code=400, detail="upload_id 格式不合法") from exc
+
+
 def get_minio_public_url(minio_path: str) -> str:
-    return get_public_url(minio_path) or f"{settings.minio_endpoint.rstrip('/')}/{settings.minio_bucket_name}/{minio_path}"
+    return get_presigned_url(minio_path, expiry_seconds=15 * 60) or ""
 
 
 @router.post("/init", response_model=UploadInitResponse)
 async def init_chunked_upload(
     request: UploadInitRequest,
     auth: ApiKeyAuth = Depends(verify_api_key),
+    session: AsyncSession = Depends(get_db_session),
 ):
-    valid, error = validate_file(request.filename, request.file_size)
+    await asyncio.to_thread(_legacy_chunk_manager.cleanup_expired_sessions)
+    filename = _safe_filename(request.filename)
+    kb = await require_kb_access(session, request.kb_id, auth, access="write")
+    ingestion_backend = declared_ingestion_backend(settings, kb=kb)
+    valid, error = validate_file(
+        filename, request.file_size, ingestion_backend=ingestion_backend
+    )
     if not valid:
         raise HTTPException(status_code=400, detail=error)
 
     file_id = str(uuid.uuid4())
-    upload_id = str(uuid.uuid4())
-    minio_path = f"pending/{request.kb_id}/{file_id}/{request.filename}"
+    minio_path = f"pending/{request.kb_id}/{file_id}/{filename}"
     
-    total_chunks = (request.file_size + MAX_FILE_SIZE - 1) // MAX_FILE_SIZE if request.file_size > 0 else 1
+    total_chunks = (request.file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
     
-    _chunk_sessions[upload_id] = {
-        "chunks": {},
-        "total_chunks": total_chunks,
-        "file_id": file_id,
-        "kb_id": request.kb_id,
-        "filename": request.filename,
-        "minio_path": minio_path,
-        "content_type": request.content_type,
-        "file_size": request.file_size,
-    }
+    upload_session = _legacy_chunk_manager.init_upload(
+        filename=filename,
+        total_size=request.file_size,
+        content_type=request.content_type,
+        user_id=auth.user_id,
+        metadata={
+            "file_id": file_id,
+            "kb_id": request.kb_id,
+            "minio_path": minio_path,
+            "category_path": request.category_path,
+        },
+    )
+    upload_id = upload_session["upload_id"]
     
     logger.info(f"初始化分块上传: upload_id={upload_id}, file_id={file_id}, total_chunks={total_chunks}")
 
@@ -223,9 +342,6 @@ async def init_chunked_upload(
     )
 
 
-_chunk_sessions = {}
-
-
 @router.post("/chunks/{upload_id}/{chunk_index}", response_model=ChunkUploadResponse)
 async def upload_chunk(
     upload_id: str,
@@ -233,15 +349,42 @@ async def upload_chunk(
     chunk: UploadFile = File(...),
     auth: ApiKeyAuth = Depends(verify_api_key),
 ):
-    if upload_id not in _chunk_sessions:
+    _validate_upload_id(upload_id)
+    session_data = _legacy_chunk_manager.get_upload_session(
+        upload_id,
+        user_id=auth.user_id,
+    )
+    if not session_data:
         raise HTTPException(status_code=404, detail="上传会话不存在，请先调用 init 接口")
+    if session_data.get("state") != "open":
+        raise HTTPException(status_code=409, detail="上传会话正在完成")
+    total = int(session_data["total_chunks"])
+    if chunk_index < 0 or chunk_index >= total:
+        raise HTTPException(status_code=400, detail="分块索引超出范围")
+    expected_size = min(
+        CHUNK_SIZE,
+        int(session_data["total_size"]) - chunk_index * CHUNK_SIZE,
+    )
 
-    content = await chunk.read()
-    _chunk_sessions[upload_id]["chunks"][chunk_index] = content
+    try:
+        content = await read_upload_with_limit(chunk, expected_size)
+    except UploadTooLargeError as exc:
+        raise HTTPException(status_code=413, detail="分块大小超过限制") from exc
+    if len(content) != expected_size:
+        raise HTTPException(status_code=400, detail=f"分块大小不正确，应为 {expected_size} 字节")
 
-    session_data = _chunk_sessions[upload_id]
-    uploaded = len(session_data["chunks"])
-    total = session_data.get("total_chunks", uploaded)
+    result = await asyncio.to_thread(
+        _legacy_chunk_manager.save_chunk,
+        upload_id,
+        chunk_index,
+        content,
+        user_id=auth.user_id,
+    )
+    if not result["success"]:
+        status_code = 409 if "正在完成" in result.get("error", "") else 400
+        raise HTTPException(status_code=status_code, detail=result.get("error", "上传分块失败"))
+    uploaded = int(result.get("uploaded", 0))
+    total = int(result.get("total", total))
     progress = (uploaded / total * 100) if total > 0 else 0
 
     return ChunkUploadResponse(
@@ -260,46 +403,91 @@ async def complete_upload(
     auth: ApiKeyAuth = Depends(verify_api_key),
     session: AsyncSession = Depends(get_db_session),
 ):
-    if upload_id not in _chunk_sessions:
+    _validate_upload_id(upload_id)
+    chunk_session = _legacy_chunk_manager.get_upload_session(
+        upload_id,
+        user_id=auth.user_id,
+    )
+    if not chunk_session:
         raise HTTPException(status_code=404, detail="上传会话不存在")
+    expected_chunks = int(chunk_session["total_chunks"])
+    if total_chunks not in (0, expected_chunks):
+        raise HTTPException(status_code=400, detail="total_chunks 与初始化信息不一致")
+    success, message, merged_path = await asyncio.to_thread(
+        _legacy_chunk_manager.complete_upload,
+        upload_id,
+        user_id=auth.user_id,
+        cleanup_on_success=False,
+    )
+    if not success or not merged_path:
+        raise HTTPException(status_code=400, detail=message)
 
-    chunk_session = _chunk_sessions[upload_id]
-    logger.info(f"完成上传: upload_id={upload_id}, chunks={len(chunk_session['chunks'])}, expected={total_chunks}")
+    metadata = dict(chunk_session.get("metadata") or {})
+    minio_path = str(metadata.get("minio_path") or f"pending/{upload_id}")
+    content_type = chunk_session.get("content_type") or "application/octet-stream"
+    file_size = int(chunk_session["total_size"])
+    kb_id = str(metadata.get("kb_id") or "")
+    kb = await require_kb_access(session, kb_id, auth, access="write")
+    ingestion_backend = declared_ingestion_backend(settings, kb=kb)
 
-    if len(chunk_session["chunks"]) != total_chunks:
-        raise HTTPException(
-            status_code=400,
-            detail=f"分块不完整: {len(chunk_session['chunks'])}/{total_chunks}",
-        )
-
-    content = b"".join(chunk_session["chunks"][i] for i in range(total_chunks))
-    minio_path = chunk_session.get("minio_path", f"pending/{upload_id}")
-    content_type = chunk_session.get("content_type", "application/octet-stream")
-    
-    logger.info(f"准备上传到 MinIO: path={minio_path}, size={len(content)}, type={content_type}")
-
-    if not upload_to_minio(content, minio_path, content_type):
+    uploaded = await asyncio.to_thread(
+        upload_file_to_minio,
+        merged_path,
+        minio_path,
+        content_type,
+    )
+    if not uploaded:
+        _legacy_chunk_manager.reset_completed_upload(upload_id, user_id=auth.user_id)
         raise HTTPException(status_code=500, detail="上传到存储失败")
 
-    file_id = chunk_session.get("file_id", str(uuid.uuid4()))
-    kb_id = chunk_session.get("kb_id", "")
-    filename = chunk_session.get("filename", "unknown")
+    file_id = str(metadata.get("file_id") or uuid.uuid4())
+    filename = str(chunk_session.get("filename") or "unknown")
+    source_hash = await asyncio.to_thread(_sha256_file, merged_path)
 
     pending_file = PendingFile(
         upload_id=upload_id,
         kb_id=kb_id,
         file_id=file_id,
         file_name=filename,
-        file_size=len(content),
+        file_size=file_size,
         file_type=content_type,
         minio_path=minio_path,
+        source_hash=source_hash,
+        object_bucket=settings.minio_bucket_name,
+        object_key=minio_path,
+        original_uri=_minio_uri(minio_path),
+        mime_type=content_type,
+        file_ext=get_file_extension(filename),
+        ingestion_backend=ingestion_backend,
+        category_path=metadata.get("category_path") or None,
         status=0,
         created_by=auth.user_id,
     )
-    session.add(pending_file)
-    await session.commit()
+    try:
+        session.add(pending_file)
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        try:
+            client = _get_minio_client()
+            await asyncio.to_thread(
+                client.remove_object,
+                settings.minio_bucket_name,
+                minio_path,
+            )
+        except Exception as cleanup_exc:
+            logger.exception(
+                "数据库写入失败后清理 MinIO 对象失败: %s",
+                cleanup_exc,
+            )
+        _legacy_chunk_manager.reset_completed_upload(upload_id, user_id=auth.user_id)
+        raise
 
-    del _chunk_sessions[upload_id]
+    _legacy_chunk_manager.cancel_upload(upload_id, user_id=auth.user_id)
+    try:
+        os.unlink(merged_path)
+    except FileNotFoundError:
+        pass
     
     logger.info(f"文件上传完成: file_id={file_id}, filename={filename}")
 
@@ -321,23 +509,59 @@ async def batch_upload(
     auth: ApiKeyAuth = Depends(verify_api_key),
     session: AsyncSession = Depends(get_db_session),
 ):
+    if not kb_id or len(kb_id) > 36:
+        raise HTTPException(status_code=400, detail="kb_id 不合法")
+    if not files:
+        raise HTTPException(status_code=400, detail="至少需要上传一个文件")
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(status_code=400, detail=f"单次最多上传 {MAX_BATCH_FILES} 个文件")
+
     upload_id = str(uuid.uuid4())
     uploaded_files = []
+    kb = await require_kb_access(session, kb_id, auth, access="write")
+    ingestion_backend = declared_ingestion_backend(settings, kb=kb)
+    allowed_exts = _allowed_extensions_for_backend(ingestion_backend)
 
     for file in files:
+        filename = _safe_filename(file.filename or "")
         file_id = str(uuid.uuid4())
-        content = await file.read()
-
-        valid, error = validate_file(file.filename or "unknown", len(content))
-        if not valid:
-            logger.warning(f"文件验证失败: {file.filename}, {error}")
+        temp_path: str | None = None
+        try:
+            await file.seek(0)
+            temp_path, file_size, source_hash = await asyncio.to_thread(
+                spool_file_with_limit,
+                file.file,
+                MAX_FILE_SIZE,
+                temp_dir=settings.upload_temp_dir,
+            )
+        except UploadTooLargeError:
+            logger.warning("文件超过大小限制: %s", filename)
             continue
 
-        ext = get_file_extension(file.filename or "")
-        content_type = ALLOWED_EXTENSIONS.get(ext, file.content_type or "application/octet-stream")
-        minio_path = f"pending/{kb_id}/{file_id}/{file.filename}"
+        valid, error = validate_file(
+            filename, file_size, ingestion_backend=ingestion_backend
+        )
+        if not valid:
+            logger.warning(f"文件验证失败: {file.filename}, {error}")
+            await asyncio.to_thread(os.unlink, temp_path)
+            continue
 
-        if not upload_to_minio(content, minio_path, content_type):
+        ext = get_file_extension(filename)
+        content_type = allowed_exts.get(
+            ext, file.content_type or "application/octet-stream"
+        )
+        minio_path = f"pending/{kb_id}/{file_id}/{filename}"
+
+        try:
+            uploaded = await asyncio.to_thread(
+                upload_file_to_minio,
+                temp_path,
+                minio_path,
+                content_type,
+            )
+        finally:
+            await asyncio.to_thread(Path(temp_path).unlink, missing_ok=True)
+        if not uploaded:
             logger.error(f"上传到 MinIO 失败: {file.filename}")
             continue
 
@@ -345,10 +569,17 @@ async def batch_upload(
             upload_id=upload_id,
             kb_id=kb_id,
             file_id=file_id,
-            file_name=file.filename or "unknown",
-            file_size=len(content),
+            file_name=filename,
+            file_size=file_size,
             file_type=content_type,
             minio_path=minio_path,
+            source_hash=source_hash,
+            object_bucket=settings.minio_bucket_name,
+            object_key=minio_path,
+            original_uri=_minio_uri(minio_path),
+            mime_type=content_type,
+            file_ext=ext,
+            ingestion_backend=ingestion_backend,
             category_path=category_path or None,
             status=0,
             created_by=auth.user_id,
@@ -357,13 +588,36 @@ async def batch_upload(
 
         uploaded_files.append(BatchUploadFile(
             file_id=file_id,
-            file_name=file.filename or "unknown",
-            file_size=len(content),
+            file_name=filename,
+            file_size=file_size,
             minio_path=minio_path,
             status="pending",
         ))
 
-    await session.commit()
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        client = _get_minio_client()
+        cleanup_results = await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    client.remove_object,
+                    settings.minio_bucket_name,
+                    uploaded.minio_path,
+                )
+                for uploaded in uploaded_files
+            ),
+            return_exceptions=True,
+        )
+        for uploaded, result in zip(uploaded_files, cleanup_results, strict=True):
+            if isinstance(result, Exception):
+                logger.error(
+                    "批量上传回滚后清理对象失败: path=%s error=%s",
+                    uploaded.minio_path,
+                    result,
+                )
+        raise
     logger.info(f"批量上传完成: upload_id={upload_id}, files={len(uploaded_files)}")
 
     return BatchUploadResponse(
@@ -379,12 +633,13 @@ async def batch_upload(
 async def list_pending_files(
     kb_id: Optional[str] = None,
     status: Optional[int] = None,
-    skip: int = 0,
-    limit: int = 50,
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
     auth: ApiKeyAuth = Depends(verify_api_key),
     session: AsyncSession = Depends(get_db_session),
 ):
-    query = select(PendingFile)
+    owner_filter = PendingFile.created_by == auth.user_id
+    query = select(PendingFile).where(owner_filter)
 
     if kb_id:
         query = query.where(PendingFile.kb_id == kb_id)
@@ -396,14 +651,13 @@ async def list_pending_files(
     result = await session.execute(query)
     items = result.scalars().all()
 
-    count_query = select(PendingFile)
+    count_query = select(func.count(PendingFile.id)).where(owner_filter)
     if kb_id:
         count_query = count_query.where(PendingFile.kb_id == kb_id)
     if status is not None:
         count_query = count_query.where(PendingFile.status == status)
 
-    count_result = await session.execute(count_query)
-    total = len(count_result.scalars().all())
+    total = int((await session.execute(count_query)).scalar_one())
 
     return PendingFileListResponse(
         items=[
@@ -437,7 +691,10 @@ async def batch_move_pending_files(
     new_path = request.category_path or None
     result = await session.execute(
         update(PendingFile)
-        .where(PendingFile.file_id.in_(request.file_ids))
+        .where(
+            PendingFile.file_id.in_(request.file_ids),
+            PendingFile.created_by == auth.user_id,
+        )
         .values(category_path=new_path)
     )
     await session.commit()
@@ -459,6 +716,7 @@ async def start_ingest(
         select(PendingFile).where(
             PendingFile.file_id.in_(request.file_ids),
             PendingFile.kb_id == request.kb_id,
+            PendingFile.created_by == auth.user_id,
         )
     )
     pending_files = result.scalars().all()
@@ -466,38 +724,33 @@ async def start_ingest(
     if not pending_files:
         raise HTTPException(status_code=404, detail="未找到待入库文件")
 
-    update_data = {"status": 1, "document_date": request.document_date}
+    kb_result = await session.execute(
+        select(KnowledgeBase).where(KnowledgeBase.kb_id == request.kb_id)
+    )
+    kb = kb_result.scalar_one_or_none()
+    await require_kb_access(session, request.kb_id, auth, access="write")
+    ingestion_backend = declared_ingestion_backend(settings, kb=kb)
+
+    update_data = {
+        "status": 1,
+        "document_date": request.document_date,
+        "upload_id": task_id,
+        "ingest_job_id": task_id,
+        "ingestion_backend": ingestion_backend,
+    }
     if request.category_path is not None:
         update_data["category_path"] = request.category_path or None
 
     await session.execute(
         update(PendingFile)
-        .where(PendingFile.file_id.in_(request.file_ids))
+        .where(
+            PendingFile.file_id.in_(request.file_ids),
+            PendingFile.kb_id == request.kb_id,
+            PendingFile.created_by == auth.user_id,
+        )
         .values(**update_data)
     )
     await session.commit()
-
-    _ingest_tasks[task_id] = {
-        "kb_id": request.kb_id,
-        "status": "queued",
-        "total": len(pending_files),
-        "completed": 0,
-        "failed": 0,
-        "file_ids": [pf.file_id for pf in pending_files],
-        "files": [
-            {
-                "file_id": pf.file_id,
-                "file_name": pf.file_name,
-                "status": "queued",
-                "doc_id": None,
-                "error": None,
-            }
-            for pf in pending_files
-        ],
-        "options": request.options or {},
-        "document_date": request.document_date.isoformat() if request.document_date else None,
-        "created_at": datetime.now(),
-    }
 
     return IngestResponse(
         success=True,
@@ -513,19 +766,15 @@ async def get_ingest_status(
     auth: ApiKeyAuth = Depends(verify_api_key),
     session: AsyncSession = Depends(get_db_session),
 ):
-    if task_id not in _ingest_tasks:
-        raise HTTPException(status_code=404, detail="任务不存在")
-
-    task = _ingest_tasks[task_id]
-
-    file_ids = task.get("file_ids", [])
-    if not file_ids:
-        raise HTTPException(status_code=404, detail="任务文件不存在")
-
     result = await session.execute(
-        select(PendingFile).where(PendingFile.file_id.in_(file_ids))
+        select(PendingFile).where(
+            PendingFile.upload_id == task_id,
+            PendingFile.created_by == auth.user_id,
+        )
     )
-    pending_files = {pf.file_id: pf for pf in result.scalars().all()}
+    pending_files = result.scalars().all()
+    if not pending_files:
+        raise HTTPException(status_code=404, detail="任务不存在")
 
     status_map = {
         0: "pending",
@@ -537,16 +786,10 @@ async def get_ingest_status(
     files_status = []
     completed = 0
     failed = 0
-    for file_id in file_ids:
-        pf = pending_files.get(file_id)
-        if not pf:
-            file_status = "failed"
-            error = "文件记录不存在"
-            file_name = file_id
-        else:
-            file_status = status_map.get(pf.status, "pending")
-            error = pf.error_message
-            file_name = pf.file_name
+    for pf in pending_files:
+        file_status = status_map.get(pf.status, "pending")
+        error = pf.error_message
+        file_name = pf.file_name
 
         if file_status == "completed":
             completed += 1
@@ -555,7 +798,7 @@ async def get_ingest_status(
 
         files_status.append(
             IngestFileStatus(
-                file_id=file_id,
+                file_id=pf.file_id,
                 file_name=file_name,
                 status=file_status,
                 doc_id=None,
@@ -563,20 +806,15 @@ async def get_ingest_status(
             )
         )
 
-    total = len(file_ids)
+    total = len(pending_files)
     if completed + failed >= total and total > 0:
         overall_status = "completed" if failed == 0 else "partial"
     else:
         overall_status = "processing"
 
-    task["status"] = overall_status
-    task["total"] = total
-    task["completed"] = completed
-    task["failed"] = failed
-
     return IngestStatusResponse(
         task_id=task_id,
-        kb_id=task["kb_id"],
+        kb_id=pending_files[0].kb_id,
         status=overall_status,
         total=total,
         completed=completed,
@@ -593,12 +831,22 @@ async def delete_pending_file(
     session: AsyncSession = Depends(get_db_session),
 ):
     result = await session.execute(
-        select(PendingFile).where(PendingFile.file_id == file_id)
+        select(PendingFile).where(
+            PendingFile.file_id == file_id,
+            PendingFile.created_by == auth.user_id,
+        )
     )
     pending_file = result.scalar_one_or_none()
 
     if not pending_file:
         raise HTTPException(status_code=404, detail="文件不存在")
+
+    await require_kb_access(
+        session,
+        pending_file.kb_id,
+        auth,
+        access="write",
+    )
 
     if pending_file.status == 1:
         raise HTTPException(status_code=400, detail="文件正在入库中，无法删除")
@@ -617,20 +865,42 @@ async def delete_pending_file(
         
         if kb_doc:
             try:
-                rag_service = get_rag_service()
-                await rag_service.delete_doc_by_id(
-                    doc_id=kb_doc.doc_id,
-                    kb_id=pending_file.kb_id,
-                )
-                logger.info(f"已删除入库文档: {kb_doc.doc_id}")
+                # 严格隔离：按文档 ingestion_backend 分流删除，
+                # self 文档走 self_delete_service，绝不调用 LightRAG delete；
+                # legacy 文档走 rag_service.delete_doc_by_id，绝不触碰 kb_self_*。
+                doc_backend = getattr(kb_doc, "ingestion_backend", None) or LEGACY_BACKEND
+                if doc_backend == SELF_BACKEND:
+                    await self_delete_service.soft_delete(
+                        session, kb_id=pending_file.kb_id, doc_id=kb_doc.doc_id,
+                    )
+                    logger.info(f"已删除自研入库文档: {kb_doc.doc_id}")
+                else:
+                    rag_service = get_rag_service()
+                    await rag_service.delete_doc_by_id(
+                        doc_id=kb_doc.doc_id,
+                        kb_id=pending_file.kb_id,
+                    )
+                    logger.info(f"已删除 legacy 入库文档: {kb_doc.doc_id}")
             except Exception as e:
-                logger.warning(f"删除入库文档失败: {e}")
+                logger.exception("删除入库文档失败: %s", e)
+                raise HTTPException(
+                    status_code=502,
+                    detail="索引删除失败，文件记录已保留，可稍后重试",
+                ) from e
 
     try:
         client = _get_minio_client()
-        client.remove_object(settings.minio_bucket_name, pending_file.minio_path)
+        await asyncio.to_thread(
+            client.remove_object,
+            settings.minio_bucket_name,
+            pending_file.minio_path,
+        )
     except Exception as e:
-        logger.warning(f"删除 MinIO 文件失败: {e}")
+        logger.exception("删除 MinIO 文件失败: %s", e)
+        raise HTTPException(
+            status_code=502,
+            detail="对象存储删除失败，文件记录已保留，可稍后重试",
+        ) from e
 
     await session.delete(pending_file)
     await session.commit()

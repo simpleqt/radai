@@ -1,15 +1,18 @@
 """文件存储管理模块"""
 
 import asyncio
+import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from collections.abc import Generator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +25,68 @@ from backend.services.minio_paths import normalize_minio_endpoint
 logger = get_logger(__name__)
 
 _minio_client = None
+_minio_client_lock = threading.Lock()
+
+
+def _bounded_float_env(name: str, default: float, *, minimum: float) -> float:
+    try:
+        return max(minimum, float(os.getenv(name, str(default)) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bounded_int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default)) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+async def _await_thread_completion(func, /, *args, **kwargs):
+    """Run blocking storage I/O with bounded normal and cancellation waits."""
+    operation = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    operation_timeout = _bounded_float_env(
+        "STORAGE_BLOCKING_TIMEOUT_SECONDS",
+        120.0,
+        minimum=0.1,
+    )
+    cancel_drain_timeout = _bounded_float_env(
+        "STORAGE_CANCEL_DRAIN_TIMEOUT_SECONDS",
+        5.0,
+        minimum=0.0,
+    )
+
+    def consume_result(completed: asyncio.Task) -> None:
+        try:
+            completed.result()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(operation),
+            timeout=operation_timeout,
+        )
+    except asyncio.TimeoutError as exc:  # noqa: UP041 -- Python 3.10 compatibility
+        operation.add_done_callback(consume_result)
+        raise TimeoutError(
+            f"对象存储操作超过 {operation_timeout:.1f}s"
+        ) from exc
+    except asyncio.CancelledError:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(operation),
+                timeout=cancel_drain_timeout,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):  # noqa: UP041
+            operation.add_done_callback(consume_result)
+            logger.warning(
+                "对象存储操作在取消后 %.1fs 内未结束，停止等待",
+                cancel_drain_timeout,
+            )
+        except Exception as exc:
+            logger.warning("被取消的对象存储操作最终失败: %s", exc)
+        raise
 
 
 def get_user_minio_bucket_name() -> str:
@@ -36,25 +101,113 @@ def _get_minio_client():
     global _minio_client
     if _minio_client is not None:
         return _minio_client
-    from minio import Minio
+    with _minio_client_lock:
+        if _minio_client is not None:
+            return _minio_client
+        from minio import Minio
+        from urllib3 import PoolManager, Retry, Timeout
 
-    endpoint = normalize_minio_endpoint(settings.minio_endpoint)
-    secure = settings.minio_secure
-    _minio_client = Minio(
-        endpoint,
-        access_key=settings.minio_access_key,
-        secret_key=settings.minio_secret_key,
-        secure=secure,
+        endpoint = normalize_minio_endpoint(settings.minio_endpoint)
+        secure = settings.minio_secure
+        connect_timeout = _bounded_float_env(
+            "MINIO_CONNECT_TIMEOUT_SECONDS",
+            3.0,
+            minimum=0.1,
+        )
+        read_timeout = _bounded_float_env(
+            "MINIO_READ_TIMEOUT_SECONDS",
+            60.0,
+            minimum=0.1,
+        )
+        client = Minio(
+            endpoint,
+            access_key=settings.minio_access_key,
+            secret_key=settings.minio_secret_key,
+            secure=secure,
+            http_client=PoolManager(
+                num_pools=_bounded_int_env("MINIO_HTTP_POOL_COUNT", 20),
+                maxsize=_bounded_int_env("MINIO_HTTP_POOL_MAXSIZE", 100),
+                block=True,
+                timeout=Timeout(connect=connect_timeout, read=read_timeout),
+                retries=Retry(total=2, backoff_factor=0.2),
+            ),
+        )
+        try:
+            if not client.bucket_exists(settings.minio_bucket_name):
+                client.make_bucket(settings.minio_bucket_name)
+            user_bucket = get_user_minio_bucket_name()
+            if (
+                user_bucket != settings.minio_bucket_name
+                and not client.bucket_exists(user_bucket)
+            ):
+                client.make_bucket(user_bucket)
+        except Exception:
+            logger.warning("MinIO bucket 初始化失败", exc_info=True)
+        _minio_client = client
+        return _minio_client
+
+
+def download_minio_object_to_path(
+    minio_path: str,
+    target_path: str | Path,
+    *,
+    bucket_name: str | None = None,
+    chunk_size: int = 1024 * 1024,
+) -> Path:
+    """Stream one object to an atomic local file without materializing bytes."""
+
+    client = _get_minio_client()
+    destination = Path(target_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.part"
     )
+    candidates = [minio_path]
+    normalized = _normalize_minio_object_name(minio_path)
+    if normalized and normalized not in candidates:
+        candidates.append(normalized)
+    bucket = bucket_name or settings.minio_bucket_name
+    last_error: Exception | None = None
+
     try:
-        if not _minio_client.bucket_exists(settings.minio_bucket_name):
-            _minio_client.make_bucket(settings.minio_bucket_name)
-        user_bucket = get_user_minio_bucket_name()
-        if user_bucket != settings.minio_bucket_name and not _minio_client.bucket_exists(user_bucket):
-            _minio_client.make_bucket(user_bucket)
-    except Exception:
-        pass
-    return _minio_client
+        for candidate in candidates:
+            response = None
+            try:
+                response = client.get_object(bucket, candidate)
+                with temporary.open("wb") as output:
+                    while True:
+                        chunk = response.read(max(64 * 1024, int(chunk_size)))
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                os.replace(temporary, destination)
+                return destination
+            except Exception as exc:
+                last_error = exc
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+            finally:
+                if response is not None:
+                    response.close()
+                    response.release_conn()
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+    assert last_error is not None
+    raise last_error
+
+
+def sha256_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        while chunk := source.read(max(64 * 1024, int(chunk_size))):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _normalize_minio_object_name(minio_path: str) -> str:
@@ -96,7 +249,7 @@ async def upload_bytes_to_minio(
 ) -> str | None:
     """异步上传到 MinIO，避免阻塞事件循环"""
     try:
-        client = _get_minio_client()
+        client = await asyncio.to_thread(_get_minio_client)
         from io import BytesIO
 
         data = BytesIO(content)
@@ -111,9 +264,17 @@ async def upload_bytes_to_minio(
                 content_type=content_type,
             )
 
-        await asyncio.to_thread(_sync_put)
+        # A thread cannot be force-cancelled. Wait for it to settle so callers
+        # can safely run compensating deletion without racing a late upload.
+        await _await_thread_completion(_sync_put)
         return object_name
     except Exception:
+        logger.warning(
+            "MinIO 异步上传失败: bucket=%s object=%s",
+            bucket_name or settings.minio_bucket_name,
+            object_name,
+            exc_info=True,
+        )
         return None
 
 
@@ -139,6 +300,12 @@ def upload_bytes_to_minio_sync(
         )
         return object_name
     except Exception:
+        logger.warning(
+            "MinIO 同步上传失败: bucket=%s object=%s",
+            bucket_name or settings.minio_bucket_name,
+            object_name,
+            exc_info=True,
+        )
         return None
 
 
@@ -155,6 +322,12 @@ def get_presigned_url(
         )
         return url
     except Exception:
+        logger.warning(
+            "生成 MinIO 预签名 URL 失败: bucket=%s object=%s",
+            bucket_name or settings.minio_bucket_name,
+            object_name,
+            exc_info=True,
+        )
         return None
 
 
@@ -280,8 +453,56 @@ def normalize_minio_url(url: str) -> str:
     )
 
 
-_UUID_IMAGE_FUZZY_CACHE: dict[str, str | None] = {}
-_UUID_PREFIX_OBJECTS_CACHE: dict[str, list[str]] = {}
+def get_minio_image_proxy_url(url: str) -> str | None:
+    """Build a same-origin image URL for a public MinIO ``/files/`` path.
+
+    The proxy is needed because legacy image objects may have literal ``%XX``
+    sequences in their keys and may be stored as ``application/octet-stream``.
+    Browsers cannot reliably resolve that combination directly from MinIO.
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return None
+
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.scheme not in {"http", "https"}:
+        return None
+
+    path = parsed.path if parsed.scheme else raw.split("?", 1)[0].split("#", 1)[0]
+    bucket = (settings.minio_bucket_name or "").strip("/")
+    prefixes = [prefix for prefix in (f"/{bucket}/" if bucket else "", "/files/") if prefix]
+    object_ref = ""
+    for prefix in dict.fromkeys(prefixes):
+        if path.startswith(prefix):
+            object_ref = path[len(prefix):]
+            break
+    if not object_ref:
+        return None
+
+    expires_at = int(time.time()) + 7 * 24 * 60 * 60
+    signature = _build_kb_image_proxy_signature(object_ref, expires_at)
+    return (
+        f"/api/v2/files/kb-image?object_name={quote(object_ref, safe='')}"
+        f"&exp={expires_at}&sig={signature}"
+    )
+
+
+def _build_kb_image_proxy_signature(object_name: str, expires_at: int) -> str:
+    secret = (settings.minio_secret_key or "").encode("utf-8")
+    payload = f"{str(object_name).lstrip('/')}\n{int(expires_at)}".encode("utf-8")
+    return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+
+def verify_kb_image_proxy_signature(
+    object_name: str,
+    expires_at: int | None,
+    signature: str | None,
+) -> bool:
+    if not expires_at or not signature or expires_at < int(time.time()):
+        return False
+    expected = _build_kb_image_proxy_signature(object_name, expires_at)
+    return hmac.compare_digest(expected, signature)
+
 
 class ChunkedUploadManager:
     """分块上传管理器"""
@@ -299,7 +520,48 @@ class ChunkedUploadManager:
 
     def _get_upload_session_dir(self, upload_id: str) -> Path:
         """获取上传会话目录"""
-        return self.temp_dir / upload_id
+        try:
+            normalized = str(uuid.UUID(str(upload_id)))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ValueError("无效的上传会话 ID") from exc
+        if normalized != str(upload_id).lower():
+            raise ValueError("无效的上传会话 ID")
+        return self.temp_dir / normalized
+
+    @contextmanager
+    def _session_lock(self, upload_id: str):
+        session_dir = self._get_upload_session_dir(upload_id)
+        if not session_dir.exists():
+            yield False
+            return
+        lock_path = session_dir / ".lock"
+        with open(lock_path, "a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield True
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _read_session_unlocked(self, upload_id: str) -> dict[str, Any] | None:
+        info_file = self._get_upload_session_dir(upload_id) / "session.json"
+        if not info_file.exists():
+            return None
+        with open(info_file, encoding="utf-8") as f:
+            return self._normalize_session(json.load(f))
+
+    def _write_session_unlocked(self, upload_id: str, session: dict[str, Any]) -> None:
+        session_dir = self._get_upload_session_dir(upload_id)
+        info_file = session_dir / "session.json"
+        temp_file = session_dir / f"session.{os.getpid()}.tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(self._serialize_session(session), f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, info_file)
+
+    @staticmethod
+    def _owned_by(session: dict[str, Any] | None, user_id: str) -> bool:
+        return bool(session) and str(session.get("user_id") or "") == str(user_id or "")
 
     def _serialize_session(self, session: dict[str, Any]) -> dict[str, Any]:
         """将会话对象转换为可 JSON 序列化的结构。"""
@@ -326,7 +588,13 @@ class ChunkedUploadManager:
         return normalized
 
     def init_upload(
-        self, filename: str, total_size: int, content_type: str = None
+        self,
+        filename: str,
+        total_size: int,
+        content_type: str = None,
+        *,
+        user_id: str,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """初始化分块上传
 
@@ -338,6 +606,10 @@ class ChunkedUploadManager:
         Returns:
             上传会话信息
         """
+        if total_size <= 0:
+            raise ValueError("文件大小必须大于 0")
+        if not str(user_id or "").strip():
+            raise ValueError("上传会话必须绑定用户")
         upload_id = str(uuid.uuid4())
         session_dir = self._get_upload_session_dir(upload_id)
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -350,16 +622,15 @@ class ChunkedUploadManager:
             "total_size": total_size,
             "total_chunks": total_chunks,
             "content_type": content_type,
+            "user_id": str(user_id),
             "uploaded_chunks": set(),
             "created_at": datetime.now().isoformat(),
             "chunk_size": self.chunk_size,
+            "metadata": dict(metadata or {}),
+            "state": "open",
         }
 
-        info_file = session_dir / "session.json"
-        with open(info_file, "w", encoding="utf-8") as f:
-            json.dump(
-                self._serialize_session(session_info), f, ensure_ascii=False, indent=2
-            )
+        self._write_session_unlocked(upload_id, session_info)
 
         logger.info(
             f"分块上传已初始化: upload_id={upload_id}, filename={filename}, chunks={total_chunks}"
@@ -367,19 +638,26 @@ class ChunkedUploadManager:
 
         return session_info
 
-    def get_upload_session(self, upload_id: str) -> dict[str, Any] | None:
+    def get_upload_session(
+        self,
+        upload_id: str,
+        *,
+        user_id: str,
+    ) -> dict[str, Any] | None:
         """获取上传会话信息"""
-        session_dir = self._get_upload_session_dir(upload_id)
-        info_file = session_dir / "session.json"
-
-        if not info_file.exists():
-            return None
-
-        with open(info_file, encoding="utf-8") as f:
-            return self._normalize_session(json.load(f))
+        with self._session_lock(upload_id) as exists:
+            if not exists:
+                return None
+            session = self._read_session_unlocked(upload_id)
+            return session if self._owned_by(session, user_id) else None
 
     def save_chunk(
-        self, upload_id: str, chunk_index: int, content: bytes
+        self,
+        upload_id: str,
+        chunk_index: int,
+        content: bytes,
+        *,
+        user_id: str,
     ) -> dict[str, Any]:
         """保存分块
 
@@ -391,33 +669,43 @@ class ChunkedUploadManager:
         Returns:
             保存结果
         """
-        session = self.get_upload_session(upload_id)
-
-        if not session:
-            return {"success": False, "error": "上传会话不存在"}
-
-        if chunk_index >= session["total_chunks"]:
-            return {"success": False, "error": "分块索引超出范围"}
-
-        if chunk_index in session["uploaded_chunks"]:
-            return {"success": True, "message": "分块已存在", "duplicate": True}
-
-        session_dir = self._get_upload_session_dir(upload_id)
-        chunk_file = session_dir / f"chunk_{chunk_index:06d}"
-
         try:
-            with open(chunk_file, "wb") as f:
-                f.write(content)
+            with self._session_lock(upload_id) as exists:
+                if not exists:
+                    return {"success": False, "error": "上传会话不存在"}
+                session = self._read_session_unlocked(upload_id)
+                if not self._owned_by(session, user_id):
+                    return {"success": False, "error": "上传会话不存在"}
+                if session.get("state", "open") != "open":
+                    return {"success": False, "error": "上传会话正在完成"}
+                if chunk_index < 0 or chunk_index >= session["total_chunks"]:
+                    return {"success": False, "error": "分块索引超出范围"}
+                remaining = session["total_size"] - chunk_index * session["chunk_size"]
+                max_chunk_size = min(session["chunk_size"], remaining)
+                if not content or len(content) > max_chunk_size:
+                    return {"success": False, "error": "分块大小无效"}
+                if chunk_index in session["uploaded_chunks"]:
+                    progress = (
+                        len(session["uploaded_chunks"]) / session["total_chunks"] * 100
+                    )
+                    return {
+                        "success": True,
+                        "message": "分块已存在",
+                        "duplicate": True,
+                        "uploaded": len(session["uploaded_chunks"]),
+                        "total": session["total_chunks"],
+                        "progress": progress,
+                    }
 
-            session["uploaded_chunks"].add(chunk_index)
+                session_dir = self._get_upload_session_dir(upload_id)
+                chunk_file = session_dir / f"chunk_{chunk_index:06d}"
+                with open(chunk_file, "wb") as f:
+                    f.write(content)
 
-            info_file = session_dir / "session.json"
-            with open(info_file, "w", encoding="utf-8") as f:
-                json.dump(
-                    self._serialize_session(session), f, ensure_ascii=False, indent=2
-                )
+                session["uploaded_chunks"].add(chunk_index)
+                self._write_session_unlocked(upload_id, session)
 
-            progress = len(session["uploaded_chunks"]) / session["total_chunks"] * 100
+                progress = len(session["uploaded_chunks"]) / session["total_chunks"] * 100
 
             logger.debug(
                 f"分块已保存: upload_id={upload_id}, chunk={chunk_index}, progress={progress:.1f}%"
@@ -438,7 +726,12 @@ class ChunkedUploadManager:
             return {"success": False, "error": str(e)}
 
     def complete_upload(
-        self, upload_id: str, storage_type: str = "documents"
+        self,
+        upload_id: str,
+        storage_type: str = "documents",
+        *,
+        user_id: str,
+        cleanup_on_success: bool = True,
     ) -> tuple[bool, str, str | None]:
         """完成上传，合并所有分块
 
@@ -449,41 +742,51 @@ class ChunkedUploadManager:
         Returns:
             (是否成功, 消息, 文件路径)
         """
-        session = self.get_upload_session(upload_id)
-
-        if not session:
-            return False, "上传会话不存在", None
-
-        if len(session["uploaded_chunks"]) < session["total_chunks"]:
-            missing = set(range(session["total_chunks"])) - session["uploaded_chunks"]
-            return False, f"还有 {len(missing)} 个分块未上传", None
-
-        session_dir = self._get_upload_session_dir(upload_id)
-        filename = session["filename"]
-
-        file_id, final_path = storage_manager.generate_storage_path(
-            filename, storage_type
-        )
-
         try:
-            with open(final_path, "wb") as outfile:
-                for i in range(session["total_chunks"]):
-                    chunk_file = session_dir / f"chunk_{i:06d}"
-                    if chunk_file.exists():
+            with self._session_lock(upload_id) as exists:
+                if not exists:
+                    return False, "上传会话不存在", None
+                session = self._read_session_unlocked(upload_id)
+                if not self._owned_by(session, user_id):
+                    return False, "上传会话不存在", None
+                if session.get("state") == "completed":
+                    return False, "上传会话正在完成", None
+                if session.get("state", "open") != "open":
+                    return False, "上传会话正在完成", None
+                if len(session["uploaded_chunks"]) < session["total_chunks"]:
+                    missing = set(range(session["total_chunks"])) - session["uploaded_chunks"]
+                    return False, f"还有 {len(missing)} 个分块未上传", None
+
+                session_dir = self._get_upload_session_dir(upload_id)
+                filename = session["filename"]
+                file_id, final_path = storage_manager.generate_storage_path(
+                    filename,
+                    storage_type,
+                )
+                with open(final_path, "wb") as outfile:
+                    for i in range(session["total_chunks"]):
+                        chunk_file = session_dir / f"chunk_{i:06d}"
                         with open(chunk_file, "rb") as infile:
                             outfile.write(infile.read())
 
-            total_size = os.path.getsize(final_path)
+                total_size = os.path.getsize(final_path)
 
-            if total_size != session["total_size"]:
-                os.remove(final_path)
-                return (
-                    False,
-                    f"文件大小不匹配: 期望 {session['total_size']}, 实际 {total_size}",
-                    None,
-                )
+                if total_size != session["total_size"]:
+                    os.remove(final_path)
+                    return (
+                        False,
+                        f"文件大小不匹配: 期望 {session['total_size']}, 实际 {total_size}",
+                        None,
+                    )
 
-            self.cleanup_upload_session(upload_id)
+                if cleanup_on_success:
+                    # The route captures session metadata before this call. Cleanup is
+                    # intentionally the final operation while the lock is held.
+                    shutil.rmtree(session_dir)
+                else:
+                    session["state"] = "completed"
+                    session["merged_path"] = final_path
+                    self._write_session_unlocked(upload_id, session)
 
             logger.info(
                 f"分块上传完成: upload_id={upload_id}, file_id={file_id}, path={final_path}"
@@ -495,10 +798,38 @@ class ChunkedUploadManager:
             logger.error(f"合并分块失败: upload_id={upload_id}, {e}")
             return False, f"合并分块失败: {str(e)}", None
 
-    def cancel_upload(self, upload_id: str) -> bool:
+    def reset_completed_upload(self, upload_id: str, *, user_id: str) -> bool:
+        """下游持久化失败后恢复分块会话，使客户端可以安全重试。"""
+        try:
+            with self._session_lock(upload_id) as exists:
+                if not exists:
+                    return False
+                session = self._read_session_unlocked(upload_id)
+                if not self._owned_by(session, user_id):
+                    return False
+                merged_path = str(session.pop("merged_path", "") or "")
+                session["state"] = "open"
+                self._write_session_unlocked(upload_id, session)
+                if merged_path:
+                    try:
+                        os.unlink(merged_path)
+                    except FileNotFoundError:
+                        pass
+            return True
+        except Exception as exc:
+            logger.error("恢复分块上传会话失败: upload_id=%s, %s", upload_id, exc)
+            return False
+
+    def cancel_upload(self, upload_id: str, *, user_id: str) -> bool:
         """取消上传"""
         try:
-            self.cleanup_upload_session(upload_id)
+            with self._session_lock(upload_id) as exists:
+                if not exists:
+                    return False
+                session = self._read_session_unlocked(upload_id)
+                if not self._owned_by(session, user_id):
+                    return False
+                shutil.rmtree(self._get_upload_session_dir(upload_id))
             logger.info(f"上传已取消: upload_id={upload_id}")
             return True
         except Exception as e:
@@ -543,9 +874,14 @@ class ChunkedUploadManager:
 
         return cleaned_count
 
-    def get_upload_progress(self, upload_id: str) -> dict[str, Any] | None:
+    def get_upload_progress(
+        self,
+        upload_id: str,
+        *,
+        user_id: str,
+    ) -> dict[str, Any] | None:
         """获取上传进度"""
-        session = self.get_upload_session(upload_id)
+        session = self.get_upload_session(upload_id, user_id=user_id)
 
         if not session:
             return None
@@ -633,7 +969,7 @@ class StorageManager:
         async with self._atomic_write(storage_path) as temp_path:
             await asyncio.to_thread(Path(temp_path).write_bytes, content)
 
-        file_hash = self.calculate_file_hash(storage_path)
+        file_hash = await asyncio.to_thread(self.calculate_file_hash, storage_path)
         logger.info(
             f"文件已保存: {storage_path} (ID: {file_id}, Hash: {file_hash[:16]}...)"
         )
@@ -762,23 +1098,25 @@ class StorageManager:
             return
 
         cutoff_time = time.time() - (max_age_days * 24 * 60 * 60)
-        deleted_count = 0
-        freed_space = 0
-
-        for file_path in storage_dir.rglob("*"):
-            if file_path.is_file():
+        def _cleanup_sync() -> tuple[int, int]:
+            deleted_count = 0
+            freed_space = 0
+            for file_path in storage_dir.rglob("*"):
+                if not file_path.is_file():
+                    continue
                 try:
-                    file_mtime = file_path.stat().st_mtime
+                    file_stat = file_path.stat()
+                    if file_stat.st_mtime < cutoff_time:
+                        file_path.unlink()
+                        deleted_count += 1
+                        freed_space += file_stat.st_size
+                except FileNotFoundError:
+                    continue
+                except Exception as exc:
+                    logger.warning("清理文件时出错: %s, %s", file_path, exc)
+            return deleted_count, freed_space
 
-                    if file_mtime < cutoff_time:
-                        file_size = file_path.stat().st_size
-
-                        if await self.delete_file(str(file_path)):
-                            deleted_count += 1
-                            freed_space += file_size
-
-                except Exception as e:
-                    logger.warning(f"清理文件时出错: {file_path}, {e}")
+        deleted_count, freed_space = await asyncio.to_thread(_cleanup_sync)
 
         logger.info(
             f"清理完成: {storage_type}, "
@@ -943,23 +1281,24 @@ class StorageManager:
             logger.warning(f"存储目录不存在: {storage_dir}")
             return
 
-        backup_path = (
-            Path(backup_dir)
-            / f"{storage_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        )
-        backup_path.mkdir(parents=True, exist_ok=True)
-
-        backup_count = 0
-
-        for file_path in storage_dir.rglob("*"):
-            if file_path.is_file():
+        def _backup_sync() -> tuple[Path, int]:
+            backup_path = (
+                Path(backup_dir)
+                / f"{storage_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            backup_path.mkdir(parents=True, exist_ok=True)
+            backup_count = 0
+            for file_path in storage_dir.rglob("*"):
+                if not file_path.is_file():
+                    continue
                 relative_path = file_path.relative_to(storage_dir)
                 dest_path = backup_path / relative_path
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
-
                 shutil.copy2(file_path, dest_path)
                 backup_count += 1
+            return backup_path, backup_count
 
+        backup_path, backup_count = await asyncio.to_thread(_backup_sync)
         logger.info(f"备份完成: {backup_path}, 共 {backup_count} 个文件")
 
         return str(backup_path)
@@ -973,15 +1312,17 @@ async def init_storage():
     """初始化存储系统"""
     logger.info("初始化存储系统...")
 
-    stats = storage_manager.get_storage_stats()
+    await asyncio.to_thread(_get_minio_client)
+
+    stats = await asyncio.to_thread(storage_manager.get_storage_stats)
     logger.info(f"存储统计: {stats}")
 
-    disk_info = storage_manager.check_disk_usage()
+    disk_info = await asyncio.to_thread(storage_manager.check_disk_usage)
     logger.info(f"磁盘使用: {disk_info}")
 
     await storage_manager.cleanup_by_policy()
 
-    chunked_upload_manager.cleanup_expired_sessions()
+    await asyncio.to_thread(chunked_upload_manager.cleanup_expired_sessions)
 
     logger.info("存储系统初始化完成")
 
@@ -993,7 +1334,7 @@ async def periodic_cleanup():
             await asyncio.sleep(3600)
             logger.info("执行定期清理...")
             await storage_manager.cleanup_by_policy()
-            chunked_upload_manager.cleanup_expired_sessions()
+            await asyncio.to_thread(chunked_upload_manager.cleanup_expired_sessions)
         except asyncio.CancelledError:
             logger.info("定期清理任务已停止")
             break

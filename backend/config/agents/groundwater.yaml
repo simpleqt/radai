@@ -9,6 +9,8 @@ default_skills:
 default_workflow: full
 allowed_workflows:
   - full
+  - multi_agent_parallel
+  - multi_agent_alternating
 prompt_profile: groundwater
 tool_policy: groundwater_default
 kb_policy: bound_or_selected

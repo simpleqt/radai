@@ -14,15 +14,35 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.api.dependencies.auth import ApiKeyAuth, require_admin
 from backend.config.loggers import get_logger
 from backend.db.connection import get_async_session_factory
-from backend.rag.knowledge_base.manager import get_kb_manager
 from backend.rag.keywords.index_manager import get_keyword_index_manager
 from backend.rag.keywords.models import ExtractionMode
+from backend.rag.knowledge_base.manager import get_kb_manager
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/keywords", tags=["关键词管理"])
 
 _keyword_init_tasks: dict[str, dict] = {}
+_KEYWORD_TASK_RETENTION_SECONDS = 3600
+_MAX_KEYWORD_TASKS = 1000
+
+
+async def _cleanup_keyword_task(task_id: str) -> None:
+    await asyncio.sleep(_KEYWORD_TASK_RETENTION_SECONDS)
+    _keyword_init_tasks.pop(task_id, None)
+
+
+def _prune_keyword_tasks() -> None:
+    overflow = len(_keyword_init_tasks) - _MAX_KEYWORD_TASKS + 1
+    if overflow <= 0:
+        return
+    completed = [
+        task_id
+        for task_id, state in _keyword_init_tasks.items()
+        if state.get("status") in {"success", "failed"}
+    ]
+    for task_id in completed[:overflow]:
+        _keyword_init_tasks.pop(task_id, None)
 
 
 class BuildIndexRequest(BaseModel):
@@ -109,6 +129,12 @@ async def init_keyword_components(
 
     task_id = uuid4().hex
     now = datetime.now().isoformat()
+    _prune_keyword_tasks()
+    if len(_keyword_init_tasks) >= _MAX_KEYWORD_TASKS:
+        raise HTTPException(
+            status_code=429,
+            detail="关键词初始化任务过多，请稍后重试",
+        )
     _keyword_init_tasks[task_id] = {
         "task_id": task_id,
         "status": "running",
@@ -157,6 +183,8 @@ async def init_keyword_components(
             task["message"] = "关键词初始化失败"
             task["updated_at"] = datetime.now().isoformat()
             task["error"] = str(e)
+        finally:
+            asyncio.create_task(_cleanup_keyword_task(task_id))
 
     asyncio.create_task(run_task())
 
@@ -208,9 +236,11 @@ async def build_keyword_index(
             
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"构建关键词索引失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("构建关键词索引失败")
+        raise HTTPException(status_code=500, detail="关键词索引构建失败") from None
 
 
 @router.post("/extract", response_model=ExtractKeywordsResponse)
@@ -253,9 +283,11 @@ async def extract_keywords(
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"提取关键词失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("提取关键词失败")
+        raise HTTPException(status_code=500, detail="关键词提取失败") from None
 
 
 @router.get("/stats/{kb_id}", response_model=IndexStatsResponse)
@@ -290,9 +322,11 @@ async def get_index_stats(
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"获取索引统计失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("获取索引统计失败")
+        raise HTTPException(status_code=500, detail="索引统计查询失败") from None
 
 
 @router.delete("/index/{kb_id}")
@@ -323,9 +357,11 @@ async def delete_keyword_index(
             
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"删除关键词索引失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("删除关键词索引失败")
+        raise HTTPException(status_code=500, detail="关键词索引删除失败") from None
 
 
 @router.post("/invalidate/{kb_id}")
@@ -353,9 +389,11 @@ async def invalidate_keyword_index(
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"使索引缓存失效失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("使索引缓存失效失败")
+        raise HTTPException(status_code=500, detail="索引缓存失效操作失败") from None
 
 
 @router.get("/cached")
@@ -373,6 +411,6 @@ async def list_cached_kb(_auth: ApiKeyAuth = Depends(require_admin)):
             "count": len(cached_kb),
         }
         
-    except Exception as e:
-        logger.error(f"列出缓存知识库失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("列出缓存知识库失败")
+        raise HTTPException(status_code=500, detail="缓存知识库查询失败") from None

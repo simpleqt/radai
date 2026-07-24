@@ -16,6 +16,7 @@ class FilterMode(Enum):
     PPR_MMR = "ppr_mmr"
     FULL = "full"
     MMR_ONLY = "mmr_only"  # 跳过 PPR，仅 MMR 重排序
+    MMR_TIME_AWARE = "mmr_time_aware"  # MMR + Time-Aware（跳过 PPR 与 Rerank）
     RERANK_MMR = "rerank_mmr"  # 跳过 PPR，直接 Rerank + MMR
     RERANK = "rerank"                # 跳过 PPR，仅 Rerank
     PPR_RERANK_MMR = "ppr_rerank_mmr" # PPR + Rerank + MMR (默认)
@@ -30,7 +31,7 @@ class TimeAwareConfig:
     alpha_base: float = 0.3
     time_high_boost: float = 0.4
     time_low_penalty: float = 0.3
-    undated_doc_beta: float = 0.0
+    undated_doc_beta: float = 0.7
     created_at_fallback_beta: float = 0.1
 
 

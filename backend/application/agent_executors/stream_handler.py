@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import time
 from typing import Any, AsyncIterator
 
-from backend.application.artifacts.artifact_utils import build_registered_artifact_metadata
-from backend.config.loggers import get_logger
-from backend.application.agent_executors.image_url_registry import StreamingTokenResolver, resolve_image_tokens
-from backend.application.agents.prompt_templates.ne import SUPPRESSED_TOOL_RESULT_TOOLS
+from backend.application.agent_executors.image_url_registry import (
+    StreamingTokenResolver,
+    inject_missing_captioned_images,
+    resolve_image_tokens,
+)
 from backend.application.agent_executors.stream_utils import (
     build_task_runtime_metadata,
     extract_chat_model_output_text,
@@ -24,7 +27,22 @@ from backend.application.agent_executors.stream_utils import (
     stringify_message_content,
     summarize_tool_output,
 )
+from backend.application.agents.prompt_templates.ne import SUPPRESSED_TOOL_RESULT_TOOLS
+from backend.application.artifacts.artifact_utils import (
+    build_registered_artifact_metadata,
+)
 from backend.application.event_stream.thinking_filter import split_thinking_segments
+from backend.application.image_pipeline import sanitize_answer_image_urls
+from backend.application.tools.result_metadata import parse_tool_result_metadata
+from backend.config.loggers import get_logger
+from backend.core.agents.context.ledger import (
+    make_evidence_record,
+    parse_multikb_text_evidence,
+)
+from backend.core.agents.context.structured_result import (
+    compact_structured_result,
+    structured_result_fingerprint,
+)
 
 logger = get_logger(__name__)
 
@@ -36,6 +54,265 @@ _GROUNDWATER_PROJECT_EVIDENCE_TOOLS = {
     "groundwater_prediction",
     "groundwater_quality_check",
 }
+_COORDINATED_EVIDENCE_TOOLS = {
+    "multi_kb_search",
+    "academic_search",
+    "chat_file_search",
+    "list_experiment_datasets",
+    "inspect_excel_data",
+    "query_excel_data",
+    "summarize_excel_data",
+    "inspect_project_tables",
+    "query_project_tables",
+    "summarize_project_table",
+    "groundwater_prediction",
+    "groundwater_quality_check",
+    "groundwater_kml_summary",
+}
+_TOOL_OUTPUT_CONTENT_KEYS = (
+    "text",
+    "content",
+    "output",
+    "result",
+    "results",
+    "answer",
+    "summary",
+    "data",
+    "rows",
+    "records",
+    "tables",
+    "datasets",
+    "schema",
+    "statistics",
+)
+
+
+def _coordinated_tool_output_content(raw_output: Any) -> str:
+    """Read result-bearing fields without treating tool inputs as evidence."""
+
+    visited: set[int] = set()
+
+    def extract(candidate: Any, *, allow_collection: bool = False) -> str:
+        if candidate is None:
+            return ""
+        candidate_id = id(candidate)
+        if candidate_id in visited:
+            return ""
+        visited.add(candidate_id)
+        if isinstance(candidate, str):
+            text = candidate.strip()
+            if not text:
+                return ""
+            if text.startswith(("{", "[")):
+                try:
+                    decoded = json.loads(text)
+                except (TypeError, json.JSONDecodeError):
+                    return text
+                decoded_content = extract(decoded, allow_collection=True)
+                return decoded_content
+            return text
+        if isinstance(candidate, dict):
+            for key in _TOOL_OUTPUT_CONTENT_KEYS:
+                if key not in candidate:
+                    continue
+                value = candidate.get(key)
+                content = extract(value, allow_collection=True)
+                if content:
+                    return content
+            return ""
+        if isinstance(candidate, (list, tuple, set)):
+            if not allow_collection:
+                return ""
+            try:
+                return json.dumps(list(candidate), ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                return stringify_message_content(list(candidate)).strip()
+        candidate_content = getattr(candidate, "content", None)
+        content = extract(candidate_content, allow_collection=True)
+        if content:
+            return content
+        return extract(getattr(candidate, "artifact", None), allow_collection=True)
+
+    return extract(raw_output, allow_collection=True)
+
+
+def _coordinated_tool_evidence_records(
+    tool_name: str | None,
+    raw_output: Any,
+    *,
+    tool_run_id: str,
+) -> list[dict[str, Any]]:
+    """Extract bounded, internal-only evidence from one successful tool result."""
+
+    normalized_tool = str(tool_name or "").strip()
+    if normalized_tool not in _COORDINATED_EVIDENCE_TOOLS:
+        return []
+
+    queue: list[Any] = [raw_output]
+    visited: set[int] = set()
+    structured: list[dict[str, Any]] = []
+    while queue and len(visited) < 64:
+        candidate = queue.pop(0)
+        if candidate is None:
+            continue
+        candidate_id = id(candidate)
+        if candidate_id in visited:
+            continue
+        visited.add(candidate_id)
+        if isinstance(candidate, dict):
+            for key in ("evidence_records", "evidence"):
+                records = candidate.get(key)
+                if isinstance(records, list):
+                    structured.extend(
+                        dict(record) for record in records if isinstance(record, dict)
+                    )
+            queue.extend(candidate.values())
+        elif isinstance(candidate, (list, tuple, set)):
+            queue.extend(candidate)
+        elif isinstance(candidate, str):
+            text = candidate.strip()
+            if text.startswith(("{", "[")):
+                try:
+                    queue.append(json.loads(text))
+                except (TypeError, json.JSONDecodeError):
+                    pass
+        else:
+            artifact = getattr(candidate, "artifact", None)
+            if artifact is not None:
+                queue.append(artifact)
+            candidate_content = getattr(candidate, "content", None)
+            if candidate_content is not None:
+                queue.append(candidate_content)
+
+    records: list[dict[str, Any]] = []
+    for index, record in enumerate(structured[:12], start=1):
+        record_content = str(record.get("content") or record.get("claim") or "").strip()
+        if not record_content:
+            continue
+        records.append(
+            make_evidence_record(
+                source_tool=str(record.get("source_tool") or normalized_tool),
+                content=record_content,
+                category=(
+                    "retrieval"
+                    if str(record.get("category") or "") == "retrieval"
+                    or normalized_tool
+                    in {"multi_kb_search", "academic_search", "chat_file_search"}
+                    else "tool_result"
+                ),
+                source_id=str(record.get("source_id") or normalized_tool),
+                chunk_id=str(record.get("chunk_id") or tool_run_id or index),
+                doc_title=str(
+                    record.get("doc_title")
+                    or record.get("source_id")
+                    or normalized_tool
+                ),
+                score=(
+                    record.get("score")
+                    if isinstance(record.get("score"), (int, float))
+                    else None
+                ),
+                kind=str(record.get("kind") or "") or None,
+                raw_ref=str(record.get("raw_ref") or "") or None,
+                tags=[str(tag) for tag in record.get("tags") or []][:10],
+            )
+        )
+    if records:
+        return records
+
+    content = _coordinated_tool_output_content(raw_output)
+    if not content:
+        return []
+    if normalized_tool == "multi_kb_search":
+        parsed_records = parse_multikb_text_evidence(content)
+        if parsed_records:
+            return [dict(record) for record in parsed_records[:12]]
+
+    if normalized_tool == "academic_search":
+        sections = [section.strip() for section in content.split("\n### ") if section.strip()]
+        paper_sections = sections[1:] if len(sections) > 1 else sections
+        for index, section in enumerate(paper_sections[:8], start=1):
+            lines = section.splitlines()
+            title = lines[0].strip("# ") if lines else f"academic result {index}"
+            records.append(
+                make_evidence_record(
+                    source_tool=normalized_tool,
+                    content=section,
+                    category="retrieval",
+                    source_id=title,
+                    chunk_id=f"{tool_run_id or 'result'}-{index}",
+                    doc_title=title,
+                    kind="retrieval",
+                    tags=["evidence", "academic"],
+                )
+            )
+        if records:
+            return records
+
+    return [
+        make_evidence_record(
+            source_tool=normalized_tool,
+            content=content,
+            category=("retrieval" if normalized_tool == "chat_file_search" else "tool_result"),
+            source_id=normalized_tool,
+            chunk_id=tool_run_id or "result",
+            doc_title=f"{normalized_tool} result",
+            tags=["evidence", "coordinated_tool_result"],
+        )
+    ]
+
+
+def _extract_context_compaction(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Find middleware compaction metadata without traversing message bodies."""
+
+    queue: list[Any] = [event.get("data"), event.get("output")]
+    visited: set[int] = set()
+    while queue and len(visited) < 32:
+        candidate = queue.pop(0)
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = id(candidate)
+        if candidate_id in visited:
+            continue
+        visited.add(candidate_id)
+        metadata = candidate.get("context_compaction")
+        if isinstance(metadata, dict) and metadata.get("window_id"):
+            return dict(metadata)
+        for key, value in candidate.items():
+            if key in {"messages", "context_records", "context_items", "context_pack"}:
+                continue
+            if isinstance(value, dict):
+                queue.append(value)
+    return None
+
+
+def _display_compaction_summary(value: object, *, max_chars: int = 4000) -> str:
+    text = str(value or "").strip()
+    if text.startswith("Another language model started to solve this problem"):
+        _, separator, remainder = text.partition("\n")
+        if separator:
+            text = remainder.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n...[truncated]"
+
+
+def _counts_toward_project_query_budget(raw_output: Any) -> bool:
+    """Count only successful data queries, not rejected SQL or schema lookups."""
+    candidate = raw_output
+    if hasattr(candidate, "content"):
+        candidate = getattr(candidate, "content")
+    elif isinstance(candidate, dict):
+        if "counts_toward_query_budget" in candidate:
+            return candidate.get("counts_toward_query_budget") is not False
+        candidate = candidate.get("output") or candidate.get("content") or candidate.get("result")
+    try:
+        payload = json.loads(str(candidate or ""))
+    except (TypeError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    return payload.get("counts_toward_query_budget") is not False
 
 
 def _extract_ai_message_from_output(output: Any) -> Any | None:
@@ -129,6 +406,31 @@ def _extract_tool_call_names(output: Any) -> list[str]:
     return names
 
 
+def _extract_graph_message_stream(event: dict[str, Any]) -> Any | None:
+    """Extract LangGraph ``messages`` mode payloads from chain stream events."""
+
+    if event.get("event") != "on_chain_stream":
+        return None
+    data = event.get("data") or {}
+    if not isinstance(data, dict):
+        return None
+    candidate = data.get("chunk")
+    if (
+        isinstance(candidate, tuple)
+        and len(candidate) == 2
+        and candidate[0] == "messages"
+    ):
+        candidate = candidate[1]
+    if not isinstance(candidate, tuple) or len(candidate) != 2:
+        return None
+    message, metadata = candidate
+    if not isinstance(metadata, dict):
+        return None
+    if str(metadata.get("langgraph_node") or "") != "model":
+        return None
+    return message if hasattr(message, "content") else None
+
+
 class NEAgentStreamHandler:
     """Translate LangGraph events into frontend SSE payloads."""
 
@@ -142,6 +444,7 @@ class NEAgentStreamHandler:
         selected_skills: set[str] | None = None,
         kb_ids: list[str] | None = None,
         use_search: bool = True,
+        capture_tool_evidence: bool = False,
     ):
         self._is_deep_research = is_deep_research
         self._thread_id = thread_id
@@ -150,6 +453,7 @@ class NEAgentStreamHandler:
         self._selected_skills: set[str] = set(selected_skills or ())
         self._kb_ids: list[str] = list(kb_ids or [])
         self._use_search = use_search
+        self._capture_tool_evidence = bool(capture_tool_evidence)
 
         self.answer_fragments: list[str] = []
         self.collected_research_notes: list[str] = []
@@ -164,6 +468,7 @@ class NEAgentStreamHandler:
         self.deep_research_active_task_ids: set[str] = set()
 
         self._tool_started_at: dict[str, float] = {}
+        self._tool_inputs: dict[str, dict[str, Any]] = {}
         self._current_gen_has_tool_calls = False
         self._normal_output_chars = 0
         self._analysis_status_sent = False
@@ -190,10 +495,16 @@ class NEAgentStreamHandler:
         self._in_thinking_markup = False
         self._thinking_markup_carry = ""
         self._project_evidence_fragments: list[str] = []
+        self._project_evidence_fingerprints: set[str] = set()
         self._retrieved_evidence_fragments: list[str] = []
-        self._writer_handoff_ready = False
+        self._evidence_convergence_ready = False
         self._knowledge_target_missed = False
         self._web_evidence_fragments: list[str] = []
+        self._last_evaluated_evidence_fingerprint = ""
+        self._evidence_gap_text = ""
+        self._project_table_query_count = 0
+        self._seen_context_window_ids: set[str] = set()
+        self._saw_chat_model_callbacks = False
 
     def set_stream_exit_reason(self, reason: str) -> None:
         self._stream_exit_reason = reason
@@ -226,6 +537,39 @@ class NEAgentStreamHandler:
         if len(target) > max_items:
             del target[: len(target) - max_items]
 
+    def _append_project_evidence(
+        self,
+        *,
+        tool_name: str,
+        raw_output: Any,
+        tool_input: dict[str, Any],
+    ) -> None:
+        compact = compact_structured_result(raw_output, max_chars=5000)
+        evidence = compact or self._stringify_evidence(raw_output, max_chars=6000)
+        fingerprint = structured_result_fingerprint(raw_output)
+        if fingerprint is None:
+            fingerprint = hashlib.sha256(
+                f"{tool_name}\0{evidence}".encode("utf-8")
+            ).hexdigest()
+        if fingerprint in self._project_evidence_fingerprints:
+            return
+        self._project_evidence_fingerprints.add(fingerprint)
+        input_text = self._stringify_evidence(tool_input, max_chars=1600)
+        wrapped = (
+            f'<project_tool_result name="{tool_name}">\n'
+            f"<tool_input>\n{input_text}\n</tool_input>\n"
+            f"<tool_output>\n{evidence}\n</tool_output>\n"
+            "</project_tool_result>"
+        )
+        self._append_evidence(
+            self._project_evidence_fragments,
+            wrapped,
+            # ContextLedger performs the model-aware token fit. Preserve
+            # distinct source blocks until then instead of applying a second
+            # four-item recency window here.
+            max_items=16,
+        )
+
     @property
     def project_evidence_text(self) -> str:
         return "\n\n".join(self._project_evidence_fragments)
@@ -234,21 +578,60 @@ class NEAgentStreamHandler:
     def retrieved_evidence_text(self) -> str:
         return "\n\n".join([*self._retrieved_evidence_fragments, *self._web_evidence_fragments])
 
-    def should_handoff_to_writer(self, *, min_retrieval_blocks: int = 1) -> bool:
+    def evidence_fingerprint(self) -> str:
+        payload = f"{self.project_evidence_text}\n---\n{self.retrieved_evidence_text}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def should_evaluate_evidence(self, *, min_retrieval_blocks: int = 1) -> bool:
+        fingerprint = self.evidence_fingerprint()
+        project_only_ready = self._project_table_query_count >= 2
+        retrieval_ready = (
+            len(self._retrieved_evidence_fragments) >= max(1, min_retrieval_blocks)
+        )
         return (
             not self._is_deep_research
             and (
-                self._writer_handoff_ready
-                or len(self._retrieved_evidence_fragments) >= max(1, min_retrieval_blocks)
+                self._evidence_convergence_ready
+                or retrieval_ready
+                or project_only_ready
             )
             and bool(self._project_evidence_fragments)
-            and bool(self._retrieved_evidence_fragments)
             and (
                 not self._knowledge_target_missed
                 or not self._use_search
                 or bool(self._web_evidence_fragments)
             )
-            and not "".join(self.answer_fragments).strip()
+            and fingerprint != self._last_evaluated_evidence_fingerprint
+        )
+
+    def mark_evidence_evaluated(self, fingerprint: str) -> None:
+        self._last_evaluated_evidence_fingerprint = fingerprint
+
+    @property
+    def evidence_gap_text(self) -> str:
+        return self._evidence_gap_text
+
+    def record_evidence_gap(
+        self,
+        missing_evidence: list[str],
+        next_action: str,
+    ) -> None:
+        """Keep the latest evaluator verdict for the no-tool writer handoff."""
+        lines = [
+            f"- {str(item).strip()}"
+            for item in missing_evidence[:6]
+            if str(item).strip()
+        ]
+        if str(next_action or "").strip():
+            lines.append(f"- 建议补充：{str(next_action).strip()}")
+        self._evidence_gap_text = "\n".join(lines)
+
+    def should_force_evidence_convergence(self, *, max_queries: int = 8) -> bool:
+        """Converge after repeated project probing has produced usable evidence."""
+        return (
+            not self._is_deep_research
+            and self._project_table_query_count >= max(1, max_queries)
+            and bool(self._project_evidence_fragments)
         )
 
     @staticmethod
@@ -333,10 +716,75 @@ class NEAgentStreamHandler:
     async def handle(self, event: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
         self.event_count += 1
         kind = event.get("event")
-
         tags = event.get("tags") or []
         metadata = event.get("metadata") or {}
-        is_summarization = "summarization" in tags or metadata.get("purpose") == "summarization"
+
+        # Agentic RAG invokes a planner/evaluator model from inside the
+        # ``multi_kb_search`` tool.  LangGraph propagates those nested model
+        # callbacks to the outer event stream.  Their strict JSON responses
+        # are retrieval control-plane data and must never become visible
+        # ``message.delta`` answer text or alter main-model round accounting.
+        internal_purpose = str(metadata.get("purpose") or "")
+        is_agentic_rag_internal = (
+            "agentic-rag-internal" in tags
+            or metadata.get("agentic_rag_internal") is True
+            or internal_purpose.startswith("agentic_rag_")
+        )
+        if is_agentic_rag_internal:
+            return
+
+        if kind in {
+            "on_chat_model_start",
+            "on_chat_model_stream",
+            "on_chat_model_end",
+        }:
+            self._saw_chat_model_callbacks = True
+
+        is_large_result_summarization = (
+            "large-result-subagent" in tags
+            or metadata.get("purpose") == "large_result_summarization"
+        )
+        if is_large_result_summarization:
+            if kind == "on_chat_model_start":
+                yield {
+                    "type": "status",
+                    "content": "正在压缩较长的工具结果，请稍候；关键来源信息会继续保留...",
+                }
+                yield {
+                    "type": "event",
+                    "event": make_process_event(
+                        kind="tool_start",
+                        title="正在压缩工具结果",
+                        detail=(
+                            "工具结果正文较长，正在隔离上下文中提取结论和关键证据；"
+                            "来源标识会继续保留。"
+                        ),
+                        tool="large_result_summarization",
+                        level="active",
+                    ),
+                }
+            elif kind == "on_chat_model_end":
+                yield {"type": "status", "content": "工具结果压缩完成，继续执行任务"}
+                yield {
+                    "type": "event",
+                    "event": make_process_event(
+                        kind="tool_end",
+                        title="工具结果压缩完成",
+                        detail=(
+                            "已将较长的工具结果压缩为主智能体可直接使用的证据摘要，"
+                            "关键来源标识保持可用。"
+                        ),
+                        tool="large_result_summarization",
+                        level="success",
+                    ),
+                }
+            return
+
+        is_summarization = (
+            "summarization" in tags
+            or "history-compaction" in tags
+            or metadata.get("purpose") in {"summarization", "history_compaction"}
+        )
 
         if is_summarization:
             if kind == "on_chat_model_start":
@@ -369,21 +817,7 @@ class NEAgentStreamHandler:
             async for item in self._on_model_stream(event):
                 yield item
         elif kind == "on_chat_model_start":
-            self._model_generation_round += 1
-            self._skipped_stream_chunks_tool_round = 0
-            self._current_gen_has_tool_calls = False
-            self._round_forwarded_chars = 0
-            self._round_reasoning_chars = 0
-            self._model_round_open = True
-            self._token_resolver = StreamingTokenResolver()
-            if not self._generation_status_sent:
-                self._generation_status_sent = True
-            logger.info(
-                "[NEAgentStreamHandler] 模型轮次开始: round=%d thread_id=%s deep_research=%s",
-                self._model_generation_round,
-                self._thread_id,
-                self._is_deep_research,
-            )
+            self._start_model_round()
         elif kind == "on_chat_model_end":
             async for item in self._on_model_end(event):
                 yield item
@@ -399,8 +833,56 @@ class NEAgentStreamHandler:
         elif kind == "on_chain_end":
             async for item in self._on_chain_end(event):
                 yield item
-        elif kind in {"on_custom_event", "on_chain_stream"}:
+        elif kind == "on_chain_stream":
+            graph_message = _extract_graph_message_stream(event)
+            if graph_message is not None and not self._saw_chat_model_callbacks:
+                async for item in self._on_graph_message_stream(graph_message):
+                    yield item
+                return
             async for item in self._on_task_runtime(event):
+                yield item
+        elif kind == "on_custom_event":
+            async for item in self._on_task_runtime(event):
+                yield item
+
+    def _start_model_round(self) -> None:
+        self._model_generation_round += 1
+        self._skipped_stream_chunks_tool_round = 0
+        self._current_gen_has_tool_calls = False
+        self._round_forwarded_chars = 0
+        self._round_reasoning_chars = 0
+        self._model_round_open = True
+        self._token_resolver = StreamingTokenResolver()
+        if not self._generation_status_sent:
+            self._generation_status_sent = True
+        logger.info(
+            "[NEAgentStreamHandler] 模型轮次开始: round=%d thread_id=%s deep_research=%s",
+            self._model_generation_round,
+            self._thread_id,
+            self._is_deep_research,
+        )
+
+    async def _on_graph_message_stream(
+        self,
+        message: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Fallback for LangGraph versions that expose model output as chain data."""
+
+        if not self._model_round_open:
+            self._start_model_round()
+        if getattr(message, "tool_calls", None):
+            self._current_gen_has_tool_calls = True
+        async for item in self._on_model_stream(
+            {"event": "on_chat_model_stream", "data": {"chunk": message}}
+        ):
+            yield item
+
+        is_chunk = type(message).__name__.endswith("Chunk")
+        is_last_chunk = str(getattr(message, "chunk_position", "") or "") == "last"
+        if not is_chunk or is_last_chunk:
+            async for item in self._on_model_end(
+                {"event": "on_chat_model_end", "data": {"output": message}}
+            ):
                 yield item
 
     def log_session_diagnostic(self) -> None:
@@ -531,6 +1013,20 @@ class NEAgentStreamHandler:
 
         if (
             not self._is_deep_research
+            and self.timeout_reached
+            and not "".join(self.answer_fragments).strip()
+        ):
+            msg = (
+                "当前流程在生成最终答案前超时，已停止继续检索。"
+                "本次问题和已完成的查询会保留在历史记录中；请重新发送问题以继续。"
+            )
+            self.answer_fragments.append(msg)
+            self.chunk_count += 1
+            self._normal_output_chars += len(msg)
+            yield {"type": "chunk", "content": msg}
+
+        if (
+            not self._is_deep_research
             and self._malformed_tool_call_rounds > 0
             and not "".join(self.answer_fragments).strip()
         ):
@@ -543,6 +1039,17 @@ class NEAgentStreamHandler:
             self.chunk_count += 1
             self._normal_output_chars += len(msg)
             yield {"type": "chunk", "content": msg}
+
+        current_answer = "".join(self.answer_fragments)
+        corrected_answer = inject_missing_captioned_images(current_answer)
+        corrected_answer = sanitize_answer_image_urls(corrected_answer)
+        if corrected_answer != current_answer:
+            self.answer_fragments = [corrected_answer]
+            self._normal_output_chars = len(corrected_answer)
+            yield {
+                "type": "message.replace",
+                "payload": {"content": corrected_answer},
+            }
 
         detail = (
             f"本轮共处理 {self.event_count} 个事件，生成 {self.chunk_count} 个输出片段"
@@ -678,6 +1185,10 @@ class NEAgentStreamHandler:
             self._malformed_tool_call_rounds += 1
         existing_text = "".join(self.answer_fragments)
         missing_text = self._compute_missing_tail(existing_text, final_text)
+        if malformed_tool_call and "<tool_call" in final_text.lower():
+            # Some OpenAI-compatible gateways return an unparsed tool call as
+            # message text. It is control-plane data, never an answer.
+            missing_text = ""
 
         round_summary = {
             "round": self._model_generation_round,
@@ -772,11 +1283,29 @@ class NEAgentStreamHandler:
                 self._round_forwarded_chars += len(recovered_chunk)
                 yield {"type": "chunk", "content": recovered_chunk}
 
+    @staticmethod
+    def _tool_run_id(event: dict[str, Any]) -> str:
+        metadata = event.get("metadata") or {}
+        data = event.get("data") or {}
+        candidates = (
+            event.get("run_id"),
+            metadata.get("tool_run_id") if isinstance(metadata, dict) else None,
+            metadata.get("tool_call_id") if isinstance(metadata, dict) else None,
+            data.get("tool_call_id") if isinstance(data, dict) else None,
+        )
+        for candidate in candidates:
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        return ""
+
     async def _on_tool_start(self, event: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
         tool_name = event.get("name")
+        tool_run_id = self._tool_run_id(event)
+        tool_run_key = tool_run_id or str(tool_name or "unknown")
         if tool_name:
             self._tools_invoked.append(str(tool_name))
-        self._tool_started_at[tool_name] = time.monotonic()
+        self._tool_started_at[tool_run_key] = time.monotonic()
         data = event.get("data", {}) or {}
         tool_input = data.get("input", {})
 
@@ -785,18 +1314,30 @@ class NEAgentStreamHandler:
                 tool_input = json.loads(tool_input)
             except Exception:
                 tool_input = {"query": tool_input}
+        if not isinstance(tool_input, dict):
+            tool_input = {"input": tool_input}
+        self._tool_inputs[tool_run_key] = dict(tool_input)
 
         if tool_name == "multi_kb_search":
             q = tool_input.get("query", "未知")
             kb_ids = tool_input.get("kb_ids")
-            from backend.application.tools.providers.multi_kb_search_tool import DEFAULT_KB_ID, KB_LABELS, PAPER_KB_ID
+            effective_kb_ids = kb_ids if kb_ids else self._kb_ids
+            from backend.application.knowledge_bases.catalog_service import (
+                resolve_knowledge_base_labels,
+            )
 
-            effective_kb_ids = kb_ids if kb_ids else (self._kb_ids or [DEFAULT_KB_ID, PAPER_KB_ID])
-            kb_names = [KB_LABELS.get(kid, kid) for kid in effective_kb_ids]
-            kb_names_str = "、".join(kb_names)
+            try:
+                kb_names = await asyncio.wait_for(
+                    resolve_knowledge_base_labels(effective_kb_ids),
+                    timeout=5.0,
+                )
+            except (asyncio.TimeoutError, TimeoutError):  # noqa: UP041
+                logger.warning("知识库标签解析超时，使用降级标签")
+                kb_names = []
+            kb_names_str = "、".join(kb_names) or "已授权知识库"
             title = "检索专业知识库"
             detail = f"正在{kb_names_str}中检索: '{q}'"
-        elif tool_name in {"web_search", "duckduckgo_search"}:
+        elif tool_name == "web_search":
             q = tool_input.get("query", "未知")
             title = "联网搜索"
             detail = f"正在搜索全网资讯: '{q}'"
@@ -815,6 +1356,9 @@ class NEAgentStreamHandler:
             title = "工具调用"
             detail = f"使用工具: {tool_name}"
 
+        event_metadata: dict[str, Any] = {"input": tool_input}
+        if tool_run_id:
+            event_metadata["tool_run_id"] = tool_run_id
         yield {
             "type": "event",
             "event": make_process_event(
@@ -823,14 +1367,18 @@ class NEAgentStreamHandler:
                 detail=detail,
                 tool=tool_name,
                 level="active",
-                metadata={"input": tool_input},
+                metadata=event_metadata,
+                event_key=(f"tool_start:{tool_run_id}" if tool_run_id else None),
             ),
         }
 
     async def _on_tool_end(self, event: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
         tool_name = event.get("name")
+        tool_run_id = self._tool_run_id(event)
+        tool_run_key = tool_run_id or str(tool_name or "unknown")
         elapsed_ms = None
-        started_at = self._tool_started_at.pop(tool_name, None)
+        started_at = self._tool_started_at.pop(tool_run_key, None)
+        tool_input = self._tool_inputs.pop(tool_run_key, {})
         if started_at is not None:
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
 
@@ -840,29 +1388,35 @@ class NEAgentStreamHandler:
         data = event.get("data", {}) or {}
         raw_output = data.get("output") or data.get("content") or data.get("result")
         summary = summarize_tool_output(raw_output)
-        result_metadata: dict[str, Any] = {"source": "tool_output"}
+        parsed_metadata = parse_tool_result_metadata(tool_name, raw_output)
+        result_metadata: dict[str, Any] = parsed_metadata.as_dict()
+        if tool_run_id:
+            result_metadata["tool_run_id"] = tool_run_id
 
         if not self._is_deep_research:
             if tool_name in _GROUNDWATER_PROJECT_EVIDENCE_TOOLS:
-                evidence = self._stringify_evidence(raw_output, max_chars=12000)
-                self._append_evidence(
-                    self._project_evidence_fragments,
-                    f"<project_tool_result name=\"{tool_name}\">\n{evidence}\n</project_tool_result>",
-                    max_items=4,
-                )
+                keep_as_project_evidence = True
+                if tool_name == "query_project_tables":
+                    keep_as_project_evidence = _counts_toward_project_query_budget(raw_output)
+                    if keep_as_project_evidence:
+                        self._project_table_query_count += 1
+                if keep_as_project_evidence:
+                    self._append_project_evidence(
+                        tool_name=str(tool_name or "unknown"),
+                        raw_output=raw_output,
+                        tool_input=tool_input,
+                    )
             elif tool_name == "multi_kb_search":
                 evidence = self._stringify_evidence(raw_output, max_chars=10000)
-                self._knowledge_target_missed = (
-                    "<target_document_match>false</target_document_match>" in evidence
-                )
+                self._knowledge_target_missed = parsed_metadata.target_document_match is False
                 self._append_evidence(
                     self._retrieved_evidence_fragments,
                     f"<knowledge_tool_result name=\"multi_kb_search\">\n{evidence}\n</knowledge_tool_result>",
                     max_items=4,
                 )
-                if "知识库检索次数已达上限" in evidence and self._project_evidence_fragments:
-                    self._writer_handoff_ready = True
-            elif tool_name in {"web_search", "duckduckgo_search"}:
+                if parsed_metadata.budget_exhausted and self._project_evidence_fragments:
+                    self._evidence_convergence_ready = True
+            elif tool_name == "web_search":
                 evidence = self._stringify_evidence(raw_output, max_chars=10000)
                 self._append_evidence(
                     self._web_evidence_fragments,
@@ -870,22 +1424,32 @@ class NEAgentStreamHandler:
                     max_items=2,
                 )
 
-        if tool_name in {"web_search", "duckduckgo_search"}:
+        if tool_name == "web_search":
             result_metadata.update(extract_web_search_metadata(raw_output))
         elif tool_name in {"save_deep_research_report", "generate_html_ppt"}:
             result_metadata.update(extract_report_metadata(raw_output))
+        if self._capture_tool_evidence:
+            evidence_records = _coordinated_tool_evidence_records(
+                tool_name,
+                raw_output,
+                tool_run_id=tool_run_id,
+            )
+            if evidence_records:
+                # The coordinator consumes this private field and removes it
+                # before emitting the parent process event to clients.
+                result_metadata["_coordination_evidence_records"] = evidence_records
 
         status_title = "工具调用完成"
         status_detail = f"{tool_name} 调用完成"
 
         if tool_name == "multi_kb_search":
-            if "<target_document_match>false</target_document_match>" in self._stringify_evidence(raw_output, max_chars=10000):
+            if parsed_metadata.target_document_match is False:
                 status_title = "目标标准未命中"
                 status_detail = "知识库仅返回相关资料，将继续使用联网搜索核验目标标准"
             else:
                 status_title = "知识库检索完成"
                 status_detail = "已成功获取相关的知识库文档"
-        elif tool_name in {"web_search", "duckduckgo_search"}:
+        elif tool_name == "web_search":
             status_title = "网络搜索完成"
             status_detail = "已获取网页参考资讯"
         elif tool_name == "academic_search":
@@ -939,15 +1503,21 @@ class NEAgentStreamHandler:
                 tool=tool_name,
                 level="warning" if tool_end_warning else "success",
                 duration_ms=elapsed_ms,
+                metadata=(
+                    {"tool_run_id": tool_run_id}
+                    if tool_run_id
+                    else None
+                ),
+                event_key=(f"tool_end:{tool_run_id}" if tool_run_id else None),
             ),
         }
 
         should_emit_tool_result = tool_name not in SUPPRESSED_TOOL_RESULT_TOOLS
         if summary and should_emit_tool_result:
-            if tool_name in {"multi_kb_search", "web_search", "duckduckgo_search", "academic_search", "task"}:
+            if tool_name in {"multi_kb_search", "web_search", "academic_search", "task"}:
                 self.collected_research_notes.append(f"- [{tool_name}] {summary}")
             tool_result_detail = summary
-            if tool_name in {"web_search", "duckduckgo_search"}:
+            if tool_name == "web_search":
                 total = result_metadata.get("total_results")
                 url_count = len(result_metadata.get("urls") or [])
                 if isinstance(total, int) and url_count:
@@ -965,6 +1535,7 @@ class NEAgentStreamHandler:
                     duration_ms=elapsed_ms,
                     summary=summary,
                     metadata=result_metadata,
+                    event_key=(f"tool_result:{tool_run_id}" if tool_run_id else None),
                 ),
             }
 
@@ -976,12 +1547,30 @@ class NEAgentStreamHandler:
                     result_metadata.get("title")
                     or ("深度研究报告" if tool_name == "save_deep_research_report" else "HTML PPT")
                 )
-                artifact_metadata = await build_registered_artifact_metadata(
-                    internal_thread_id=self._thread_id,
-                    artifact_path=artifact_path,
-                    title=artifact_title,
-                    minio_object=str(result_metadata.get("minio_object") or "") or None,
-                )
+                try:
+                    artifact_metadata = await asyncio.wait_for(
+                        build_registered_artifact_metadata(
+                            internal_thread_id=self._thread_id,
+                            artifact_path=artifact_path,
+                            title=artifact_title,
+                            minio_object=(
+                                str(result_metadata.get("minio_object") or "") or None
+                            ),
+                        ),
+                        timeout=10.0,
+                    )
+                except (asyncio.TimeoutError, TimeoutError):  # noqa: UP041
+                    logger.warning(
+                        "工具工件元数据注册超时: tool=%s path=%s",
+                        tool_name,
+                        artifact_path,
+                    )
+                    artifact_metadata = {
+                        **result_metadata,
+                        "id": artifact_path,
+                        "title": artifact_title,
+                        "type": "file",
+                    }
                 yield {
                     "type": "event",
                     "event": make_process_event(
@@ -1031,6 +1620,35 @@ class NEAgentStreamHandler:
             }
 
     async def _on_chain_end(self, event: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+        compaction = _extract_context_compaction(event)
+        if compaction is not None:
+            window_id = str(compaction.get("window_id") or "").strip()
+            if window_id and window_id not in self._seen_context_window_ids:
+                self._seen_context_window_ids.add(window_id)
+                tokens_before = int(compaction.get("tokens_before") or 0)
+                tokens_after = int(compaction.get("tokens_after") or 0)
+                removed_messages = int(compaction.get("removed_messages") or 0)
+                summary = _display_compaction_summary(compaction.get("summary"))
+                detail = (
+                    f"上下文窗口 {window_id}：约 {tokens_before} → {tokens_after} tokens，"
+                    f"归档 {removed_messages} 条历史消息"
+                )
+                yield {
+                    "type": "event",
+                    "event": make_process_event(
+                        kind="context_compaction",
+                        title="上下文窗口已压缩",
+                        detail=detail,
+                        tool="context_compression",
+                        level="success",
+                        summary=summary or None,
+                        metadata={
+                            key: value
+                            for key, value in compaction.items()
+                            if key != "summary"
+                        },
+                    ),
+                }
         chain_name = event.get("name", "chain")
         if "task" in str(chain_name).lower():
             yield {
@@ -1059,7 +1677,12 @@ class NEAgentStreamHandler:
             self.deep_research_last_task_runtime_at = time.monotonic()
             if task_id and runtime_type in {"task_started", "task_running", "task_tool_start", "task_tool_end"}:
                 self.deep_research_active_task_ids.add(task_id)
-            if task_id and runtime_type in {"task_completed", "task_failed", "task_timed_out"}:
+            if task_id and runtime_type in {
+                "task_completed",
+                "task_failed",
+                "task_timed_out",
+                "task_cancelled",
+            }:
                 self.deep_research_active_task_ids.discard(task_id)
 
         runtime_metadata = build_task_runtime_metadata(
@@ -1142,13 +1765,17 @@ class NEAgentStreamHandler:
                     },
                 ),
             }
-        elif runtime_type in {"task_failed", "task_timed_out"}:
+        elif runtime_type in {"task_failed", "task_timed_out", "task_cancelled"}:
             error = str(task_runtime_event.get("error", "")).strip() or runtime_type
             yield {
                 "type": "event",
                 "event": make_process_event(
                     kind="task_end",
-                    title="子智能体执行异常",
+                    title=(
+                        "子智能体已取消"
+                        if runtime_type == "task_cancelled"
+                        else "子智能体执行异常"
+                    ),
                     detail=error,
                     tool="task",
                     level="warning",

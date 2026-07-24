@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from backend.api.routers.auth import get_current_user
+from backend.api.upload_utils import UploadTooLargeError, read_upload_with_limit
 from backend.config.loggers import get_logger
 from backend.core.models.asr_config import load_asr_config_from_db
 from backend.db.models import User
@@ -31,7 +33,7 @@ async def transcribe_audio(
     user: User = Depends(get_current_user),
 ):
     """上传音频并转写为文本。"""
-    config = load_asr_config_from_db(name=model_name)
+    config = await asyncio.to_thread(load_asr_config_from_db, name=model_name)
     if not config:
         raise HTTPException(status_code=503, detail="ASR 模型未配置，请在 llm_models 中添加 usage_scope=asr 的记录")
 
@@ -40,11 +42,12 @@ async def transcribe_audio(
     if not api_key or not base_url:
         raise HTTPException(status_code=503, detail="ASR 模型 API Key 或 Base URL 未配置")
 
-    data = await file.read()
+    try:
+        data = await read_upload_with_limit(file, MAX_AUDIO_SIZE)
+    except UploadTooLargeError as exc:
+        raise HTTPException(status_code=413, detail="音频文件过大，上限 25MB") from exc
     if not data:
         raise HTTPException(status_code=400, detail="音频文件为空")
-    if len(data) > MAX_AUDIO_SIZE:
-        raise HTTPException(status_code=400, detail="音频文件过大，上限 25MB")
 
     filename = file.filename or "audio.webm"
     ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -57,7 +60,7 @@ async def transcribe_audio(
     timeout = float(config.get("request_timeout") or 120.0)
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(trust_env=False, timeout=timeout) as client:
             response = await client.post(
                 url,
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -78,10 +81,7 @@ async def transcribe_audio(
 
     if response.status_code >= 400:
         logger.warning("[ASR] 上游错误 %s: %s", response.status_code, response.text[:500])
-        raise HTTPException(
-            status_code=502,
-            detail=f"语音识别失败: {response.text[:200]}",
-        )
+        raise HTTPException(status_code=502, detail="语音识别服务返回错误")
 
     try:
         payload = response.json()

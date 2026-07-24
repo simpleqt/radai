@@ -18,6 +18,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import (
     Any,
@@ -30,6 +31,25 @@ from typing import (
 )
 
 T = TypeVar("T")
+
+
+def _positive_timeout(env_name: str, default: float) -> float:
+    try:
+        return max(1.0, float(os.getenv(env_name, str(default)) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _terminate_process(process: subprocess.Popen, *, grace_seconds: float = 5.0) -> None:
+    """Terminate a parser subprocess and guarantee it is reaped."""
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=grace_seconds)
 
 
 class MineruExecutionError(Exception):
@@ -941,6 +961,9 @@ class MineruParser(Parser):
 
             # Start subprocess
             process = subprocess.Popen(cmd, **subprocess_kwargs)
+            deadline = time.monotonic() + _positive_timeout(
+                "MINERU_PROCESS_TIMEOUT_SECONDS", 1800.0
+            )
 
             # Create queues for stdout and stderr
             stdout_queue = Queue()
@@ -961,6 +984,11 @@ class MineruParser(Parser):
 
             # Process output in real time
             while process.poll() is None:
+                if time.monotonic() >= deadline:
+                    _terminate_process(process)
+                    raise TimeoutError(
+                        "MinerU document parsing exceeded the configured timeout"
+                    )
                 # Check stdout queue
                 try:
                     while True:
@@ -1043,6 +1071,9 @@ class MineruParser(Parser):
                 "mineru command not found. Please ensure MinerU 2.0 is properly installed:\n"
                 "pip install -U 'mineru[core]' or uv pip install -U 'mineru[core]'"
             )
+        except TimeoutError:
+            cls.logger.error("MinerU command timed out and was terminated")
+            raise
         except Exception as e:
             error_message = f"Unexpected error running mineru command: {e}"
             cls.logger.error(error_message)
@@ -1635,6 +1666,9 @@ class DoclingParser(Parser):
                 "encoding": "utf-8",
                 "errors": "ignore",
                 "env": env,
+                "timeout": _positive_timeout(
+                    "DOCLING_PROCESS_TIMEOUT_SECONDS", 1800.0
+                ),
             }
 
             # Hide console window on Windows
@@ -1653,6 +1687,11 @@ class DoclingParser(Parser):
             if e.stderr:
                 self.logger.error(f"Error details: {e.stderr}")
             raise
+        except subprocess.TimeoutExpired as exc:
+            self.logger.error("Docling command timed out: %s", exc.cmd)
+            raise TimeoutError(
+                "Docling document parsing exceeded the configured timeout"
+            ) from exc
         except FileNotFoundError:
             raise RuntimeError(
                 "docling command not found. Please ensure Docling is properly installed."
@@ -1939,6 +1978,9 @@ class DoclingParser(Parser):
                 "check": True,
                 "encoding": "utf-8",
                 "errors": "ignore",
+                "timeout": _positive_timeout(
+                    "DOCLING_VERSION_TIMEOUT_SECONDS", 15.0
+                ),
             }
 
             # Hide console window on Windows
@@ -1948,7 +1990,7 @@ class DoclingParser(Parser):
             result = subprocess.run(["docling", "--version"], **subprocess_kwargs)
             self.logger.debug(f"Docling version: {result.stdout.strip()}")
             return True
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
             self.logger.debug(
                 "Docling is not properly installed. "
                 "Please ensure it is installed correctly."
@@ -2027,7 +2069,7 @@ def main():
     )
     parser.add_argument(
         "--vlm_url",
-        help="When the backend is `vlm-http-client`, you need to specify the server_url",
+        help="When the backend is `vlm-http-client`, you need to specify the server_url, for example:`http://127.0.0.1:30000`",
     )
 
     args = parser.parse_args()

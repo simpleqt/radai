@@ -8,8 +8,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-UTC = timezone.utc
-from typing_extensions import override
+from typing import Any
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
@@ -17,6 +16,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.errors import GraphBubbleUp
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
+from typing_extensions import override
 
 from backend.core.agents.middlewares.guardrail_provider import (
     GuardrailDecision,
@@ -26,6 +26,7 @@ from backend.core.agents.middlewares.guardrail_provider import (
 )
 
 logger = logging.getLogger(__name__)
+UTC = timezone.utc
 
 
 class ToolGuardrailMiddleware(AgentMiddleware[AgentState]):
@@ -40,17 +41,28 @@ class ToolGuardrailMiddleware(AgentMiddleware[AgentState]):
         *,
         fail_closed: bool = True,
         passport: str | None = None,
+        tool_metadata: dict[str, dict[str, Any]] | None = None,
     ):
         self.provider = provider
         self.fail_closed = fail_closed
         self.passport = passport
+        self.tool_metadata = dict(tool_metadata or {})
 
     def _build_request(self, request: ToolCallRequest) -> GuardrailRequest:
+        tool_name = str(request.tool_call.get("name", ""))
+        metadata = self.tool_metadata.get(tool_name, {})
         return GuardrailRequest(
-            tool_name=str(request.tool_call.get("name", "")),
+            tool_name=tool_name,
             tool_input=request.tool_call.get("args", {}),
             agent_id=self.passport,
             timestamp=datetime.now(UTC).isoformat(),
+            risk_level=str(metadata.get("risk_level") or metadata.get("risk") or "safe"),
+            side_effect=str(
+                metadata.get("side_effect")
+                or metadata.get("side_effects")
+                or "none"
+            ),
+            policy_source=str(metadata.get("policy_source") or metadata.get("source") or ""),
         )
 
     def _build_denied_message(

@@ -19,10 +19,10 @@ from backend.db.models import Base
 
 
 class Agent(Base):
-    """智能体配置表
+    """智能体展示与绑定记录表。
 
-    每条记录对应一个可部署的智能体实例。
-    ``agent_code`` 与代码层的智能体类一一对应（如 ``ne_full_feature``、``csh_full_feature``）。
+    本表不创建可执行智能体。每条记录必须引用一个已经通过统一验证的
+    YAML Agent Profile；这里只保存前端展示、启停、排序和知识库绑定元数据。
     """
 
     __tablename__ = "agents"
@@ -30,7 +30,7 @@ class Agent(Base):
     agent_code = Column(
         String(64),
         primary_key=True,
-        comment="智能体唯一编码，与代码类名对应，如 ne_full_feature",
+        comment="智能体唯一编码，引用运行时 Agent Profile code",
     )
     agent_name = Column(String(100), nullable=False, comment="前端展示名称")
     description = Column(Text, nullable=True, comment="智能体描述")
@@ -54,7 +54,7 @@ class Agent(Base):
     __table_args__ = (
         Index("idx_agent_active", "is_active"),
         Index("idx_agent_sort", "sort_order"),
-        {"comment": "智能体配置表"},
+        {"comment": "智能体展示与知识库绑定元数据表"},
     )
 
     def __repr__(self) -> str:

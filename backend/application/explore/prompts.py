@@ -131,7 +131,9 @@ def build_quiz_prompt(
 4. judge 题 answer 为「正确」或「错误」。
 5. short/calc 题提供 reference_answer（参考答案）与 scoring_points（采分点数组）。
 6. 每题都应有 explanation（解析，简明说明为何如此）。
-7. 严格只输出 JSON，不要任何额外说明。
+7. 每道题题干不超过 60 字；选择题选项不超过 24 字；explanation 不超过 48 字；reference_answer 不超过 120 字；scoring_points 每条不超过 24 字。
+8. JSON 字符串中不要使用 LaTeX/KaTeX 反斜杠公式；公式请写成纯文本形式，例如 Vn=sqrt(4*k*T*R*B)。
+9. 必须生成恰好 {count} 道题。严格只输出可被 json.loads 解析的 JSON，不要任何额外说明。
 
 知识库内容：
 {_context_block(context)}

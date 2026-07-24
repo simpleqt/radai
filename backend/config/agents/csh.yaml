@@ -7,9 +7,8 @@ default_kb_ids: []
 default_skills:
   - csh-hydrogeology
   - general-table-analysis
-default_workflow: lightweight
+default_workflow: full
 allowed_workflows:
-  - lightweight
   - full
   - deep_research
   - plan_solve

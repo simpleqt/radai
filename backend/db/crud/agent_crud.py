@@ -32,6 +32,35 @@ async def get_agent_kb_ids(session: "AsyncSession", agent_code: str) -> list[str
     return [row.kb_id for row in result]
 
 
+async def get_runtime_agent_kb_ids(
+    session: "AsyncSession",
+    profile_code: str,
+) -> list[str]:
+    """Resolve bindings from MySQL, preferring the current profile key."""
+    from backend.domain.agents.bindings import agent_binding_codes
+    from backend.db.models.agent import Agent, AgentKnowledgeBase
+
+    agent_codes = agent_binding_codes(profile_code)
+    if not agent_codes:
+        return []
+    result = await session.execute(
+        select(AgentKnowledgeBase.agent_code, AgentKnowledgeBase.kb_id)
+        .join(Agent, Agent.agent_code == AgentKnowledgeBase.agent_code)
+        .where(
+            AgentKnowledgeBase.agent_code.in_(agent_codes),
+            Agent.is_active.is_(True),
+        )
+        .order_by(AgentKnowledgeBase.sort_order, AgentKnowledgeBase.id)
+    )
+    grouped: dict[str, list[str]] = {}
+    for row in result:
+        grouped.setdefault(str(row.agent_code), []).append(str(row.kb_id))
+    for agent_code in agent_codes:
+        if grouped.get(agent_code):
+            return grouped[agent_code]
+    return []
+
+
 async def get_agent(session: "AsyncSession", agent_code: str):
     """返回智能体配置记录，若不存在返回 None。"""
     from backend.db.models.agent import Agent
@@ -108,14 +137,25 @@ async def add_kb_binding(
 ):
     """为智能体添加知识库绑定（已存在则忽略）。"""
     from backend.db.models.agent import AgentKnowledgeBase
-    from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-    stmt = (
-        mysql_insert(AgentKnowledgeBase)
-        .values(agent_code=agent_code, kb_id=kb_id, sort_order=sort_order)
-        .on_duplicate_key_update(sort_order=sort_order)
+    result = await session.execute(
+        select(AgentKnowledgeBase).where(
+            AgentKnowledgeBase.agent_code == agent_code,
+            AgentKnowledgeBase.kb_id == kb_id,
+        )
     )
-    await session.execute(stmt)
+    binding = result.scalar_one_or_none()
+    if binding is None:
+        session.add(
+            AgentKnowledgeBase(
+                agent_code=agent_code,
+                kb_id=kb_id,
+                sort_order=sort_order,
+            )
+        )
+    else:
+        binding.sort_order = sort_order
+    await session.flush()
 
 
 async def remove_kb_binding(

@@ -12,6 +12,7 @@ from sqlalchemy import (
     Index,
     String,
     Text,
+    UniqueConstraint,
 )
 
 from backend.db.models import Base
@@ -93,3 +94,32 @@ class ExperimentDataset(Base):
             "status": self.status,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class ExperimentDatasetAcl(Base):
+    """Explicit grants for non-public experiment datasets."""
+
+    __tablename__ = "experiment_dataset_acl"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    dataset_id = Column(String(36), nullable=False, index=True)
+    subject_type = Column(String(16), nullable=False, default="user")
+    subject_id = Column(String(64), nullable=False)
+    permission = Column(String(16), nullable=False, default="read")
+    effect = Column(String(8), nullable=False, default="allow")
+    expires_at = Column(DateTime, nullable=True)
+    created_by = Column(String(36), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_id",
+            "subject_type",
+            "subject_id",
+            "permission",
+            name="uk_experiment_dataset_acl",
+        ),
+        Index("idx_experiment_dataset_acl_subject", "subject_type", "subject_id"),
+        Index("idx_experiment_dataset_acl_dataset", "dataset_id"),
+        {"comment": "Explicit experiment-dataset access grants"},
+    )

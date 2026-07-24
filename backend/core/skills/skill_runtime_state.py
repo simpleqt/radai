@@ -18,8 +18,19 @@ def reset_request_skill_state(tokens) -> None:
     if not isinstance(tokens, tuple) or len(tokens) != 2:
         return
     token_loaded, token_required = tokens
-    _LOADED_SKILLS.reset(token_loaded)
-    _REQUIRED_SKILLS.reset(token_required)
+    _safe_reset(_LOADED_SKILLS, token_loaded, fallback=None)
+    _safe_reset(_REQUIRED_SKILLS, token_required, fallback=None)
+
+
+def _safe_reset(var: ContextVar, token, *, fallback) -> None:
+    if getattr(token, "var", var) is not var:
+        raise ValueError("skill runtime token belongs to a different ContextVar")
+    try:
+        var.reset(token)
+    except ValueError as exc:
+        if "different Context" not in str(exc):
+            raise
+        var.set(fallback)
 
 
 def mark_skill_loaded(skill_name: str) -> None:

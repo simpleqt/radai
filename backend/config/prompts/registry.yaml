@@ -17,3 +17,10 @@ prompt_profiles:
     aliases:
       - groundwater
       - groundwater-project-analysis
+
+  fmca:
+    provider: backend.application.agents.prompt_templates.fmca:build_system_prompt
+    aliases:
+      - fmca
+      - fundamental-mechanics-course
+      - mechanics

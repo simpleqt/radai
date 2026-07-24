@@ -15,8 +15,6 @@ import os
 import time
 import uuid
 import warnings
-from typing import Any
-
 import matplotlib
 matplotlib.use("Agg")  # 无头模式，必须在 import pyplot 之前设置
 
@@ -234,7 +232,6 @@ def _gen_scatter(df, *, x_col, y_cols, group_by, title, x_label, y_label, **_) -
 
         # 整体趋势线
         try:
-            from numpy.polynomial import polynomial as P
             xn = pd.to_numeric(df[x_col], errors="coerce")
             yn = pd.to_numeric(df[y_col], errors="coerce")
             mask = xn.notna() & yn.notna()
@@ -299,7 +296,7 @@ def _gen_barh(df, *, x_col, y_cols, group_by, title, x_label, y_label, **_) -> p
     colors = sns.color_palette(_PALETTE, len(df))
     xdata = pd.to_numeric(df[y_col], errors="coerce")
     ax.barh(df[x_col].astype(str), xdata, color=colors, edgecolor="white", alpha=0.85)
-    for i, (val, label) in enumerate(zip(xdata, df[x_col])):
+    for i, val in enumerate(xdata):
         ax.text(val * 1.005, i, f"{val:.2e}" if abs(val) > 1e4 else f"{val:.3f}",
                 va="center", fontsize=9)
     ax.set_xlabel(y_label or y_col, fontsize=11)
@@ -502,7 +499,7 @@ async def save_chart(
     3. 统一由 API Server（8082）服务，权限可控
     4. URL 中包含 user_id 实现用户归属
     """
-    from backend.api.routers.chart_images import store_chart
+    from backend.services.chart_image_store import store_chart
     return await store_chart(png_bytes, user_id=user_id, chart_id=chart_id)
 
 

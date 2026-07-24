@@ -6,6 +6,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.models import Document
+from backend.db.unit_of_work import flush_or_commit
 
 
 class DocumentCRUD:
@@ -34,7 +35,7 @@ class DocumentCRUD:
             status="pending",
         )
         session.add(doc)
-        await session.commit()
+        await flush_or_commit(session)
         await session.refresh(doc)
         return doc
 
@@ -99,7 +100,7 @@ class DocumentCRUD:
         await session.execute(
             update(Document).where(Document.doc_id == doc_id).values(**update_data)
         )
-        await session.commit()
+        await flush_or_commit(session)
 
         return await DocumentCRUD.get_by_id(session, doc_id)
 
@@ -118,7 +119,7 @@ class DocumentCRUD:
                 updated_at=datetime.now(),
             )
         )
-        await session.commit()
+        await flush_or_commit(session)
 
         return await DocumentCRUD.get_by_id(session, doc_id)
 
@@ -128,7 +129,7 @@ class DocumentCRUD:
         result = await session.execute(
             delete(Document).where(Document.doc_id == doc_id)
         )
-        await session.commit()
+        await flush_or_commit(session)
         return result.rowcount > 0
 
     @staticmethod

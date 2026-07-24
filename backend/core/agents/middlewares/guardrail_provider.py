@@ -14,6 +14,9 @@ class GuardrailRequest:
     thread_id: str | None = None
     is_subagent: bool = False
     timestamp: str = ""
+    risk_level: str = "safe"
+    side_effect: str = "none"
+    policy_source: str = ""
 
 
 @dataclass

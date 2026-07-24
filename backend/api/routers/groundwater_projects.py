@@ -10,8 +10,8 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from backend.api.dependencies.auth import ApiKeyAuth, require_admin, verify_api_key
+from backend.application.blocking import run_blocking
 from backend.application.groundwater import GroundwaterProjectService
-
 
 router = APIRouter(prefix="/groundwater", tags=["groundwater-projects-v2"])
 
@@ -47,7 +47,8 @@ async def list_groundwater_projects(
 ):
     service = GroundwaterProjectService()
     return {
-        "projects": service.list_projects(
+        "projects": await run_blocking(
+            service.list_projects,
             auth.user_id,
             is_admin=(auth.role or "").lower() == "admin",
         )
@@ -60,7 +61,8 @@ async def get_groundwater_project(
     auth: ApiKeyAuth = Depends(verify_api_key),
 ):
     try:
-        context = GroundwaterProjectService().resolve(
+        context = await run_blocking(
+            GroundwaterProjectService().resolve,
             auth.user_id,
             project_id,
             is_admin=(auth.role or "").lower() == "admin",
@@ -84,12 +86,13 @@ async def read_groundwater_project_resource(
 ):
     try:
         service = GroundwaterProjectService()
-        context = service.resolve(
+        context = await run_blocking(
+            service.resolve,
             auth.user_id,
             project_id,
             is_admin=(auth.role or "").lower() == "admin",
         )
-        return service.read_resource(context, resource, limit=limit)
+        return await run_blocking(service.read_resource, context, resource, limit=limit)
     except Exception as exc:
         raise _service_error(exc) from exc
 
@@ -98,7 +101,9 @@ async def read_groundwater_project_resource(
 async def list_admin_groundwater_projects(
     _auth: ApiKeyAuth = Depends(require_admin),
 ):
-    return {"projects": GroundwaterProjectService().list_admin_projects()}
+    return {
+        "projects": await run_blocking(GroundwaterProjectService().list_admin_projects)
+    }
 
 
 @router.post("/admin/projects")
@@ -107,7 +112,8 @@ async def create_groundwater_project(
     auth: ApiKeyAuth = Depends(require_admin),
 ):
     try:
-        context = GroundwaterProjectService().create_project(
+        context = await run_blocking(
+            GroundwaterProjectService().create_project,
             auth.user_id,
             name=payload.name,
             project_id=payload.project_id,
@@ -131,7 +137,8 @@ async def update_groundwater_project(
     _auth: ApiKeyAuth = Depends(require_admin),
 ):
     try:
-        context = GroundwaterProjectService().update_project(
+        context = await run_blocking(
+            GroundwaterProjectService().update_project,
             project_id,
             name=payload.name,
             region=payload.region,
@@ -154,7 +161,9 @@ async def delete_groundwater_project(
     _auth: ApiKeyAuth = Depends(require_admin),
 ):
     try:
-        return GroundwaterProjectService().archive_project(project_id)
+        return await run_blocking(
+            GroundwaterProjectService().archive_project, project_id
+        )
     except Exception as exc:
         raise _service_error(exc) from exc
 
@@ -170,11 +179,15 @@ async def upload_groundwater_project_package(
         raise HTTPException(status_code=400, detail="当前接口只接受标准 ZIP 项目包")
     try:
         service = GroundwaterProjectService()
-        context = service.resolve(auth.user_id, project_id, is_admin=True)
-        with tempfile.NamedTemporaryFile(suffix=".zip") as temp_file:
-            shutil.copyfileobj(file.file, temp_file)
-            temp_file.flush()
-            updated = service.import_zip(context, Path(temp_file.name))
+
+        def import_package():
+            context = service.resolve(auth.user_id, project_id, is_admin=True)
+            with tempfile.NamedTemporaryFile(suffix=".zip") as temp_file:
+                shutil.copyfileobj(file.file, temp_file)
+                temp_file.flush()
+                return service.import_zip(context, Path(temp_file.name))
+
+        updated = await run_blocking(import_package)
         return {
             "project_id": updated.project_id,
             "data_version": updated.data_version,
@@ -188,7 +201,7 @@ async def upload_groundwater_project_package(
 async def list_groundwater_users(
     _auth: ApiKeyAuth = Depends(require_admin),
 ):
-    return {"users": GroundwaterProjectService().list_users()}
+    return {"users": await run_blocking(GroundwaterProjectService().list_users)}
 
 
 @router.get("/admin/projects/{project_id}/bindings")
@@ -198,7 +211,9 @@ async def list_groundwater_project_bindings(
 ):
     try:
         return {
-            "bindings": GroundwaterProjectService().list_bindings(project_id)
+            "bindings": await run_blocking(
+                GroundwaterProjectService().list_bindings, project_id
+            )
         }
     except Exception as exc:
         raise _service_error(exc) from exc
@@ -211,7 +226,8 @@ async def replace_groundwater_project_bindings(
     auth: ApiKeyAuth = Depends(require_admin),
 ):
     try:
-        bindings = GroundwaterProjectService().replace_bindings(
+        bindings = await run_blocking(
+            GroundwaterProjectService().replace_bindings,
             project_id,
             payload.user_ids,
             granted_by=auth.user_id,

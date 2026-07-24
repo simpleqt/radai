@@ -4,15 +4,21 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
-from typing_extensions import override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
-from langchain.agents.middleware.types import ModelCallResult, ModelRequest, ModelResponse
+from langchain.agents.middleware.types import (
+    ModelCallResult,
+    ModelRequest,
+    ModelResponse,
+)
 from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.runtime import Runtime
+from typing_extensions import override
 
 from backend.core.skills.native_skill_tools import normalize_skill_tool_name
+from backend.core.tools.tool_arguments import clean_malformed_tool_args
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +37,7 @@ class DanglingToolCallMiddleware(AgentMiddleware[AgentState]):
     """Inserts placeholder ToolMessages for dangling tool calls before model invocation."""
 
     def _normalize_tool_args(self, tool_name: str, args: Any) -> Any:
+        args = clean_malformed_tool_args(args)
         if isinstance(args, dict):
             normalized = dict(args)
             if tool_name in SKILL_NAME_TOOL_ARGS and "skill_name" in normalized:
@@ -47,14 +54,37 @@ class DanglingToolCallMiddleware(AgentMiddleware[AgentState]):
                 decoded = json.loads(args)
                 if isinstance(decoded, dict):
                     return self._normalize_tool_args(tool_name, decoded)
-            except Exception:
-                pass
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Could not decode string tool arguments: tool=%s",
+                    tool_name,
+                    exc_info=True,
+                )
             return {"skill_name": normalize_skill_tool_name(args)}
         return args
 
+    def _normalize_tool_request(self, request: ToolCallRequest) -> ToolCallRequest:
+        """Repair malformed arguments before the ToolNode invokes a tool.
+
+        ``before_model`` only fixes historical messages.  The malformed suffix
+        in the reported failure is present on the *new* tool call, so it must
+        also be removed at the tool-execution boundary.
+        """
+        tool_call = request.tool_call
+        if not isinstance(tool_call, dict):
+            return request
+        tool_name = str(tool_call.get("name") or "")
+        old_args = tool_call.get("args")
+        new_args = self._normalize_tool_args(tool_name, old_args)
+        if new_args != old_args:
+            tool_call["args"] = new_args
+            logger.warning("Repaired malformed tool arguments: tool=%s", tool_name)
+        return request
+
     def _sanitize_ai_message(self, msg: AIMessage) -> AIMessage:
         tool_calls = getattr(msg, "tool_calls", None) or []
-        if not tool_calls:
+        invalid_tool_calls = getattr(msg, "invalid_tool_calls", None) or []
+        if not tool_calls and not invalid_tool_calls:
             return msg
 
         changed = False
@@ -71,6 +101,18 @@ class DanglingToolCallMiddleware(AgentMiddleware[AgentState]):
                 sanitized["args"] = new_args
                 changed = True
             sanitized_tool_calls.append(sanitized)
+
+        # LangChain preserves malformed provider tool-call JSON in
+        # ``invalid_tool_calls``.  Re-sending that raw JSON in a later request
+        # makes OpenAI-compatible gateways parse it again and fail the entire
+        # model round (rather than merely dropping the bad call).  It cannot be
+        # invoked safely, so omit it from the conversation sent to the model.
+        if invalid_tool_calls:
+            changed = True
+            logger.warning(
+                "Dropped %d invalid tool call(s) from model history",
+                len(invalid_tool_calls),
+            )
 
         additional_kwargs = dict(getattr(msg, "additional_kwargs", {}) or {})
         for key in ("tool_calls", "invalid_tool_calls"):
@@ -187,3 +229,11 @@ class DanglingToolCallMiddleware(AgentMiddleware[AgentState]):
         if patched is not None:
             request = request.override(messages=patched)
         return await handler(request)
+
+    @override
+    def wrap_tool_call(self, request, handler):
+        return handler(self._normalize_tool_request(request))
+
+    @override
+    async def awrap_tool_call(self, request, handler):
+        return await handler(self._normalize_tool_request(request))

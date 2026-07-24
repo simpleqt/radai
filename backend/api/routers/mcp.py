@@ -2,18 +2,34 @@
 
 import asyncio
 import json
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from backend.api.dependencies.auth import ApiKeyAuth, verify_api_key
+from backend.application.agent_executors.image_url_registry import (
+    StreamingTokenResolver,
+    resolve_image_tokens,
+)
 from backend.application.agent_service import AgentService
-from backend.application.mcp.query_service import build_mcp_agent_request
 from backend.application.event_stream.thinking_filter import split_thinking_segments
+from backend.application.mcp.query_service import (
+    build_mcp_agent_request,
+    invoke_mcp_tool,
+    validate_mcp_arguments,
+)
+from backend.application.mcp.tool_catalog import (
+    McpToolCatalogQuery,
+    build_mcp_tool_catalog,
+)
 from backend.config.loggers import get_logger
-from backend.config.settings import settings
+from backend.core.thread_key import validate_external_thread_id
+from backend.core.utils.async_tasks import (
+    close_async_iterator_safely,
+    iterate_until_disconnected,
+)
 from backend.domain.agents.events import AgentEvent
 
 router = APIRouter()
@@ -22,6 +38,37 @@ logger = get_logger(__name__)
 
 class McpQueryRequest(BaseModel):
     query: str = Field(..., description="用户查询")
+    thread_id: str | None = Field(default=None, min_length=1, max_length=100)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_thread_aliases(self):
+        for value in (self.thread_id, self.conversation_id):
+            if value:
+                validate_external_thread_id(value)
+        if self.thread_id and self.conversation_id and self.thread_id != self.conversation_id:
+            raise ValueError("thread_id 与 conversation_id 必须一致")
+        return self
+
+
+class McpToolCallRequest(BaseModel):
+    tool_name: str = Field(..., min_length=1, max_length=128)
+    arguments: dict = Field(default_factory=dict)
+    agent_code: str | None = None
+    workflow: str | None = None
+    selected_skills: list[str] | None = None
+    thread_id: str | None = Field(default=None, min_length=1, max_length=100)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_thread_aliases(self):
+        validate_mcp_arguments(self.arguments)
+        for value in (self.thread_id, self.conversation_id):
+            if value:
+                validate_external_thread_id(value)
+        if self.thread_id and self.conversation_id and self.thread_id != self.conversation_id:
+            raise ValueError("thread_id 与 conversation_id 必须一致")
+        return self
 
 
 class McpConfigResponse(BaseModel):
@@ -30,13 +77,25 @@ class McpConfigResponse(BaseModel):
     headers: dict = Field(..., description="请求头")
 
 
+class McpToolCatalogResponse(BaseModel):
+    agent_code: str | None = Field(None, description="智能体代码")
+    policy_name: str = Field(..., description="工具策略名称")
+    domain: str = Field(..., description="智能体领域")
+    workflow: str = Field(..., description="工作流")
+    selected_skills: list[str] = Field(
+        default_factory=list,
+        description="已选 Skills",
+    )
+    tools: list[dict] = Field(default_factory=list, description="MCP-like 工具描述")
+
+
 @router.get("/config", response_model=McpConfigResponse)
 async def get_mcp_config(
     auth: ApiKeyAuth = Depends(verify_api_key),
 ):
     from backend.config.settings import settings
 
-    server_host = settings.server_host
+    server_host = settings.server_host or "YOUR_SERVER_HOST"
     if server_host in {"127.0.0.1", "localhost"}:
         server_host = "0.0.0.0"
 
@@ -45,108 +104,86 @@ async def get_mcp_config(
         url=f"http://{server_host}:{settings.server_port}/api/v1/mcp/query",
         headers={
             "Authorization": f"Bearer {auth.api_key}",
-            "Content-Type": "application/json"
-        }
+            "Content-Type": "application/json",
+        },
     )
 
 
-def _get_public_base_url() -> str:
-    """获取公共URL基础地址（如 https://radai2.example.com/files）"""
-    import os
-    from dotenv import dotenv_values
-    from pathlib import Path
-
-    # 优先从 os.environ 获取（RAG service 初始化后可能已 load_dotenv）
-    public_base = (os.getenv("MINIO_PUBLIC_BASE_URL") or "").rstrip("/")
-    if not public_base:
-        # fallback: 直接读取 .env 文件（pydantic-settings extra="ignore" 不会加载到 os.environ）
-        env_path = Path(__file__).resolve().parents[2] / ".env"
-        if env_path.exists():
-            env_values = dotenv_values(env_path)
-            public_base = (env_values.get("MINIO_PUBLIC_BASE_URL") or "").rstrip("/")
-    return public_base
-
-
-def _get_minio_base_url() -> str:
-    """获取原始MinIO地址"""
-    minio_endpoint = settings.minio_endpoint.rstrip("/")
-    bucket = (settings.minio_bucket_name or "").strip("/")
-    return f"{minio_endpoint}/{bucket}"
-
-
-class _UrlReplacer:
-    """跨chunk的URL替换器，处理URL被分割到多个chunk中的情况。
-
-    流式输出中，URL可能被分割到多个chunk，例如：
-    - chunk 1: `...src="https://radai2.example.com/fi`
-    - chunk 2: `les/431fdba6-206b-435d-8c1b-da5e521c039d/...`
-
-    此类维护一个缓冲区，确保跨chunk的URL也能被正确替换。
-    """
-
-    def __init__(self, public_base: str, minio_base: str):
-        self.public_base = public_base
-        self.minio_base = minio_base
-        self.carry = ""  # 缓冲区：可能包含URL前缀的部分文本
-
-    def process(self, text: str) -> str:
-        """处理一个chunk，返回替换后的文本。
-
-        取消之前的逐字符缓充处理，改为通过匹配md格式图片来进行。
-        只有在遇到图片输出（`![`）且未闭合时才进行缓存。
-        """
-        if not self.public_base:
-            return text
-
-        merged = f"{self.carry}{text}"
-        self.carry = ""
-
-        if not merged:
-            return ""
-
-        # 寻找最后一个 ![
-        last_img_idx = merged.rfind('![')
-        if last_img_idx != -1:
-            # 如果在 ![ 之后没有对应的 )，并且没有换行符(防异常长文本截断)
-            if ')' not in merged[last_img_idx:] and '\n' not in merged[last_img_idx:]:
-                self.carry = merged[last_img_idx:]
-                merged = merged[:last_img_idx]
-        elif merged.endswith('!'):
-            # 边缘情况：chunk刚好以 ! 结尾
-            self.carry = '!'
-            merged = merged[:-1]
-
-        # 替换完整的URL
-        if self.public_base in merged:
-            merged = merged.replace(self.public_base, self.minio_base)
-
-        return merged
-
-    def flush(self) -> str:
-        """刷新缓冲区，返回剩余的文本。"""
-        result = self.carry
-        self.carry = ""
-        if self.public_base in result:
-            result = result.replace(self.public_base, self.minio_base)
-        return result
+@router.get("/tools", response_model=McpToolCatalogResponse)
+async def list_mcp_tools(
+    agent_code: str | None = None,
+    policy_name: str | None = None,
+    domain: str | None = None,
+    workflow: str | None = None,
+    selected_skills: str | None = None,
+    auth: ApiKeyAuth = Depends(verify_api_key),
+):
+    """列出 policy 管理的 MCP-like 工具目录。"""
+    del auth
+    try:
+        catalog = build_mcp_tool_catalog(
+            McpToolCatalogQuery(
+                agent_code=agent_code,
+                policy_name=policy_name,
+                domain=domain,
+                workflow=workflow,
+                selected_skills=_parse_selected_skills(selected_skills),
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return McpToolCatalogResponse(**catalog.to_dict())
 
 
-def _replace_public_url_with_minio_url(text: str) -> str:
-    """将公共URL（如 https://radai2.example.com/files/）替换为原始MinIO地址。
+@router.post("/tools/call")
+async def call_mcp_tool(
+    body: McpToolCallRequest,
+    http_request: Request,
+    auth: ApiKeyAuth = Depends(verify_api_key),
+):
+    """调用目录中的单个工具，并复用 Agent Runtime 权限/超时治理。"""
+    from backend.application.mcp.config import McpServiceRegistry
 
-    注意：此函数适用于非流式场景（如event payload）。
-    流式场景请使用 _UrlReplacer 类。
-    """
-    public_base = _get_public_base_url()
-    if not public_base:
-        return text
-    minio_base = _get_minio_base_url()
-    if public_base in text:
-        text = text.replace(public_base, minio_base)
-    return text
+    service_spec = McpServiceRegistry().get()
+    if body.agent_code and body.agent_code != service_spec.agent_code:
+        raise HTTPException(status_code=403, detail="MCP 服务不允许切换绑定智能体")
+    try:
+        from backend.application.checkpointing.checkpointer import get_checkpointer_from_request
+
+        value = await invoke_mcp_tool(
+            body.tool_name,
+            body.arguments,
+            user_id=auth.user_id,
+            role=auth.role,
+            spec=service_spec,
+            workflow=body.workflow,
+            selected_skills=body.selected_skills,
+            thread_id=body.thread_id,
+            conversation_id=body.conversation_id,
+            checkpointer=get_checkpointer_from_request(http_request),
+        )
+        return {"tool_name": body.tool_name, "result": value}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (TimeoutError, ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-async def stream_generator(question: str, *, user_id: str):
+def _parse_selected_skills(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+async def stream_generator(
+    question: str,
+    *,
+    user_id: str,
+    thread_id: str | None = None,
+    conversation_id: str | None = None,
+    checkpointer=None,
+    request: Request | None = None,
+):
     """生成 SSE 流式响应 - 返回与前端 v2 接口相同格式的事件
 
     事件格式与 /api/v2/agent-runtime/query 一致：
@@ -154,33 +191,46 @@ async def stream_generator(question: str, *, user_id: str):
     - type: "status" → {"type": "status", "status": "..."}
     - type: "event"  → {"type": "event", "event": {...}}
     - type: "error"  → {"type": "error", "message": "..."}
-    图片 URL 会替换为原始 MinIO 地址。
+    图片统一使用后端图片管线处理，禁止向客户端输出原始 MinIO 地址。
     """
+    edge_events = _iter_mcp_edge_events(
+        question=question,
+        user_id=user_id,
+        thread_id=thread_id,
+        conversation_id=conversation_id,
+        checkpointer=checkpointer,
+    )
     try:
-        # 初始化URL替换器，处理跨chunk的URL替换
-        public_base = _get_public_base_url()
-        minio_base = _get_minio_base_url()
-        url_replacer = _UrlReplacer(public_base, minio_base)
+        token_resolver = StreamingTokenResolver()
         in_thought = False
         think_carry = ""
 
-        async for event in _iter_mcp_edge_events(question=question, user_id=user_id):
+        event_stream = (
+            iterate_until_disconnected(edge_events, request)
+            if request is not None
+            else edge_events
+        )
+        async for event in event_stream:
             event_type = event.get("type")
             if event_type == "chunk":
                 content = event.get("content", "")
                 visible, _, in_thought, think_carry = split_thinking_segments(content, in_thought, think_carry)
                 if visible:
-                    # 使用跨chunk替换器处理URL
-                    visible = url_replacer.process(visible)
+                    visible = token_resolver.feed(visible)
                     if visible:
                         yield f"data: {json.dumps({'type': 'chunk', 'content': visible}, ensure_ascii=False)}\n\n"
+            elif event_type == "message.replace":
+                # Coordinated workflows may publish a draft then a corrected
+                # final answer.  Preserve replacement semantics for MCP
+                # clients instead of silently discarding the final result.
+                content = resolve_image_tokens(str(event.get("content") or ""))
+                yield f"data: {json.dumps({'type': 'message.replace', 'content': content}, ensure_ascii=False)}\n\n"
             elif event_type == "status":
                 yield f"data: {json.dumps({'type': 'status', 'status': event.get('content', '')}, ensure_ascii=False)}\n\n"
             elif event_type == "event":
                 event_payload = event.get("event", {})
-                # 对 event 中的图片 URL 也做 MinIO 替换
                 event_payload_str = json.dumps(event_payload, ensure_ascii=False)
-                event_payload_str = _replace_public_url_with_minio_url(event_payload_str)
+                event_payload_str = resolve_image_tokens(event_payload_str)
                 event_payload = json.loads(event_payload_str)
                 yield f"data: {json.dumps({'type': 'event', 'event': event_payload}, ensure_ascii=False)}\n\n"
             elif event_type == "error":
@@ -189,40 +239,59 @@ async def stream_generator(question: str, *, user_id: str):
             elif event_type == "done":
                 break
 
-        # 刷新URL替换器缓冲区
-        remaining = url_replacer.flush()
+        if request is not None and await request.is_disconnected():
+            logger.info("MCP 客户端已断开，停止流式后处理")
+            return
+
+        remaining = token_resolver.flush()
         if remaining:
             yield f"data: {json.dumps({'type': 'chunk', 'content': remaining}, ensure_ascii=False)}\n\n"
 
         yield "data: [DONE]\n\n"
     except asyncio.CancelledError:
         logger.warning("MCP 流式连接被取消")
-        yield f"data: {json.dumps({'type': 'error', 'message': '连接已取消'}, ensure_ascii=False)}\n\n"
-        yield "data: [DONE]\n\n"
+        raise
     except Exception as e:
         logger.exception(f"MCP 流式查询失败: {e}")
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
+    finally:
+        await close_async_iterator_safely(edge_events)
 
 
-async def _iter_mcp_edge_events(*, question: str, user_id: str) -> AsyncIterator[dict]:
-    service = AgentService()
+async def _iter_mcp_edge_events(
+    *,
+    question: str,
+    user_id: str,
+    thread_id: str | None = None,
+    conversation_id: str | None = None,
+    checkpointer=None,
+) -> AsyncIterator[dict]:
+    service = AgentService(checkpointer=checkpointer)
     agent_request = build_mcp_agent_request(
         question=question,
         user_id=user_id,
         source="mcp.query",
+        thread_id=thread_id,
+        conversation_id=conversation_id,
     )
-    async for event in service.run_stream(agent_request):
-        edge_event = _map_standard_event_to_mcp_edge(event)
-        if edge_event is not None:
-            yield edge_event
-        if event.type == "done":
-            break
+    upstream = service.run_stream(agent_request)
+    try:
+        async for event in upstream:
+            edge_event = _map_standard_event_to_mcp_edge(event)
+            if edge_event is not None:
+                yield edge_event
+            if event.type == "done":
+                break
+    finally:
+        await close_async_iterator_safely(upstream)
 
 
 def _map_standard_event_to_mcp_edge(event: AgentEvent) -> dict | None:
     if event.type == "message.delta":
         return {"type": "chunk", "content": str(event.payload.get("content") or "")}
+    if event.type == "message.replace":
+        return {"type": "message.replace", "content": str(event.payload.get("content") or "")}
     if event.type == "workflow.step":
         if isinstance(event.payload.get("event"), dict):
             return {"type": "event", "event": event.payload.get("event") or {}}
@@ -240,13 +309,23 @@ def _map_standard_event_to_mcp_edge(event: AgentEvent) -> dict | None:
 
 @router.post("/query")
 async def mcp_query_stream(
-    request: McpQueryRequest,
+    body: McpQueryRequest,
+    http_request: Request,
     auth: ApiKeyAuth = Depends(verify_api_key),
 ):
     """MCP 流式查询接口"""
     try:
+        from backend.application.checkpointing.checkpointer import get_checkpointer_from_request
+
         return StreamingResponse(
-            stream_generator(request.query, user_id=auth.user_id),
+            stream_generator(
+                body.query,
+                user_id=auth.user_id,
+                thread_id=body.thread_id,
+                conversation_id=body.conversation_id,
+                checkpointer=get_checkpointer_from_request(http_request),
+                request=http_request,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -256,4 +335,4 @@ async def mcp_query_stream(
         )
     except Exception as e:
         logger.exception(f"MCP 流式查询初始化失败: {e}")
-        raise HTTPException(status_code=500, detail=f"MCP 流式查询初始化失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="MCP 流式查询初始化失败")

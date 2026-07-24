@@ -1144,10 +1144,14 @@ class ProcessorMixin:
         try:
             # Store in text_chunks storage and chunks_vdb concurrently
             # This reduces total latency by parallelizing independent operations
-            await asyncio.gather(
+            results = await asyncio.gather(
                 self.lightrag.text_chunks.upsert(chunks),
-                self.lightrag.chunks_vdb.upsert(chunks)
+                self.lightrag.chunks_vdb.upsert(chunks),
+                return_exceptions=True,
             )
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if errors:
+                raise errors[0]
 
             self.logger.debug(f"Stored {len(chunks)} multimodal chunks to storage")
             return True
@@ -1359,7 +1363,14 @@ class ProcessorMixin:
             )
 
             # Run both tasks in parallel
-            await asyncio.gather(store_chunks_task, store_entities_task)
+            results = await asyncio.gather(
+                store_chunks_task,
+                store_entities_task,
+                return_exceptions=True,
+            )
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if errors:
+                raise errors[0]
 
             self.logger.info(
                 f"Stored chunks and entities in parallel for {len(lightrag_chunks)} chunks"

@@ -1,7 +1,6 @@
-import os
 from langchain_core.runnables.config import RunnableConfig
 
-from backend.core.agents.thread_key import parse_internal_thread_key
+from backend.core.thread_key import parse_internal_thread_key
 
 def get_current_identity(config: RunnableConfig) -> tuple[str | None, str]:
     """

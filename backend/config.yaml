@@ -10,19 +10,106 @@ token_usage:
 # 模型配置
 # ============================================================================
 models:
-  - name: default-model
-    display_name: default-model
+  # MiniMax-M2.x：官方不提供「完全关闭思考」；推理仍会生成，仅能通过网关/OpenAI 兼容扩展约束呈现方式。
+  # extra_body.thinking.type + reasoning_effort 由工厂在 thinking_enabled=false 时合并为 disabled/none；若网关仍推送 reasoning_content，需向网关维护方确认是否有额外开关或换用非推理模型。
+  - name: MiniMax-M2.7
+    display_name: MiniMax-M2.7
     use: langchain_openai:ChatOpenAI
-    model: default-model
-    api_key: $LLM_API_KEY
-    base_url: $LLM_API_BASE
+    model: MiniMax-M2.7
+    api_key: $AI_GATEWAY_API_KEY
+    base_url: $AI_GATEWAY_BASE_URL
     request_timeout: 600.0
     max_retries: 2
-    max_tokens: 4096
-    max_input_tokens: 65536
+    max_tokens: 16384
+    max_input_tokens: 131072
     temperature: 0.1
+    extra_body:
+      thinking:
+        type: disabled
+    reasoning_effort: none
+    supports_vision: false
+    supports_thinking: false
+    supports_reasoning_effort: true
+  - name: deepseek-v4-flash
+    display_name: deepseek-v4-flash
+    use: backend.core.models.patched_deepseek_openai:PatchedDeepSeekOpenAI
+    model: deepseek-v4-flash
+    api_key: $AI_GATEWAY_API_KEY
+    base_url: $AI_GATEWAY_BASE_URL
+    request_timeout: 600.0
+    max_retries: 2
+    max_tokens: 16384
+    max_input_tokens: 131072
+    temperature: 0.1
+    supports_vision: false
+    supports_reasoning_effort: false
+  - name: glm-5.1
+    display_name: glm-5.1
+    use: langchain_openai:ChatOpenAI
+    model: glm-5.1
+    api_key: $AI_GATEWAY_API_KEY
+    base_url: $AI_GATEWAY_BASE_URL
+    request_timeout: 600.0
+    max_retries: 2
+    max_tokens: 16384
+    max_input_tokens: 131072
+    temperature: 0.1
+    extra_body:
+      thinking:
+        type: disabled
+      enable_thinking: false
+    supports_vision: false
+    supports_thinking: false
+    supports_reasoning_effort: false
+  - name: qwen3.6-max-preview
+    display_name: qwen3.6-max-preview
+    use: langchain_openai:ChatOpenAI
+    model: qwen3.6-max-preview
+    api_key: $DASHSCOPE_API_KEY
+    base_url: $DASHSCOPE_API_BASE
+    request_timeout: 600.0
+    max_retries: 2
+    max_tokens: 16384
+    max_input_tokens: 131072
+    temperature: 0.1
+    extra_body:
+      enable_thinking: false
+    reasoning_effort: minimal
     supports_vision: true
     supports_thinking: false
+  - name: qwen3.6-plus
+    display_name: qwen3.6-plus
+    use: langchain_openai:ChatOpenAI
+    model: qwen3.6-plus
+    api_key: $DASHSCOPE_API_KEY
+    base_url: $DASHSCOPE_API_BASE
+    request_timeout: 600.0
+    max_retries: 2
+    max_tokens: 16384
+    max_input_tokens: 131072
+    temperature: 0.1
+    extra_body:
+      enable_thinking: false
+    reasoning_effort: minimal
+    supports_vision: true
+    supports_thinking: false
+  - name: qwen3.5-35b
+    display_name: qwen3.6-35b
+    use: langchain_openai:ChatOpenAI
+    model: qwen3.5-35b
+    api_key: $QWEN35_API_KEY
+    base_url: $QWEN35_API_BASE
+    request_timeout: 600.0
+    max_retries: 2
+    max_tokens: 16384
+    max_input_tokens: 131072
+    temperature: 0.1
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+    supports_vision: true
+    supports_thinking: false
+    supports_reasoning_effort: false
 
 tool_groups: []
 

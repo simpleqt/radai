@@ -12,8 +12,6 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-
 from backend.config.loggers import get_logger
 from backend.rag.keywords.models import QueryType
 from backend.rag.retriever.chunk_searcher import ChunkCandidate

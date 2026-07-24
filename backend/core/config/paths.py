@@ -5,7 +5,7 @@ import re
 import shutil
 from pathlib import Path, PureWindowsPath
 
-from backend.core.thread_key import build_internal_thread_key, parse_internal_thread_key
+from backend.core.thread_key import parse_internal_thread_key
 
 THREAD_STORAGE_PREFIX = "/threads"
 

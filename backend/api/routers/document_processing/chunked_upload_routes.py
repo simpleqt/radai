@@ -1,5 +1,8 @@
 """分块上传路由"""
 
+import asyncio
+import uuid
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -10,6 +13,7 @@ from backend.api.routers.document_processing.models import (
     ChunkedUploadStatusResponse,
     validate_file_type,
 )
+from backend.api.upload_utils import UploadTooLargeError, read_upload_with_limit
 from backend.config.loggers import get_logger
 from backend.config.settings import settings
 from backend.db.crud.document_crud import document_crud
@@ -33,6 +37,16 @@ router = APIRouter()
 logger = get_logger(__name__)
 
 
+def _validate_upload_id(upload_id: str) -> str:
+    try:
+        normalized = str(uuid.UUID(str(upload_id)))
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="无效的上传会话 ID") from exc
+    if normalized != str(upload_id).lower():
+        raise HTTPException(status_code=400, detail="无效的上传会话 ID")
+    return normalized
+
+
 @router.post("/upload/chunked/init", response_model=ChunkedUploadInitResponse)
 async def init_chunked_upload(
     filename: str = Query(..., description="文件名"),
@@ -46,16 +60,18 @@ async def init_chunked_upload(
     try:
         validate_file_type(filename, content_type)
 
-        if total_size > settings.max_file_size:
+        if total_size <= 0 or total_size > settings.max_file_size:
             raise HTTPException(
                 status_code=400,
                 detail=f"文件大小超过限制: 最大 {settings.max_file_size / 1024 / 1024:.0f}MB",
             )
 
-        session = chunked_upload_manager.init_upload(
+        session = await asyncio.to_thread(
+            chunked_upload_manager.init_upload,
             filename=filename,
             total_size=total_size,
             content_type=content_type,
+            user_id=auth.user_id,
         )
 
         from datetime import datetime, timedelta
@@ -75,7 +91,7 @@ async def init_chunked_upload(
         raise
     except Exception as e:
         logger.exception(f"初始化分块上传失败: {e}")
-        raise HTTPException(status_code=500, detail=f"初始化分块上传失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="初始化分块上传失败") from e
 
 
 @router.post("/upload/chunked/{upload_id}")
@@ -87,12 +103,18 @@ async def upload_chunk(
 ):
     """上传分块"""
     try:
-        content = await chunk.read()
+        upload_id = _validate_upload_id(upload_id)
+        try:
+            content = await read_upload_with_limit(chunk, settings.chunk_size)
+        except UploadTooLargeError as exc:
+            raise HTTPException(status_code=413, detail="上传分块超过允许大小") from exc
 
-        result = chunked_upload_manager.save_chunk(
+        result = await asyncio.to_thread(
+            chunked_upload_manager.save_chunk,
             upload_id=upload_id,
             chunk_index=chunk_index,
             content=content,
+            user_id=auth.user_id,
         )
 
         if not result["success"]:
@@ -113,7 +135,7 @@ async def upload_chunk(
         raise
     except Exception as e:
         logger.exception(f"上传分块失败: {e}")
-        raise HTTPException(status_code=500, detail=f"上传分块失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="上传分块失败") from e
 
 
 @router.get(
@@ -124,7 +146,12 @@ async def get_chunked_upload_status(
     auth: ApiKeyAuth = Depends(verify_api_key),
 ):
     """获取分块上传状态"""
-    progress = chunked_upload_manager.get_upload_progress(upload_id)
+    upload_id = _validate_upload_id(upload_id)
+    progress = await asyncio.to_thread(
+        chunked_upload_manager.get_upload_progress,
+        upload_id,
+        user_id=auth.user_id,
+    )
 
     if not progress:
         raise HTTPException(status_code=404, detail="上传会话不存在")
@@ -158,22 +185,35 @@ async def complete_chunked_upload(
     """完成分块上传并创建处理任务"""
     logger.info(f"完成分块上传: upload_id={upload_id}")
 
+    merged = False
+    committed = False
     try:
-        success, message, file_path = chunked_upload_manager.complete_upload(
+        upload_id = _validate_upload_id(upload_id)
+        session_info = await asyncio.to_thread(
+            chunked_upload_manager.get_upload_session,
+            upload_id,
+            user_id=auth.user_id,
+        )
+        if session_info is None:
+            raise HTTPException(status_code=404, detail="上传会话不存在")
+        success, message, file_path = await asyncio.to_thread(
+            chunked_upload_manager.complete_upload,
             upload_id=upload_id,
             storage_type="documents",
+            user_id=auth.user_id,
+            cleanup_on_success=False,
         )
 
         if not success:
             raise HTTPException(status_code=400, detail=message)
-
-        session_info = chunked_upload_manager.get_upload_session(upload_id)
+        merged = True
 
         doc_type = validate_file_type(session_info["filename"])
 
-        import os
+        from pathlib import Path
 
-        file_size = os.path.getsize(file_path)
+        file_size = await asyncio.to_thread(Path(file_path).stat)
+        file_size = file_size.st_size
 
         doc = await document_crud.create(
             session=session,
@@ -242,12 +282,28 @@ async def complete_chunked_upload(
                     ),
                 ),
             )
-            await event_producer.send_event(event_message)
+            try:
+                await event_producer.send_event(event_message)
+            except MessageSendException:
+                logger.exception(
+                    "Task-created event delivery failed after task submission: %s",
+                    task.task_id,
+                )
         except MessageSendException as e:
             logger.error(f"Failed to send Kafka message for task {task.task_id}: {e}")
             raise HTTPException(
                 status_code=500, detail="分块上传合并成功，但任务提交到消息队列失败"
-            )
+            ) from e
+
+        await session.commit()
+        committed = True
+        cleaned = await asyncio.to_thread(
+            chunked_upload_manager.cancel_upload,
+            upload_id,
+            user_id=auth.user_id,
+        )
+        if not cleaned:
+            logger.warning("分块上传已提交，但临时会话清理失败: upload_id=%s", upload_id)
 
         return ChunkedMergeResponse(
             success=True,
@@ -258,10 +314,24 @@ async def complete_chunked_upload(
         )
 
     except HTTPException:
+        if merged and not committed:
+            await session.rollback()
+            await asyncio.to_thread(
+                chunked_upload_manager.reset_completed_upload,
+                upload_id,
+                user_id=auth.user_id,
+            )
         raise
     except Exception as e:
+        if merged and not committed:
+            await session.rollback()
+            await asyncio.to_thread(
+                chunked_upload_manager.reset_completed_upload,
+                upload_id,
+                user_id=auth.user_id,
+            )
         logger.exception(f"完成分块上传失败: {e}")
-        raise HTTPException(status_code=500, detail=f"完成分块上传失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="完成分块上传失败") from e
 
 
 @router.delete("/upload/chunked/{upload_id}")
@@ -270,7 +340,12 @@ async def cancel_chunked_upload(
     auth: ApiKeyAuth = Depends(verify_api_key),
 ):
     """取消分块上传"""
-    success = chunked_upload_manager.cancel_upload(upload_id)
+    upload_id = _validate_upload_id(upload_id)
+    success = await asyncio.to_thread(
+        chunked_upload_manager.cancel_upload,
+        upload_id,
+        user_id=auth.user_id,
+    )
 
     if success:
         return {"message": "上传已取消"}
@@ -284,7 +359,12 @@ async def get_upload_progress(
     auth: ApiKeyAuth = Depends(verify_api_key),
 ):
     """获取上传进度（用于进度回调）"""
-    progress = chunked_upload_manager.get_upload_progress(upload_id)
+    upload_id = _validate_upload_id(upload_id)
+    progress = await asyncio.to_thread(
+        chunked_upload_manager.get_upload_progress,
+        upload_id,
+        user_id=auth.user_id,
+    )
 
     if not progress:
         raise HTTPException(status_code=404, detail="上传会话不存在")

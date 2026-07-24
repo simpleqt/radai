@@ -3,14 +3,16 @@ policies:
     include:
       - multi_kb_search
       - chat_file_search
+      - read_context_artifact
       - web_search
     include_when_skill_selected:
       academic-search:
         - academic_search
+      paper-review:
+        - academic_search
       html-ppt:
         - generate_html_ppt
       general-table-analysis:
-        - excel_data_analysis
         - inspect_excel_data
         - query_excel_data
         - summarize_excel_data
@@ -29,6 +31,7 @@ policies:
     include:
       - multi_kb_search
       - chat_file_search
+      - read_context_artifact
       - web_search
     include_when_skill_selected:
       academic-search:
@@ -36,7 +39,6 @@ policies:
       html-ppt:
         - generate_html_ppt
       general-table-analysis:
-        - excel_data_analysis
         - inspect_excel_data
         - query_excel_data
         - summarize_excel_data
@@ -55,12 +57,43 @@ policies:
     include:
       - multi_kb_search
       - chat_file_search
+      - read_context_artifact
       - web_search
       - groundwater_project_skill_read
+      - groundwater_project_bootstrap
       - inspect_project_tables
       - query_project_tables
       - summarize_project_table
       - groundwater_prediction
       - groundwater_quality_check
+      - groundwater_kml_summary
     include_when_skill_selected: {}
     exclude: []
+
+  fmca_default:
+    include:
+      - chat_file_search
+      - read_context_artifact
+      - web_search
+    include_when_skill_selected:
+      academic-search:
+        - academic_search
+      paper-review:
+        - academic_search
+      html-ppt:
+        - generate_html_ppt
+      general-table-analysis:
+        - inspect_excel_data
+        - query_excel_data
+        - summarize_excel_data
+        - visualize_excel_data
+      excel-experiment-analysis:
+        - list_experiment_datasets
+        - inspect_excel_data
+        - query_excel_data
+        - summarize_excel_data
+        - visualize_excel_data
+      deep-research:
+        - save_deep_research_report
+    exclude:
+      - multi_kb_search

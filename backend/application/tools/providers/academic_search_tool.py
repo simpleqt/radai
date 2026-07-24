@@ -17,12 +17,12 @@
 - OpenAlex: 覆盖面广（2.5亿+学术作品），免费 API
 """
 
-import os
 import asyncio
 import hashlib
 import logging
+import os
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Optional
@@ -30,7 +30,6 @@ from typing import Optional
 import httpx
 from langchain_core.tools import tool
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -86,27 +85,6 @@ class RateLimitError(Exception):
 DEFAULT_TIMEOUT = 15
 MAX_RETRIES = 2
 RETRY_DELAY = 0.5
-
-
-def _run_async(coro):
-    """安全运行异步协程，兼容已有事件循环的场景
-
-    LangGraph 的 ToolNode 默认同步调用 tool.invoke()，
-    而我们内部使用 asyncio 实现并发检索。
-    当已在事件循环中时（如 Jupyter），用新线程运行；
-    否则直接 asyncio.run()。
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(asyncio.run, coro).result()
-    else:
-        return asyncio.run(coro)
 
 
 # ============================================================
@@ -650,7 +628,11 @@ async def _async_search(
     """
     db_list = databases or DEFAULT_SOURCES
 
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        trust_env=True,
+        timeout=DEFAULT_TIMEOUT,
+        follow_redirects=True,
+    ) as client:
         # 并发查询所有数据源
         tasks = []
         for db_name in db_list:
@@ -873,7 +855,7 @@ def _format_markdown(papers: list[Paper], query: str, stats: dict) -> str:
 # ============================================================
 
 @tool("academic_search")
-def academic_search(
+async def academic_search(
     query: str,
     max_results: int = 5,
     databases: list[str] = None,
@@ -915,7 +897,7 @@ def academic_search(
         except (ValueError, IndexError):
             pass
 
-    papers, stats = _run_async(_async_search(
+    papers, stats = await _async_search(
         query=query,
         max_results=max_results,
         databases=databases,
@@ -923,7 +905,7 @@ def academic_search(
         sort_by=sort_by,
         min_citations=min_citations,
         open_access_only=open_access_only,
-    ))
+    )
 
     return _format_markdown(papers, query, stats)
 
@@ -940,7 +922,7 @@ async def _run_test(name: str, **kwargs):
     print(f"参数: {kwargs}")
 
     try:
-        result = academic_search.invoke(kwargs)
+        result = await academic_search.ainvoke(kwargs)
         print(result)
     except Exception as e:
         print(f"❌ 测试失败: {type(e).__name__}: {e}")

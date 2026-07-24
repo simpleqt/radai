@@ -7,6 +7,7 @@ from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.models import Task, TaskStatus
+from backend.db.unit_of_work import flush_or_commit
 
 
 class TaskCRUD:
@@ -32,7 +33,7 @@ class TaskCRUD:
             priority=priority,
         )
         session.add(task)
-        await session.commit()
+        await flush_or_commit(session)
         await session.refresh(task)
         return task
 
@@ -43,20 +44,32 @@ class TaskCRUD:
         return result.scalar_one_or_none()
 
     @staticmethod
-    async def get_by_doc_id(session: AsyncSession, doc_id: str) -> list[Task]:
+    async def get_by_doc_id(
+        session: AsyncSession,
+        doc_id: str,
+        limit: int = 1000,
+    ) -> list[Task]:
         """根据文档 ID 获取任务列表"""
         result = await session.execute(
-            select(Task).where(Task.doc_id == doc_id).order_by(Task.created_at.desc())
+            select(Task)
+            .where(Task.doc_id == doc_id)
+            .order_by(Task.created_at.desc())
+            .limit(max(1, int(limit)))
         )
         return list(result.scalars().all())
 
     @staticmethod
-    async def get_by_batch_id(session: AsyncSession, batch_id: str) -> list[Task]:
+    async def get_by_batch_id(
+        session: AsyncSession,
+        batch_id: str,
+        limit: int = 1000,
+    ) -> list[Task]:
         """根据批次 ID 获取任务列表"""
         result = await session.execute(
             select(Task)
             .where(Task.batch_id == batch_id)
             .order_by(Task.created_at.desc())
+            .limit(max(1, int(limit)))
         )
         return list(result.scalars().all())
 
@@ -115,13 +128,17 @@ class TaskCRUD:
         if status == TaskStatus.PROCESSING.value and not update_data.get("started_at"):
             update_data["started_at"] = datetime.now()
 
-        if status in [TaskStatus.COMPLETED.value, TaskStatus.FAILED.value]:
+        if status in [
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.CANCELLED.value,
+        ]:
             update_data["completed_at"] = datetime.now()
 
         await session.execute(
             update(Task).where(Task.task_id == task_id).values(**update_data)
         )
-        await session.commit()
+        await flush_or_commit(session)
 
         return await TaskCRUD.get_by_id(session, task_id)
 
@@ -140,34 +157,32 @@ class TaskCRUD:
                 updated_at=datetime.now(),
             )
         )
-        await session.commit()
+        await flush_or_commit(session)
 
         return await TaskCRUD.get_by_id(session, task_id)
 
     @staticmethod
     async def increment_retry(session: AsyncSession, task_id: str) -> Task | None:
         """增加重试次数"""
-        task = await TaskCRUD.get_by_id(session, task_id)
-        if task:
-            new_retry = task.retry_count + 1
-            await session.execute(
-                update(Task)
-                .where(Task.task_id == task_id)
-                .values(
-                    retry_count=new_retry,
-                    status=TaskStatus.PENDING.value,
-                    updated_at=datetime.now(),
-                )
+        result = await session.execute(
+            update(Task)
+            .where(Task.task_id == task_id)
+            .values(
+                retry_count=func.coalesce(Task.retry_count, 0) + 1,
+                status=TaskStatus.PENDING.value,
+                updated_at=datetime.now(),
             )
-            await session.commit()
-            return await TaskCRUD.get_by_id(session, task_id)
-        return None
+        )
+        await flush_or_commit(session)
+        if result.rowcount == 0:
+            return None
+        return await TaskCRUD.get_by_id(session, task_id)
 
     @staticmethod
     async def delete(session: AsyncSession, task_id: str) -> bool:
         """删除任务"""
         result = await session.execute(delete(Task).where(Task.task_id == task_id))
-        await session.commit()
+        await flush_or_commit(session)
         return result.rowcount > 0
 
     @staticmethod
@@ -205,6 +220,7 @@ class TaskCRUD:
     async def get_processing_tasks(
         session: AsyncSession,
         timeout_seconds: int = 3600,
+        limit: int = 1000,
     ) -> list[Task]:
         """获取处理中任务（超时检测）"""
         timeout_threshold = datetime.now().timestamp() - timeout_seconds
@@ -219,6 +235,7 @@ class TaskCRUD:
                 )
             )
             .order_by(Task.started_at.asc())
+            .limit(max(1, int(limit)))
         )
         return list(result.scalars().all())
 
@@ -234,7 +251,14 @@ class TaskCRUD:
             query = query.where(Task.user_id == user_id)
 
         result = await session.execute(query)
-        stats = {"total": 0, "pending": 0, "processing": 0, "completed": 0, "failed": 0}
+        stats = {
+            "total": 0,
+            "pending": 0,
+            "processing": 0,
+            "completed": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
 
         for status, count in result.all():
             stats[status] = count

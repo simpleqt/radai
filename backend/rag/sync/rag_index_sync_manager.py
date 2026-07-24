@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +39,7 @@ class RAGIndexSyncManager:
         self._batch_size = 100
         self._async_initialized = False
         self._async_init_lock = asyncio.Lock()
+        self._milvus_aliases: set[str] = set()
         
         logger.info("[RAGIndexSyncManager] 初始化完成")
 
@@ -212,6 +214,18 @@ class RAGIndexSyncManager:
         doc_ids: List[str],
     ) -> List[str]:
         """从 Milvus chunks collection 获取文档的所有 chunk_id"""
+        return await asyncio.to_thread(
+            self._get_chunk_ids_for_docs_sync,
+            kb_code,
+            list(dict.fromkeys(doc_ids)),
+        )
+
+    def _get_chunk_ids_for_docs_sync(
+        self,
+        kb_code: str,
+        doc_ids: List[str],
+    ) -> List[str]:
+        """在工作线程中批量查询 Milvus，避免阻塞事件循环和逐文档 N+1。"""
         try:
             from pymilvus import connections, Collection, utility
             from backend.config.settings import settings
@@ -233,33 +247,43 @@ class RAGIndexSyncManager:
                 if milvus_db_name:
                     connect_kwargs["db_name"] = milvus_db_name
                 connections.connect(**connect_kwargs)
-            
-            collection_name = f"{kb_code}_chunks"
-            
-            if not utility.has_collection(collection_name, using=conn_alias):
-                logger.info(f"[RAGIndexSyncManager] Milvus chunks collection 不存在: {collection_name}")
-                return []
-            
-            collection = Collection(collection_name, using=conn_alias)
-            collection.load()
-            
-            chunk_ids = []
-            for doc_id in doc_ids:
-                try:
-                    results = collection.query(
-                        expr=f'full_doc_id == "{doc_id}"',
-                        output_fields=["id"],
-                        limit=10000,
+            self._milvus_aliases.add(conn_alias)
+            try:
+                collection_name = f"{kb_code}_chunks"
+                if not utility.has_collection(collection_name, using=conn_alias):
+                    logger.info(
+                        "[RAGIndexSyncManager] Milvus chunks collection 不存在: %s",
+                        collection_name,
                     )
-                    for item in results:
-                        chunk_id = item.get("id", "")
-                        if chunk_id:
-                            chunk_ids.append(chunk_id)
-                except Exception as e:
-                    logger.warning(f"[RAGIndexSyncManager] 查询 chunk_id 失败: doc_id={doc_id}, error={e}")
-            
-            logger.info(f"[RAGIndexSyncManager] 获取 chunk_id: kb={kb_code}, doc_ids={doc_ids}, chunk_count={len(chunk_ids)}")
-            return chunk_ids
+                    return []
+
+                collection = Collection(collection_name, using=conn_alias)
+                collection.load()
+                chunk_ids: list[str] = []
+                for offset in range(0, len(doc_ids), 50):
+                    batch = doc_ids[offset : offset + 50]
+                    expr_values = ", ".join(json.dumps(item) for item in batch)
+                    results = collection.query(
+                        expr=f"full_doc_id in [{expr_values}]",
+                        output_fields=["id"],
+                        limit=16384,
+                    )
+                    chunk_ids.extend(
+                        str(item.get("id"))
+                        for item in results
+                        if item.get("id")
+                    )
+
+                logger.info(
+                    "[RAGIndexSyncManager] 获取 chunk_id: kb=%s doc_count=%d chunk_count=%d",
+                    kb_code,
+                    len(doc_ids),
+                    len(chunk_ids),
+                )
+                return chunk_ids
+            finally:
+                connections.disconnect(conn_alias)
+                self._milvus_aliases.discard(conn_alias)
             
         except Exception as e:
             logger.error(f"[RAGIndexSyncManager] 获取 chunk_id 失败: {e}")
@@ -292,7 +316,7 @@ class RAGIndexSyncManager:
                     async def embed_func(texts: list[str]):
                         import httpx
                         import numpy as np
-                        async with httpx.AsyncClient(timeout=60.0) as client:
+                        async with httpx.AsyncClient(trust_env=False, timeout=60.0) as client:
                             response = await client.post(
                                 f"{embedding_api_base}/embeddings",
                                 headers={"Authorization": f"Bearer {embedding_api_key}"},
@@ -441,6 +465,7 @@ class RAGIndexSyncManager:
                 if milvus_db_name:
                     connect_kwargs["db_name"] = milvus_db_name
                 connections.connect(**connect_kwargs)
+            self._milvus_aliases.add(conn_alias)
             
             collection_name = f"{kb_code}_entities"
             
@@ -509,7 +534,7 @@ class RAGIndexSyncManager:
                 
                 if embedding_api_base and embedding_model:
                     async def embed_func(texts: list[str]):
-                        async with httpx.AsyncClient(timeout=60.0) as client:
+                        async with httpx.AsyncClient(trust_env=False, timeout=60.0) as client:
                             response = await client.post(
                                 f"{embedding_api_base}/embeddings",
                                 headers={"Authorization": f"Bearer {embedding_api_key}"},
@@ -560,6 +585,43 @@ class RAGIndexSyncManager:
         await self.initialize()
         self._enabled = True
         logger.info("[RAGIndexSyncManager] 同步已启用")
+
+    async def shutdown(self, timeout_seconds: float = 30.0) -> None:
+        """Stop owned sync tasks and disconnect Milvus aliases."""
+        self._enabled = False
+        async with self._lock:
+            tasks = [task for task in self._sync_tasks.values() if not task.done()]
+
+        if tasks:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=max(0.0, float(timeout_seconds)),
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            logger.info(
+                "[RAGIndexSyncManager] 关闭同步任务: completed=%d cancelled=%d",
+                len(done),
+                len(pending),
+            )
+
+        aliases = tuple(self._milvus_aliases)
+        self._milvus_aliases.clear()
+        if aliases:
+            def _disconnect_aliases() -> None:
+                from pymilvus import connections
+
+                for alias in aliases:
+                    if connections.has_connection(alias):
+                        connections.disconnect(alias)
+
+            await asyncio.to_thread(_disconnect_aliases)
+
+        async with self._lock:
+            self._sync_tasks.clear()
+        self._async_initialized = False
 
 
 def get_rag_index_sync_manager() -> RAGIndexSyncManager:

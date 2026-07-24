@@ -2,20 +2,120 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import mimetypes
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
-
 from backend.config.loggers import get_logger
-from backend.db.connection import get_async_session_factory, get_session_factory
 from backend.core.config import get_paths, parse_internal_thread_key
+from backend.db.connection import get_async_session_factory, get_session_factory
+from backend.db.models import UserFile
+from backend.services.chat_file_parser import (
+    ChatFileParser,
+    ParseResult,
+    clean_surrogates,
+    compress_image_if_needed,
+    replace_local_images_with_urls,
+)
+from backend.storage import (
+    _get_minio_client,
+    get_user_minio_bucket_name,
+    upload_bytes_to_minio,
+)
 
 logger = get_logger(__name__)
+
+ALLOWED_UPLOAD_EXTENSIONS: set[str] = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
+    ".txt", ".md", ".csv", ".json", ".py", ".html", ".xml", ".kml",
+    ".log", ".yaml", ".yml", ".toml", ".rst",
+    ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
+}
+
+UPLOAD_STRATEGY_BY_CATEGORY = {
+    "multimodal": "vision",
+    "short_doc": "context",
+    "long_doc": "indexed",
+}
+
+ImageUrlBuilder = Callable[[str, str], str]
+UploadedObjectRecorder = Callable[[str], None]
+ExtraImageUrlLoader = Callable[
+    [str, str, ParseResult, UploadedObjectRecorder], Awaitable[list[dict]]
+]
+ParsedCallback = Callable[[str, ParseResult], Awaitable[None]]
+
+
+def _artifact_key(*parts: str) -> str:
+    canonical = "\0".join(str(part or "") for part in parts)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+async def _commit_artifact_insert_async(
+    session: AsyncSession,
+    statement,
+    params: dict[str, Any],
+    artifact_key: str,
+) -> str:
+    try:
+        await session.execute(statement, params)
+        await session.commit()
+        return str(params["file_id"])
+    except IntegrityError:
+        await session.rollback()
+        existing_id = await session.scalar(
+            text(
+                "SELECT file_id FROM user_files "
+                "WHERE artifact_key = :artifact_key LIMIT 1"
+            ),
+            {"artifact_key": artifact_key},
+        )
+        if not existing_id:
+            raise
+        return str(existing_id)
+
+
+def _commit_artifact_insert_sync(
+    session,
+    statement,
+    params: dict[str, Any],
+    artifact_key: str,
+) -> str:
+    try:
+        session.execute(statement, params)
+        session.commit()
+        return str(params["file_id"])
+    except IntegrityError:
+        session.rollback()
+        existing_id = session.scalar(
+            text(
+                "SELECT file_id FROM user_files "
+                "WHERE artifact_key = :artifact_key LIMIT 1"
+            ),
+            {"artifact_key": artifact_key},
+        )
+        if not existing_id:
+            raise
+        return str(existing_id)
+
+
+class UserFileParseError(Exception):
+    """上传文件解析失败。"""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+class UserFileServiceError(Exception):
+    """用户文件服务持久化失败。"""
 
 
 @dataclass
@@ -33,8 +133,284 @@ class UserFileResolved:
     status: str
 
 
+@dataclass
+class StoredUploadedUserFile:
+    user_file: UserFile
+    file_id: str
+    display_name: str
+    size_bytes: int
+    mime_type: str | None
+    category: str
+    strategy: str
+    content: str | None
+    content_length: int
+    table_analysis_enabled: bool
+    metadata: dict[str, Any]
+    parse_result: ParseResult
+    storage_bucket: str
+    uploaded_object_keys: tuple[str, ...]
+
+
+def is_allowed_upload_filename(filename: str) -> bool:
+    return Path(filename or "").suffix.lower() in ALLOWED_UPLOAD_EXTENSIONS
+
+
 def _build_download_url(file_id: str) -> str:
     return f"/api/v2/files/{file_id}/download"
+
+
+async def cleanup_uploaded_minio_objects(
+    bucket_name: str,
+    object_keys: list[str] | tuple[str, ...],
+) -> None:
+    """Best-effort rollback for objects created by one upload operation."""
+    if not any(str(key or "").strip().lstrip("/") for key in object_keys):
+        return
+    try:
+        client = _get_minio_client()
+    except Exception as exc:
+        logger.exception(
+            "[UserFileService] 初始化 MinIO 回滚客户端失败: bucket=%s error=%s",
+            bucket_name,
+            exc,
+        )
+        return
+    seen: set[str] = set()
+    for raw_key in reversed(object_keys):
+        object_key = str(raw_key or "").strip().lstrip("/")
+        if not object_key or object_key in seen:
+            continue
+        seen.add(object_key)
+        try:
+            await asyncio.to_thread(client.remove_object, bucket_name, object_key)
+        except Exception as exc:
+            logger.exception(
+                "[UserFileService] 回滚 MinIO 对象失败: bucket=%s object=%s error=%s",
+                bucket_name,
+                object_key,
+                exc,
+            )
+
+
+async def _prepare_uploaded_user_file(
+    *,
+    session: AsyncSession,
+    owner_user_id: str,
+    data: bytes,
+    filename: str,
+    mime_type: str | None,
+    storage_scope: str,
+    image_url_builder: ImageUrlBuilder,
+    thread_id: str | None = None,
+    parse_mode: str = "auto",
+    parser: ChatFileParser | None = None,
+    on_parsed: ParsedCallback | None = None,
+    extra_image_url_loader: ExtraImageUrlLoader | None = None,
+    replace_content_image_urls: bool = False,
+    include_parse_metadata: bool = False,
+    uploaded_object_keys: list[str],
+) -> StoredUploadedUserFile:
+    """解析、上传并登记用户文件；调用方负责 commit。"""
+    if storage_scope not in {"personal", "chat"}:
+        raise ValueError(f"Unsupported storage_scope: {storage_scope}")
+    if storage_scope == "chat" and not thread_id:
+        raise ValueError("thread_id is required for chat file uploads")
+
+    file_id = f"uf_{uuid.uuid4().hex}"
+    file_size = len(data)
+    parser = parser or ChatFileParser()
+
+    try:
+        parse_result = await parser.parse(
+            data,
+            filename,
+            mime_type,
+            parse_mode=parse_mode,
+        )
+    except Exception as exc:
+        logger.exception("[UserFileService] 文件解析异常: %s", exc)
+        parse_result = None
+
+    if parse_result is None or parse_result.category == "failed":
+        error_msg = parse_result.error if parse_result else "解析服务异常"
+        raise UserFileParseError(error_msg)
+
+    if on_parsed is not None:
+        await on_parsed(file_id, parse_result)
+
+    strategy = UPLOAD_STRATEGY_BY_CATEGORY.get(parse_result.category, "none")
+    bucket_name = get_user_minio_bucket_name()
+    if storage_scope == "chat":
+        base_prefix = f"users/{owner_user_id}/threads/{thread_id}/chat-files/{file_id}"
+    else:
+        base_prefix = f"users/{owner_user_id}/personal-files/{file_id}"
+    storage_object = f"{base_prefix}/{filename}"
+
+    # Record ownership before the blocking upload starts. The storage helper
+    # waits for an in-flight thread on cancellation, so compensation can then
+    # safely delete this unique key even when the await is interrupted.
+    uploaded_object_keys.append(storage_object)
+    uploaded = await upload_bytes_to_minio(
+        content=data,
+        object_name=storage_object,
+        content_type=mime_type or "application/octet-stream",
+        bucket_name=bucket_name,
+    )
+    if not uploaded:
+        raise UserFileServiceError("文件上传对象存储失败")
+
+    image_urls: list[dict] = []
+    for raw_image in parse_result.images or []:
+        image = await asyncio.to_thread(compress_image_if_needed, raw_image)
+        image_object = f"{base_prefix}/images/{image.name}"
+        uploaded_object_keys.append(image_object)
+        image_uploaded = await upload_bytes_to_minio(
+            content=image.data,
+            object_name=image_object,
+            content_type=image.content_type,
+            bucket_name=bucket_name,
+        )
+        if not image_uploaded:
+            raise UserFileServiceError("文件图片上传对象存储失败")
+        image_urls.append(
+            {
+                "url": image_url_builder(file_id, image.name),
+                "name": image.name,
+                "caption": image.caption,
+                "content_type": image.content_type,
+                "storage_object": image_object,
+            }
+        )
+
+    if extra_image_url_loader is not None and getattr(parse_result, "image_urls", None):
+        image_urls.extend(
+            await extra_image_url_loader(
+                file_id,
+                bucket_name,
+                parse_result,
+                uploaded_object_keys.append,
+            )
+        )
+
+    metadata_payload: dict[str, Any] = {
+        "file_category": parse_result.category,
+        "strategy": strategy,
+        "content": parse_result.content,
+        "content_length": parse_result.content_length,
+    }
+    if include_parse_metadata:
+        metadata_payload["parse_mode"] = parse_mode
+        metadata_payload["parse_method"] = parse_result.method
+
+    from backend.services.table_analysis_files import build_table_analysis_metadata
+
+    table_analysis_meta = build_table_analysis_metadata(
+        file_id=file_id,
+        file_name=filename,
+        mime_type=parse_result.mime_type or mime_type,
+        storage_bucket=bucket_name,
+        storage_object=storage_object,
+    )
+    if table_analysis_meta:
+        metadata_payload["table_analysis"] = table_analysis_meta
+
+    if replace_content_image_urls and metadata_payload.get("content") and image_urls:
+        image_url_map: dict[str, str] = {}
+        for image_info in image_urls:
+            url = image_info.get("url")
+            if not url:
+                continue
+            for key in {
+                image_info.get("name", ""),
+                Path(image_info.get("name", "")).name,
+            }:
+                if key:
+                    image_url_map.setdefault(key, url)
+        if image_url_map:
+            metadata_payload["content"] = replace_local_images_with_urls(
+                str(metadata_payload["content"]),
+                image_url_map,
+            )
+
+    if image_urls:
+        metadata_payload["image_urls"] = image_urls
+
+    metadata_payload = clean_surrogates(metadata_payload)
+
+    db_file = UserFile(
+        file_id=file_id,
+        owner_user_id=owner_user_id,
+        thread_id=thread_id,
+        source_type="minio",
+        storage_bucket=bucket_name,
+        storage_object=storage_object,
+        display_name=filename,
+        mime_type=parse_result.mime_type or mime_type,
+        size_bytes=file_size,
+        status="active",
+        metadata_=metadata_payload,
+    )
+    session.add(db_file)
+
+    return StoredUploadedUserFile(
+        user_file=db_file,
+        file_id=file_id,
+        display_name=filename,
+        size_bytes=file_size,
+        mime_type=parse_result.mime_type or mime_type,
+        category=parse_result.category,
+        strategy=strategy,
+        content=parse_result.content,
+        content_length=parse_result.content_length,
+        table_analysis_enabled=bool(table_analysis_meta),
+        metadata=metadata_payload,
+        parse_result=parse_result,
+        storage_bucket=bucket_name,
+        uploaded_object_keys=tuple(uploaded_object_keys),
+    )
+
+
+async def prepare_uploaded_user_file(
+    *,
+    session: AsyncSession,
+    owner_user_id: str,
+    data: bytes,
+    filename: str,
+    mime_type: str | None,
+    storage_scope: str,
+    image_url_builder: ImageUrlBuilder,
+    thread_id: str | None = None,
+    parse_mode: str = "auto",
+    parser: ChatFileParser | None = None,
+    on_parsed: ParsedCallback | None = None,
+    extra_image_url_loader: ExtraImageUrlLoader | None = None,
+    replace_content_image_urls: bool = False,
+    include_parse_metadata: bool = False,
+) -> StoredUploadedUserFile:
+    """Parse, upload, and register a file with compensating object cleanup."""
+    uploaded_object_keys: list[str] = []
+    bucket_name = get_user_minio_bucket_name()
+    try:
+        return await _prepare_uploaded_user_file(
+            session=session,
+            owner_user_id=owner_user_id,
+            data=data,
+            filename=filename,
+            mime_type=mime_type,
+            storage_scope=storage_scope,
+            image_url_builder=image_url_builder,
+            thread_id=thread_id,
+            parse_mode=parse_mode,
+            parser=parser,
+            on_parsed=on_parsed,
+            extra_image_url_loader=extra_image_url_loader,
+            replace_content_image_urls=replace_content_image_urls,
+            include_parse_metadata=include_parse_metadata,
+            uploaded_object_keys=uploaded_object_keys,
+        )
+    except BaseException:
+        await cleanup_uploaded_minio_objects(bucket_name, uploaded_object_keys)
+        raise
 
 
 async def list_active_files_for_thread_for_user(
@@ -121,20 +497,29 @@ async def register_local_artifact_for_thread(
     if not safe_name:
         return None
 
-    outputs_dir = get_paths().thread_artifacts_dir(internal_thread_id).resolve()
-    local_path = (outputs_dir / safe_name).resolve()
+    outputs_dir = await asyncio.to_thread(
+        get_paths().thread_artifacts_dir(internal_thread_id).resolve
+    )
+    local_path = await asyncio.to_thread((outputs_dir / safe_name).resolve)
     try:
         local_path.relative_to(outputs_dir)
     except ValueError:
         logger.warning("[UserFileService] 非法工件路径，已拒绝登记: %s", artifact_filename)
         return None
 
-    if not local_path.exists() or not local_path.is_file():
+    exists, is_file = await asyncio.gather(
+        asyncio.to_thread(local_path.exists),
+        asyncio.to_thread(local_path.is_file),
+    )
+    if not exists or not is_file:
         logger.warning("[UserFileService] 工件文件不存在，无法登记: %s", local_path)
         return None
 
     mime_type, _ = mimetypes.guess_type(str(local_path))
-    file_size = local_path.stat().st_size
+    file_size = (await asyncio.to_thread(local_path.stat)).st_size
+    artifact_key = _artifact_key(
+        "local", user_id, external_thread_id, str(local_path)
+    )
 
     factory = get_async_session_factory()
     async with factory() as session:
@@ -163,7 +548,8 @@ async def register_local_artifact_for_thread(
             return file_id, _build_download_url(file_id)
 
         file_id = f"uf_{uuid.uuid4().hex}"
-        await session.execute(
+        file_id = await _commit_artifact_insert_async(
+            session,
             text(
                 """
                 INSERT INTO user_files (
@@ -172,6 +558,7 @@ async def register_local_artifact_for_thread(
                     thread_id,
                     source_type,
                     local_abs_path,
+                    artifact_key,
                     display_name,
                     mime_type,
                     size_bytes,
@@ -182,6 +569,7 @@ async def register_local_artifact_for_thread(
                     :thread_id,
                     'local',
                     :local_abs_path,
+                    :artifact_key,
                     :display_name,
                     :mime_type,
                     :size_bytes,
@@ -194,12 +582,13 @@ async def register_local_artifact_for_thread(
                 "owner_user_id": user_id,
                 "thread_id": external_thread_id,
                 "local_abs_path": str(local_path),
+                "artifact_key": artifact_key,
                 "display_name": Path(safe_name).name,
                 "mime_type": mime_type,
                 "size_bytes": file_size,
             },
+            artifact_key,
         )
-        await session.commit()
         return file_id, _build_download_url(file_id)
 
 
@@ -221,6 +610,9 @@ async def register_minio_artifact_for_thread(
     bucket_name = (storage_bucket or "").strip()
     if not safe_name or not object_name or not bucket_name:
         return None
+    artifact_key = _artifact_key(
+        "minio", user_id, external_thread_id, bucket_name, object_name
+    )
 
     factory = get_async_session_factory()
     async with factory() as session:
@@ -252,7 +644,8 @@ async def register_minio_artifact_for_thread(
             return file_id, _build_download_url(file_id)
 
         file_id = f"uf_{uuid.uuid4().hex}"
-        await session.execute(
+        file_id = await _commit_artifact_insert_async(
+            session,
             text(
                 """
                 INSERT INTO user_files (
@@ -262,6 +655,7 @@ async def register_minio_artifact_for_thread(
                     source_type,
                     storage_bucket,
                     storage_object,
+                    artifact_key,
                     display_name,
                     mime_type,
                     status
@@ -272,6 +666,7 @@ async def register_minio_artifact_for_thread(
                     'minio',
                     :storage_bucket,
                     :storage_object,
+                    :artifact_key,
                     :display_name,
                     :mime_type,
                     'active'
@@ -284,11 +679,12 @@ async def register_minio_artifact_for_thread(
                 "thread_id": external_thread_id,
                 "storage_bucket": bucket_name,
                 "storage_object": object_name,
+                "artifact_key": artifact_key,
                 "display_name": Path(safe_name).name,
                 "mime_type": mime_type,
             },
+            artifact_key,
         )
-        await session.commit()
         return file_id, _build_download_url(file_id)
 
 
@@ -320,6 +716,9 @@ def register_local_artifact_for_thread_sync(
 
     mime_type, _ = mimetypes.guess_type(str(local_path))
     file_size = local_path.stat().st_size
+    artifact_key = _artifact_key(
+        "local", user_id, external_thread_id, str(local_path)
+    )
 
     factory = get_session_factory()
     with factory() as session:
@@ -348,7 +747,8 @@ def register_local_artifact_for_thread_sync(
             return file_id, _build_download_url(file_id)
 
         file_id = f"uf_{uuid.uuid4().hex}"
-        session.execute(
+        file_id = _commit_artifact_insert_sync(
+            session,
             text(
                 """
                 INSERT INTO user_files (
@@ -357,6 +757,7 @@ def register_local_artifact_for_thread_sync(
                     thread_id,
                     source_type,
                     local_abs_path,
+                    artifact_key,
                     display_name,
                     mime_type,
                     size_bytes,
@@ -367,6 +768,7 @@ def register_local_artifact_for_thread_sync(
                     :thread_id,
                     'local',
                     :local_abs_path,
+                    :artifact_key,
                     :display_name,
                     :mime_type,
                     :size_bytes,
@@ -379,12 +781,13 @@ def register_local_artifact_for_thread_sync(
                 "owner_user_id": user_id,
                 "thread_id": external_thread_id,
                 "local_abs_path": str(local_path),
+                "artifact_key": artifact_key,
                 "display_name": Path(safe_name).name,
                 "mime_type": mime_type,
                 "size_bytes": file_size,
             },
+            artifact_key,
         )
-        session.commit()
         return file_id, _build_download_url(file_id)
 
 
@@ -406,6 +809,9 @@ def register_minio_artifact_for_thread_sync(
     bucket_name = (storage_bucket or "").strip()
     if not safe_name or not object_name or not bucket_name:
         return None
+    artifact_key = _artifact_key(
+        "minio", user_id, external_thread_id, bucket_name, object_name
+    )
 
     factory = get_session_factory()
     with factory() as session:
@@ -437,7 +843,8 @@ def register_minio_artifact_for_thread_sync(
             return file_id, _build_download_url(file_id)
 
         file_id = f"uf_{uuid.uuid4().hex}"
-        session.execute(
+        file_id = _commit_artifact_insert_sync(
+            session,
             text(
                 """
                 INSERT INTO user_files (
@@ -447,6 +854,7 @@ def register_minio_artifact_for_thread_sync(
                     source_type,
                     storage_bucket,
                     storage_object,
+                    artifact_key,
                     display_name,
                     mime_type,
                     status
@@ -457,6 +865,7 @@ def register_minio_artifact_for_thread_sync(
                     'minio',
                     :storage_bucket,
                     :storage_object,
+                    :artifact_key,
                     :display_name,
                     :mime_type,
                     'active'
@@ -469,11 +878,12 @@ def register_minio_artifact_for_thread_sync(
                 "thread_id": external_thread_id,
                 "storage_bucket": bucket_name,
                 "storage_object": object_name,
+                "artifact_key": artifact_key,
                 "display_name": Path(safe_name).name,
                 "mime_type": mime_type,
             },
+            artifact_key,
         )
-        session.commit()
         return file_id, _build_download_url(file_id)
 
 

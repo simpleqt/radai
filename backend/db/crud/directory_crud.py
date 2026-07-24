@@ -4,9 +4,14 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.models import KnowledgeBaseDirectory
+from backend.db.unit_of_work import flush_or_commit
 
 
 class DirectoryCRUD:
@@ -65,7 +70,7 @@ class DirectoryCRUD:
             is_system=is_system,
         )
         session.add(directory)
-        await session.commit()
+        await flush_or_commit(session)
         await session.refresh(directory)
         return directory
 
@@ -189,7 +194,7 @@ class DirectoryCRUD:
             )
             .values(**update_data)
         )
-        await session.commit()
+        await flush_or_commit(session)
         return await DirectoryCRUD.get_by_path(session, kb_id, category_path)
 
     @staticmethod
@@ -213,7 +218,7 @@ class DirectoryCRUD:
                 updated_at=datetime.now(),
             )
         )
-        await session.commit()
+        await flush_or_commit(session)
         return await DirectoryCRUD.get_by_path(session, kb_id, category_path)
 
     @staticmethod
@@ -240,7 +245,7 @@ class DirectoryCRUD:
                 updated_at=datetime.now(),
             )
         )
-        await session.commit()
+        await flush_or_commit(session)
         return result.rowcount > 0
 
     @staticmethod
@@ -275,7 +280,7 @@ class DirectoryCRUD:
             )
             updated_count += 1
         
-        await session.commit()
+        await flush_or_commit(session)
         return updated_count
 
     @staticmethod
@@ -289,7 +294,7 @@ class DirectoryCRUD:
                 KnowledgeBaseDirectory.category_path == category_path,
             )
         )
-        await session.commit()
+        await flush_or_commit(session)
         return result.rowcount > 0
 
     @staticmethod
@@ -304,7 +309,7 @@ class DirectoryCRUD:
                 (KnowledgeBaseDirectory.category_path.like(f"{category_path}/%")),
             )
         )
-        await session.commit()
+        await flush_or_commit(session)
         return result.rowcount
 
     @staticmethod
@@ -318,36 +323,100 @@ class DirectoryCRUD:
         color: Optional[str] = None,
         created_by: Optional[str] = None,
     ) -> KnowledgeBaseDirectory:
-        """创建或更新目录"""
-        existing = await DirectoryCRUD.get_by_path(session, kb_id, category_path)
-        
-        if existing:
-            update_data = {"updated_at": datetime.now()}
+        """原子创建或更新目录。"""
+        parent_path, depth, name = DirectoryCRUD._parse_path_info(category_path)
+        values = {
+            "kb_id": kb_id,
+            "category_path": category_path,
+            "parent_path": parent_path,
+            "depth": depth,
+            "name": name,
+            "description": description,
+            "sort_order": sort_order,
+            "icon": icon,
+            "color": color,
+            "created_by": created_by,
+        }
+        dialect_name = session.get_bind().dialect.name
+        update_values = {"updated_at": datetime.now()}
+        if description is not None:
+            update_values["description"] = description
+        if sort_order != 0:
+            update_values["sort_order"] = sort_order
+        if icon is not None:
+            update_values["icon"] = icon
+        if color is not None:
+            update_values["color"] = color
+        if dialect_name == "mysql":
+            statement = mysql_insert(KnowledgeBaseDirectory).values(**values)
+            updates = {"updated_at": datetime.now()}
             if description is not None:
-                update_data["description"] = description
+                updates["description"] = statement.inserted.description
             if sort_order != 0:
-                update_data["sort_order"] = sort_order
-            
-            if len(update_data) > 1:
-                await session.execute(
-                    update(KnowledgeBaseDirectory)
-                    .where(KnowledgeBaseDirectory.id == existing.id)
-                    .values(**update_data)
+                updates["sort_order"] = statement.inserted.sort_order
+            if icon is not None:
+                updates["icon"] = statement.inserted.icon
+            if color is not None:
+                updates["color"] = statement.inserted.color
+            await session.execute(statement.on_duplicate_key_update(**updates))
+        elif dialect_name == "sqlite":
+            statement = sqlite_insert(KnowledgeBaseDirectory).values(**values)
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["kb_id", "category_path"],
+                    set_={
+                        key: (
+                            statement.excluded[key]
+                            if key != "updated_at"
+                            else value
+                        )
+                        for key, value in update_values.items()
+                    },
                 )
-                await session.commit()
-                await session.refresh(existing)
-            return existing
-        else:
-            return await DirectoryCRUD.create(
-                session=session,
-                kb_id=kb_id,
-                category_path=category_path,
-                description=description,
-                sort_order=sort_order,
-                icon=icon,
-                color=color,
-                created_by=created_by,
             )
+        elif dialect_name == "postgresql":
+            statement = postgresql_insert(KnowledgeBaseDirectory).values(**values)
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["kb_id", "category_path"],
+                    set_={
+                        key: (
+                            statement.excluded[key]
+                            if key != "updated_at"
+                            else value
+                        )
+                        for key, value in update_values.items()
+                    },
+                )
+            )
+        else:
+            updated = await session.execute(
+                update(KnowledgeBaseDirectory)
+                .where(
+                    KnowledgeBaseDirectory.kb_id == kb_id,
+                    KnowledgeBaseDirectory.category_path == category_path,
+                )
+                .values(**update_values)
+            )
+            if updated.rowcount == 0:
+                try:
+                    async with session.begin_nested():
+                        session.add(KnowledgeBaseDirectory(**values))
+                        await session.flush()
+                except IntegrityError:
+                    await session.execute(
+                        update(KnowledgeBaseDirectory)
+                        .where(
+                            KnowledgeBaseDirectory.kb_id == kb_id,
+                            KnowledgeBaseDirectory.category_path == category_path,
+                        )
+                        .values(**update_values)
+                    )
+        await flush_or_commit(session)
+        result = await DirectoryCRUD.get_by_path(session, kb_id, category_path)
+        if result is None:
+            raise RuntimeError(f"目录 upsert 后无法读取: {kb_id}/{category_path}")
+        return result
 
     @staticmethod
     async def ensure_parent_directories(
@@ -367,7 +436,7 @@ class DirectoryCRUD:
         created = []
         current_path = ""
         
-        for i, part in enumerate(parts[:-1]):
+        for part in parts[:-1]:
             current_path = f"{current_path}/{part}" if current_path else part
             
             existing = await DirectoryCRUD.get_by_path(session, kb_id, current_path)

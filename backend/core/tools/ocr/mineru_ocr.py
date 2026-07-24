@@ -48,7 +48,7 @@ class MinerUOCR(BaseOCR):
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建 HTTP 会话"""
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(trust_env=False)
         return self._session
 
     async def close(self):
@@ -92,12 +92,12 @@ class MinerUOCR(BaseOCR):
         ocr_config = config or self.config
 
         file_path_obj = Path(file_path)
-        if not file_path_obj.exists():
+        if not await asyncio.to_thread(file_path_obj.exists):
             raise FileNotFoundError(f"File not found: {file_path}")
 
         session = await self._get_session()
 
-        file_handle = open(file_path, "rb")
+        file_handle = await asyncio.to_thread(open, file_path, "rb")
 
         data = aiohttp.FormData()
         data.add_field(
@@ -136,7 +136,7 @@ class MinerUOCR(BaseOCR):
                     error = await resp.text()
                     raise Exception(f"Failed to submit task: {error}")
         finally:
-            file_handle.close()
+            await asyncio.to_thread(file_handle.close)
 
     def submit_task(
         self, file_path: str, config: OCRConfig | None = None, **kwargs: Any
@@ -328,6 +328,9 @@ class MinerUOCR(BaseOCR):
                 if elapsed >= timeout:
                     logger.warning(f"Task {task_id} timed out after {timeout} seconds")
                     result.status = OCRStatus.TIMEOUT
+                    result.error_message = (
+                        result.error_message or f"timeout after {timeout} seconds"
+                    )
                     return result
 
             logger.debug(f"Task {task_id} status: {result.status}, waiting...")
@@ -382,11 +385,6 @@ class MinerUOCR(BaseOCR):
             loop.close()
 
     def __del__(self):
-        """析构函数，确保会话关闭"""
+        """Never create or run an event loop during garbage collection."""
         if self._session and not self._session.closed:
-            try:
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(self.close())
-                loop.close()
-            except Exception:
-                pass
+            logger.warning("MinerUOCR session was not closed explicitly")

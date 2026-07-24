@@ -8,11 +8,12 @@ BM25 关键词召回 + TF-IDF 余弦相似度精排，纯 Python 实现，
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 import threading
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from backend.config.loggers import get_logger
@@ -672,24 +673,28 @@ class ChatFileIndexManager:
     """
 
     def __init__(self, max_threads: int = 100):
-        self._indices: OrderedDict[str, ChatFileIndex] = OrderedDict()
+        self._indices: OrderedDict[tuple[str, str], ChatFileIndex] = OrderedDict()
         self._max_threads = max_threads
         self._lock = threading.RLock()
 
     def _evict_if_needed_locked(self) -> None:
         if len(self._indices) >= self._max_threads:
-            evicted_id, _ = self._indices.popitem(last=False)
-            logger.info("[ChatFileIndexManager] LRU 驱逐: thread_id=%s", evicted_id)
+            (evicted_user_id, evicted_thread_id), _ = self._indices.popitem(last=False)
+            logger.info(
+                "[ChatFileIndexManager] LRU 驱逐: user_id=%s thread_id=%s",
+                evicted_user_id,
+                evicted_thread_id,
+            )
 
     def _store_index_locked(
-        self, thread_id: str, index: ChatFileIndex
+        self, user_id: str, thread_id: str, index: ChatFileIndex
     ) -> ChatFileIndex:
         self._evict_if_needed_locked()
-        self._indices[thread_id] = index
+        self._indices[(user_id, thread_id)] = index
         return index
 
     def _load_thread_documents_from_storage(
-        self, thread_id: str
+        self, user_id: str, thread_id: str
     ) -> List[tuple[str, str, str]]:
         session_factory = get_session_factory()
         with session_factory() as session:
@@ -701,6 +706,8 @@ class ChatFileIndexManager:
                 )
                 .join(SessionFile, SessionFile.file_id == UserFile.file_id)
                 .where(SessionFile.session_id == thread_id)
+                .where(SessionFile.user_id == user_id)
+                .where(UserFile.owner_user_id == user_id)
                 .where(UserFile.status == "active")
                 .order_by(SessionFile.created_at.asc(), UserFile.created_at.asc())
             )
@@ -721,8 +728,8 @@ class ChatFileIndexManager:
             documents.append((file_id, display_name, content))
         return documents
 
-    def _hydrate_index(self, thread_id: str) -> Optional[ChatFileIndex]:
-        documents = self._load_thread_documents_from_storage(thread_id)
+    def _hydrate_index(self, user_id: str, thread_id: str) -> Optional[ChatFileIndex]:
+        documents = self._load_thread_documents_from_storage(user_id, thread_id)
         if not documents:
             return None
 
@@ -734,44 +741,56 @@ class ChatFileIndexManager:
                 file_name=file_name,
             )
         logger.info(
-            "[ChatFileIndexManager] 已从存储重建索引: thread_id=%s, files=%d, chunks=%d",
+            "[ChatFileIndexManager] 已从存储重建索引: user_id=%s thread_id=%s, files=%d, chunks=%d",
+            user_id,
             thread_id,
             len(documents),
             index.chunk_count,
         )
         return index
 
-    def get_or_create(self, thread_id: str) -> ChatFileIndex:
+    def get_or_create(self, thread_id: str, *, user_id: str) -> ChatFileIndex:
+        key = (user_id, thread_id)
         with self._lock:
-            if thread_id in self._indices:
-                self._indices.move_to_end(thread_id)
-                return self._indices[thread_id]
+            if key in self._indices:
+                self._indices.move_to_end(key)
+                return self._indices[key]
 
             index = ChatFileIndex(thread_id)
-            return self._store_index_locked(thread_id, index)
+            return self._store_index_locked(user_id, thread_id, index)
 
-    def get(self, thread_id: str) -> Optional[ChatFileIndex]:
+    def get(self, thread_id: str, *, user_id: str) -> Optional[ChatFileIndex]:
+        key = (user_id, thread_id)
         with self._lock:
-            if thread_id in self._indices:
-                self._indices.move_to_end(thread_id)
-                return self._indices[thread_id]
+            if key in self._indices:
+                self._indices.move_to_end(key)
+                return self._indices[key]
 
-        hydrated = self._hydrate_index(thread_id)
+        hydrated = self._hydrate_index(user_id, thread_id)
         if hydrated is None:
             return None
 
         with self._lock:
-            if thread_id in self._indices:
-                self._indices.move_to_end(thread_id)
-                return self._indices[thread_id]
-            return self._store_index_locked(thread_id, hydrated)
+            if key in self._indices:
+                self._indices.move_to_end(key)
+                return self._indices[key]
+            return self._store_index_locked(user_id, thread_id, hydrated)
 
-    def remove(self, thread_id: str) -> None:
+    async def get_async(
+        self,
+        thread_id: str,
+        *,
+        user_id: str,
+    ) -> Optional[ChatFileIndex]:
+        """Hydrate an index without running synchronous DB/CPU work on the loop."""
+        return await asyncio.to_thread(self.get, thread_id, user_id=user_id)
+
+    def remove(self, thread_id: str, *, user_id: str) -> None:
         with self._lock:
-            self._indices.pop(thread_id, None)
+            self._indices.pop((user_id, thread_id), None)
 
-    def has_files(self, thread_id: str) -> bool:
-        idx = self.get(thread_id)
+    def has_files(self, thread_id: str, *, user_id: str) -> bool:
+        idx = self.get(thread_id, user_id=user_id)
         return idx is not None and idx.chunk_count > 0
 
 

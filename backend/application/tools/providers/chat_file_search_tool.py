@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from langchain_core.tools import tool
 
 from backend.config.loggers import get_logger
@@ -15,7 +17,7 @@ from backend.services.chat_file_index import get_index_manager, prepare_search_i
 logger = get_logger(__name__)
 
 
-def create_scoped_chat_file_search_tool(thread_id: str):
+def create_scoped_chat_file_search_tool(thread_id: str, *, user_id: str):
     """为指定会话创建带作用域的文档检索工具
 
     工具绑定到 thread_id 对应的索引，不同会话互不影响。
@@ -23,7 +25,7 @@ def create_scoped_chat_file_search_tool(thread_id: str):
     index_manager = get_index_manager()
 
     @tool("chat_file_search")
-    def chat_file_search(
+    async def chat_file_search(
         query: str,
         keywords: list[str] | None = None,
         top_k: int = 5,
@@ -46,7 +48,7 @@ def create_scoped_chat_file_search_tool(thread_id: str):
             top_k:   返回片段数量，默认 5，最多 10
         """
         top_k = max(1, min(top_k, 10))
-        index = index_manager.get(thread_id)
+        index = await index_manager.get_async(thread_id, user_id=user_id)
 
         if not index or index.chunk_count == 0:
             return "当前对话中没有已上传的文档，或文档尚未建立索引。"
@@ -54,7 +56,12 @@ def create_scoped_chat_file_search_tool(thread_id: str):
         from backend.services.chat_file_parser import clean_document_images
 
         prepared_query, prepared_keywords = prepare_search_inputs(query, keywords or [])
-        results = index.search(prepared_query, top_k=top_k, keywords=prepared_keywords)
+        results = await asyncio.to_thread(
+            index.search,
+            prepared_query,
+            top_k=top_k,
+            keywords=prepared_keywords,
+        )
         if not results:
             return (
                 f"在上传的 {index.file_count} 个文档中未找到相关内容。"
@@ -68,7 +75,8 @@ def create_scoped_chat_file_search_tool(thread_id: str):
 
         # 收集检索结果中涉及的文件图片 URL，注册为 [IMAGE:xxx] token
         from backend.application.agent_executors.image_url_registry import register_image_url
-        from backend.api.routers.chat_files import get_file_meta
+        from backend.application.image_pipeline import replace_image_urls_for_model_context
+        from backend.services.chat_file_metadata import get_file_meta
         registered_file_images: dict[str, list[str]] = {}  # file_id -> [token, ...]
 
         parts: list[str] = []
@@ -81,6 +89,10 @@ def create_scoped_chat_file_search_tool(thread_id: str):
                 label = f"（相关度：{r.score:.2f}）"
             # 清理本地图片引用，避免模型输出无效图片语法
             clean_content = clean_document_images(r.content)
+            clean_content = replace_image_urls_for_model_context(
+                clean_content,
+                register_image=register_image_url,
+            )
 
             # 注册该文件的图片 URL
             fid = getattr(r, 'file_id', '')
@@ -109,8 +121,8 @@ def create_scoped_chat_file_search_tool(thread_id: str):
 
         if is_fallback:
             header = (
-                f"> 未找到精确匹配，已返回文档开头内容（摘要/引言）。"
-                f"如需继续探索，请提供更具体的 keywords（优先使用文档语言的词汇）。\n\n"
+                "> 未找到精确匹配，已返回文档开头内容（摘要/引言）。"
+                "如需继续探索，请提供更具体的 keywords（优先使用文档语言的词汇）。\n\n"
             )
         elif is_kw_match:
             header = (
@@ -126,11 +138,14 @@ def create_scoped_chat_file_search_tool(thread_id: str):
                 + (f"，keywords={prepared_keywords[:8]}" if prepared_keywords else "")
                 + "\n\n"
             )
-        return header + "\n\n---\n\n".join(parts)
+        return replace_image_urls_for_model_context(
+            header + "\n\n---\n\n".join(parts),
+            register_image=register_image_url,
+        )
 
     return chat_file_search
 
 
-def has_thread_file_index(thread_id: str) -> bool:
+def has_thread_file_index(thread_id: str, *, user_id: str) -> bool:
     """检查指定会话是否有已建立索引的长文档"""
-    return get_index_manager().has_files(thread_id)
+    return get_index_manager().has_files(thread_id, user_id=user_id)

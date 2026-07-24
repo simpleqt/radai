@@ -12,17 +12,14 @@ class ScopedStorage:
         self.bucket = get_user_minio_bucket_name()
 
     def read_file(self, filename: str) -> bytes:
-        """读取用户目录下的文件，包含旧版路径的兼容（双读策略）"""
+        """Read an object only from the authenticated user's thread scope."""
         object_name = f"{self.prefix}{filename}"
         try:
             return self._read_object(object_name)
-        except Exception:
-            # Fallback for legacy data
-            legacy_name = f"artifacts/{self.thread_id}/{filename}"
-            try:
-                return self._read_object(legacy_name)
-            except Exception as e:
-                raise FileNotFoundError(f"文件不存在: {filename} ({e})")
+        except Exception as exc:
+            # The historical artifacts/{thread_id}/ namespace has no user
+            # component and therefore cannot be authorized safely.
+            raise FileNotFoundError(f"文件不存在: {filename} ({exc})") from exc
 
     def _read_object(self, object_name: str) -> bytes:
         """内部同步读取方法"""
@@ -59,30 +56,23 @@ class ScopedStorage:
         return [obj.object_name for obj in objects]
 
     def delete_all_files(self):
-        """删除该作用域下的所有文件（包含旧版路径资产）"""
+        """Delete every object in this user's thread scope or raise."""
         from minio.deleteobjects import DeleteObject
         from backend.config.loggers import get_logger
         
         logger = get_logger(__name__)
         
-        # 1. 规范路径前缀与旧版路径前缀
-        prefixes = [self.prefix, f"artifacts/{self.thread_id}/"]
-        
-        for p in prefixes:
-            try:
-                # 列出所有待删除对象
-                objects = self.client.list_objects(self.bucket, prefix=p, recursive=True)
-                delete_list = [DeleteObject(obj.object_name) for obj in objects]
-                
-                if not delete_list:
-                    continue
-                    
-                logger.info(f"[ScopedStorage] 准备清理 MinIO 路径: {p}, 共 {len(delete_list)} 个对象")
-                
-                # 执行批量删除
-                errors = self.client.remove_objects(self.bucket, delete_list)
-                for error in errors:
-                    logger.error(f"[ScopedStorage] 删除对象失败: {error}")
-                    
-            except Exception as e:
-                logger.warning(f"[ScopedStorage] 清理路径 {p} 时发生异常: {e}")
+        objects = self.client.list_objects(self.bucket, prefix=self.prefix, recursive=True)
+        delete_list = [DeleteObject(obj.object_name) for obj in objects]
+        if not delete_list:
+            return
+
+        logger.info(
+            "[ScopedStorage] 准备清理 MinIO 路径: %s, 共 %d 个对象",
+            self.prefix,
+            len(delete_list),
+        )
+        errors = list(self.client.remove_objects(self.bucket, delete_list))
+        if errors:
+            detail = "; ".join(str(error) for error in errors[:3])
+            raise RuntimeError(f"MinIO 删除对象失败: {detail}")

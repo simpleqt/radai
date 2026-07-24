@@ -35,7 +35,7 @@ MULTIMODAL_EXTENSIONS: set[str] = {
 
 PYTHON_PARSEABLE_EXTENSIONS: set[str] = {
     ".txt", ".md", ".csv", ".json", ".py", ".html", ".xml", ".log",
-    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".rst",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".rst", ".kml",
 }
 
 RICH_DOCUMENT_EXTENSIONS: set[str] = {
@@ -120,7 +120,7 @@ class ChatFileParser:
 
         # 纯文本
         if ext in PYTHON_PARSEABLE_EXTENSIONS:
-            content = await self._parse_text_file(file_bytes, ext)
+            content = await self._parse_text_file(file_bytes, ext, filename=filename)
             if content is not None:
                 return self._route_by_length(content, method="direct")
             return ParseResult(
@@ -141,13 +141,17 @@ class ChatFileParser:
     # ── 纯文本解析 ────────────────────────────────────────
 
     async def _parse_text_file(
-        self, data: bytes, ext: str
+        self, data: bytes, ext: str, *, filename: str = ""
     ) -> Optional[str]:
         """读取纯文本内容（在线程池中执行以避免阻塞）"""
-        return await asyncio.to_thread(self._parse_text_sync, data, ext)
+        return await asyncio.to_thread(self._parse_text_sync, data, ext, filename)
 
-    def _parse_text_sync(self, data: bytes, ext: str) -> Optional[str]:
+    def _parse_text_sync(self, data: bytes, ext: str, filename: str = "") -> Optional[str]:
         try:
+            if ext == ".kml":
+                from backend.services.kml_parser import kml_to_analysis_text
+
+                return kml_to_analysis_text(data, source_file=filename)
             if ext == ".csv":
                 text = data.decode("utf-8", errors="replace")
                 reader = csv.reader(io.StringIO(text))
@@ -326,7 +330,6 @@ class ChatFileParser:
         """从 DOCX 中提取嵌入图片"""
         try:
             from docx import Document
-            from docx.opc.constants import RELATIONSHIP_TYPE as RT
             doc = Document(io.BytesIO(data))
             images: list[ExtractedImage] = []
             img_idx = 0
@@ -416,11 +419,15 @@ class ChatFileParser:
         try:
             from backend.core.tools.ocr.mineru_ocr import MinerUOCR
 
-            with tempfile.NamedTemporaryFile(
-                suffix=Path(filename).suffix, delete=False
-            ) as tmp:
-                tmp.write(data)
-                tmp_path = tmp.name
+            def _write_temp_file() -> str:
+                with tempfile.NamedTemporaryFile(
+                    suffix=Path(filename).suffix,
+                    delete=False,
+                ) as tmp:
+                    tmp.write(data)
+                    return tmp.name
+
+            tmp_path = await asyncio.to_thread(_write_temp_file)
 
             ocr = MinerUOCR(api_url=self._mineru_api_url)
             try:
@@ -450,7 +457,8 @@ class ChatFileParser:
                     )
 
                 # 从 MinerU 结果中提取图片
-                images, remote_image_urls = self._extract_mineru_images(
+                images, remote_image_urls = await asyncio.to_thread(
+                    self._extract_mineru_images,
                     detail,
                     content,
                     markdown_url=getattr(detail, "md_url", None),
@@ -474,9 +482,9 @@ class ChatFileParser:
                 error=str(e),
             )
         finally:
-            if tmp_path and os.path.exists(tmp_path):
+            if tmp_path and await asyncio.to_thread(os.path.exists, tmp_path):
                 try:
-                    os.unlink(tmp_path)
+                    await asyncio.to_thread(os.unlink, tmp_path)
                 except Exception:
                     pass
 

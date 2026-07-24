@@ -1,0 +1,114 @@
+schema_id: basic_mechanics
+label: 基础力学
+version: "1.0"
+subject: basic_mechanics
+min_entity_confidence: 60
+min_relation_confidence: 60
+candidate_confidence: 40
+
+entity_types:
+  concept:
+    description: 力学概念、现象或基本定义
+    aliases: [概念, 现象, 定义]
+  law:
+    description: 定律、定理、原理或判据
+    aliases: [定律, 定理, 原理, 判据]
+  formula:
+    description: 公式、方程、数学表达式或推导结果
+    aliases: [公式, 方程, 表达式, 推导结果]
+  physical_quantity:
+    description: 力、质量、位移、速度、加速度、应力等物理量及其取值
+    aliases: [物理量, 参数, 力, 质量, 位移, 速度, 加速度, 应力, 应变, 能量, 功率]
+  unit:
+    description: 物理量使用的单位或量纲
+    aliases: [单位, 量纲]
+  mechanics_system:
+    description: 质点、刚体、杆件、梁、桁架或其他研究对象与力学系统
+    aliases: [研究对象, 力学系统, 质点, 刚体, 杆件, 梁, 桁架, 结构]
+  material:
+    description: 材料及其力学性质
+    aliases: [材料, 材料性质]
+  boundary_condition:
+    description: 载荷、约束、支座、初始条件或边界条件
+    aliases: [边界条件, 初始条件, 载荷, 约束, 支座]
+  method:
+    description: 分析、计算、实验、建模或求解方法
+    aliases: [方法, 分析方法, 计算方法, 实验方法, 求解方法]
+  example:
+    description: 例题、习题、工程案例或应用场景
+    aliases: [例题, 习题, 案例, 应用场景]
+  term:
+    description: 其他力学专业术语
+  term_cn:
+    description: 其他中文力学专业术语
+  model_or_code:
+    description: 模型、编号、符号、缩写或代码
+
+relation_types:
+  defines:
+    description: 定义某个概念或物理量
+    aliases: [定义, 是指]
+    allowed_source_types: [law, concept, formula]
+    allowed_target_types: [concept, physical_quantity, term, term_cn]
+    min_confidence: 70
+  expressed_by:
+    description: 定律、概念或物理量由公式表达
+    aliases: [表达为, 公式为, 数学表达]
+    allowed_source_types: [law, concept, physical_quantity]
+    allowed_target_types: [formula]
+    min_confidence: 65
+  has_quantity:
+    description: 研究对象、材料、条件或案例具有某物理量
+    aliases: [具有物理量, 参数为, 取值为]
+    allowed_source_types: [mechanics_system, material, boundary_condition, example, model_or_code]
+    allowed_target_types: [physical_quantity]
+    min_confidence: 60
+  uses_unit:
+    description: 物理量使用某单位或量纲
+    aliases: [单位为, 量纲为, 使用单位]
+    allowed_source_types: [physical_quantity]
+    allowed_target_types: [unit]
+    min_confidence: 65
+  applies_to:
+    description: 定律、公式或方法适用于某对象、条件或案例
+    aliases: [适用于, 应用于, 用于]
+    allowed_source_types: [law, formula, method]
+    allowed_target_types: [mechanics_system, boundary_condition, example, concept]
+    min_confidence: 65
+  subject_to:
+    description: 力学系统受到载荷、约束或边界条件作用
+    aliases: [受到, 承受, 约束于, 边界条件为]
+    allowed_source_types: [mechanics_system]
+    allowed_target_types: [boundary_condition]
+    min_confidence: 65
+  made_of:
+    description: 力学对象由某种材料构成
+    aliases: [由材料构成, 材料为, 采用材料]
+    allowed_source_types: [mechanics_system]
+    allowed_target_types: [material]
+    min_confidence: 65
+  solves_for:
+    description: 公式或方法用于求解某物理量或问题
+    aliases: [求解, 计算, 得到]
+    allowed_source_types: [formula, method]
+    allowed_target_types: [physical_quantity, concept, example]
+    min_confidence: 65
+  derives:
+    description: 定律、公式或方法推导出另一公式或结论
+    aliases: [推导, 导出, 可得]
+    allowed_source_types: [law, formula, method]
+    allowed_target_types: [formula, law, concept]
+    min_confidence: 70
+  illustrates:
+    description: 例题或案例说明某概念、定律、公式或方法
+    aliases: [说明, 展示, 验证]
+    allowed_source_types: [example]
+    allowed_target_types: [concept, law, formula, method]
+    min_confidence: 65
+  related_to:
+    description: 有明确文本证据的力学知识关联
+    aliases: [相关, 关联]
+    min_confidence: 60
+
+forbidden_relations:
+  causality_without_evidence

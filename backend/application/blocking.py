@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import os
 import queue
 import threading
+from collections.abc import Callable
 from concurrent.futures import Executor, Future
 from functools import partial
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 from weakref import WeakKeyDictionary
 
 T = TypeVar("T")
@@ -22,6 +24,7 @@ _LIMITERS: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
 )
 _EXECUTOR: ApplicationBlockingExecutor | None = None
 _EXECUTOR_LOCK = threading.Lock()
+_LIMITER_RELEASE_TASKS: set[asyncio.Task[Any]] = set()
 
 
 class ApplicationBlockingExecutor(Executor):
@@ -123,15 +126,27 @@ def shutdown_blocking_executor() -> None:
 def _get_limiter(loop: asyncio.AbstractEventLoop) -> asyncio.Semaphore:
     limiter = _LIMITERS.get(loop)
     if limiter is None:
-        limiter = asyncio.Semaphore(8)
+        limiter = asyncio.Semaphore(_MAX_WORKERS)
         _LIMITERS[loop] = limiter
     return limiter
 
 
 async def _await_concurrent_future(future: Future[T]) -> T:
-    while not future.done():
-        await asyncio.sleep(0.005)
-    return future.result()
+    return await asyncio.shield(asyncio.wrap_future(future))
+
+
+async def _release_limiter_when_done(
+    future: Future[Any], limiter: asyncio.Semaphore
+) -> None:
+    """Keep capacity reserved while an already-running timed-out call drains."""
+    try:
+        await asyncio.shield(asyncio.wrap_future(future))
+    except BaseException:
+        # The original caller owns the result. This waiter only releases the
+        # capacity slot after the underlying thread has actually stopped.
+        pass
+    finally:
+        limiter.release()
 
 
 async def run_blocking(
@@ -143,24 +158,49 @@ async def run_blocking(
 ) -> T:
     """Run blocking work in the application pool with cancellation and timeout."""
     loop = asyncio.get_running_loop()
-    async with _get_limiter(loop):
+    context = contextvars.copy_context()
+    timeout = (
+        _DEFAULT_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    )
+    limiter = _get_limiter(loop)
+    started_at = loop.time()
+    if timeout > 0:
+        await asyncio.wait_for(limiter.acquire(), timeout=timeout)
+    else:
+        await limiter.acquire()
+
+    concurrent_future: Future[T] | None = None
+    try:
         concurrent_future = initialize_blocking_executor().submit(
+            context.run,
             func,
             *args,
             **kwargs,
         )
         try:
-            timeout = (
-                _DEFAULT_TIMEOUT_SECONDS
-                if timeout_seconds is None
-                else timeout_seconds
-            )
             if timeout <= 0:
                 return await _await_concurrent_future(concurrent_future)
+            remaining = timeout - (loop.time() - started_at)
+            if remaining <= 0:
+                raise asyncio.TimeoutError  # noqa: UP041 -- Python 3.10 compatibility
             return await asyncio.wait_for(
                 _await_concurrent_future(concurrent_future),
-                timeout=timeout,
+                timeout=remaining,
             )
-        except (asyncio.CancelledError, TimeoutError):
+        except asyncio.TimeoutError as exc:  # noqa: UP041 -- Python 3.10 compatibility
+            concurrent_future.cancel()
+            raise TimeoutError(
+                f"blocking call timed out after {timeout:.3f}s"
+            ) from exc
+        except asyncio.CancelledError:
             concurrent_future.cancel()
             raise
+    finally:
+        if concurrent_future is None or concurrent_future.done():
+            limiter.release()
+        else:
+            task = asyncio.create_task(
+                _release_limiter_when_done(concurrent_future, limiter)
+            )
+            _LIMITER_RELEASE_TASKS.add(task)
+            task.add_done_callback(_LIMITER_RELEASE_TASKS.discard)

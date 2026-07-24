@@ -5,8 +5,10 @@
 使用 LangChain 1.0.3 的标准接口封装模型
 """
 
+import threading
 from typing import Any
 
+import httpx
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 
@@ -14,6 +16,42 @@ from backend.config.loggers import get_logger
 from backend.config.settings import settings
 
 logger = get_logger(__name__)
+
+_shared_http_client: httpx.Client | None = None
+_shared_async_http_client: httpx.AsyncClient | None = None
+_shared_http_clients_lock = threading.Lock()
+
+
+def _get_shared_http_clients() -> tuple[httpx.Client, httpx.AsyncClient]:
+    global _shared_http_client, _shared_async_http_client
+    with _shared_http_clients_lock:
+        if _shared_http_client is None or _shared_http_client.is_closed:
+            _shared_http_client = httpx.Client(trust_env=False)
+        if _shared_async_http_client is None or _shared_async_http_client.is_closed:
+            _shared_async_http_client = httpx.AsyncClient(trust_env=False)
+        return _shared_http_client, _shared_async_http_client
+
+
+async def close_shared_http_clients() -> None:
+    """Close process-owned LLM transports during application shutdown."""
+    global _shared_http_client, _shared_async_http_client
+    with _shared_http_clients_lock:
+        sync_client, async_client = _shared_http_client, _shared_async_http_client
+        _shared_http_client = None
+        _shared_async_http_client = None
+    if async_client is not None and not async_client.is_closed:
+        await async_client.aclose()
+    if sync_client is not None and not sync_client.is_closed:
+        sync_client.close()
+
+
+def _inject_no_proxy_http_clients(model_config: dict[str, Any]) -> dict[str, Any]:
+    sync_client, async_client = _get_shared_http_clients()
+    if "http_client" not in model_config:
+        model_config["http_client"] = sync_client
+    if "http_async_client" not in model_config:
+        model_config["http_async_client"] = async_client
+    return model_config
 
 
 class BaseLLMProvider:
@@ -126,6 +164,7 @@ class BaseLLMProvider:
             model_config["max_tokens"] = max_tokens
 
         model_config.update(kwargs)
+        _inject_no_proxy_http_clients(model_config)
 
         logger.info(f"创建 DeepSeek 模型: {model_name}")
 
@@ -173,6 +212,7 @@ class BaseLLMProvider:
         }
 
         model_config.update(kwargs)
+        _inject_no_proxy_http_clients(model_config)
 
         logger.info(f"创建 MiniMax 模型: {model_name}")
 
@@ -221,6 +261,7 @@ class BaseLLMProvider:
             model_config["max_tokens"] = max_tokens
 
         model_config.update(kwargs)
+        _inject_no_proxy_http_clients(model_config)
 
         logger.info(f"创建 ZhipuAI 模型: {model_name}")
 
@@ -268,6 +309,7 @@ class BaseLLMProvider:
         }
 
         model_config.update(kwargs)
+        _inject_no_proxy_http_clients(model_config)
 
         logger.info(f"创建 GLM-4-Flash 模型: {model_name}")
 
@@ -316,6 +358,7 @@ class BaseLLMProvider:
             model_config["max_tokens"] = max_tokens
 
         model_config.update(kwargs)
+        _inject_no_proxy_http_clients(model_config)
 
         logger.info(f"创建 Qwen 模型: {model_name}")
 
@@ -364,6 +407,7 @@ class BaseLLMProvider:
             model_config["max_tokens"] = max_tokens
 
         model_config.update(kwargs)
+        _inject_no_proxy_http_clients(model_config)
 
         logger.info(f"创建 OpenAI 模型: {model_name}")
 

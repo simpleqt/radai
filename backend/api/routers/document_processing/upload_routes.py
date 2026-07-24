@@ -1,7 +1,6 @@
 """基本上传路由"""
 
-import os
-import tempfile
+import asyncio
 import uuid
 from pathlib import Path
 
@@ -14,6 +13,10 @@ from backend.api.routers.document_processing.models import (
     TaskCreateResponse,
     TaskStatus,
     validate_file_type,
+)
+from backend.api.upload_utils import (
+    UploadTooLargeError,
+    spool_file_with_limit,
 )
 from backend.config.loggers import get_logger
 from backend.db.crud.document_crud import document_crud
@@ -52,20 +55,24 @@ async def upload_document(
 ):
     """上传并处理文档"""
     logger.info(f"接收文档上传: {file.filename}")
+    file_path: str | None = None
 
     try:
         doc_type = validate_file_type(file.filename, file.content_type)
 
-        content = await file.read()
-
-        if len(content) > 100 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="文件大小超过 100MB 限制")
-
-        doc_id, file_path = await storage_manager.save_file(
-            content=content, filename=file.filename, storage_type="documents"
-        )
-
-        task_id = str(uuid.uuid4())
+        try:
+            _storage_id, storage_path = storage_manager.generate_storage_path(
+                file.filename,
+                "documents",
+            )
+            file_path, file_size, file_hash = await asyncio.to_thread(
+                spool_file_with_limit,
+                file.file,
+                100 * 1024 * 1024,
+                target_path=storage_path,
+            )
+        except UploadTooLargeError as exc:
+            raise HTTPException(status_code=413, detail="文件大小超过 100MB 限制") from exc
 
         options = {
             "ocr_enabled": ocr_enabled,
@@ -81,9 +88,10 @@ async def upload_document(
             session=session,
             filename=file.filename,
             document_type=doc_type.value,
-            file_size=len(content),
+            file_size=file_size,
             file_path=file_path,
             user_id=auth.user_id,
+            file_hash=file_hash,
         )
 
         task = await task_crud.create(
@@ -99,7 +107,7 @@ async def upload_document(
                 doc=doc,
                 file_path=file_path,
                 filename=file.filename,
-                file_size=len(content),
+                file_size=file_size,
                 doc_type=doc_type,
                 options=options,
                 user_id=auth.user_id,
@@ -110,9 +118,13 @@ async def upload_document(
             logger.error(f"Failed to send Kafka message for task {task.task_id}: {e}")
             raise HTTPException(
                 status_code=500, detail="文档上传成功，但任务提交到消息队列失败"
-            )
+            ) from e
 
-        logger.info(f"文档上传成功: doc_id={doc_id}, task_id={task_id}")
+        logger.info(
+            "文档上传成功: doc_id=%s, task_id=%s",
+            doc.doc_id,
+            task.task_id,
+        )
 
         return TaskCreateResponse(
             task_id=task.task_id,
@@ -122,10 +134,14 @@ async def upload_document(
         )
 
     except HTTPException:
+        if file_path:
+            await asyncio.to_thread(Path(file_path).unlink, missing_ok=True)
         raise
     except Exception as e:
         logger.exception(f"文档上传失败: {e}")
-        raise HTTPException(status_code=500, detail=f"文档上传失败: {str(e)}")
+        if file_path:
+            await asyncio.to_thread(Path(file_path).unlink, missing_ok=True)
+        raise HTTPException(status_code=500, detail="文档上传失败") from e
 
 
 @router.post("/batch", response_model=BatchTaskResponse)
@@ -144,16 +160,32 @@ async def batch_upload_documents(
     """批量上传文档"""
     logger.info(f"接收批量文档上传: {len(files)} 个文件")
 
+    if not files:
+        raise HTTPException(status_code=400, detail="至少需要上传一个文件")
+    if len(files) > 20:
+        raise HTTPException(status_code=400, detail="单次最多上传 20 个文件")
+
     batch_id = str(uuid.uuid4())
     tasks = []
 
     for file in files:
+        file_path: str | None = None
+        doc = None
         try:
             doc_type = validate_file_type(file.filename, file.content_type)
 
-            content = await file.read()
-
-            if len(content) > 100 * 1024 * 1024:
+            try:
+                _storage_id, storage_path = storage_manager.generate_storage_path(
+                    file.filename,
+                    "documents",
+                )
+                file_path, file_size, _sha256 = await asyncio.to_thread(
+                    spool_file_with_limit,
+                    file.file,
+                    100 * 1024 * 1024,
+                    target_path=storage_path,
+                )
+            except UploadTooLargeError:
                 logger.warning(f"文件 {file.filename} 超过大小限制，跳过")
                 tasks.append(
                     TaskCreateResponse(
@@ -164,16 +196,6 @@ async def batch_upload_documents(
                     )
                 )
                 continue
-
-            doc_id = str(uuid.uuid4())
-
-            file_ext = Path(file.filename).suffix
-            temp_filename = f"{doc_id}{file_ext}"
-            temp_dir = tempfile.gettempdir()
-            file_path = os.path.join(temp_dir, temp_filename)
-
-            with open(file_path, "wb") as f:
-                f.write(content)
 
             options = {
                 "ocr_enabled": ocr_enabled,
@@ -189,9 +211,10 @@ async def batch_upload_documents(
                 session=session,
                 filename=file.filename,
                 document_type=doc_type.value,
-                file_size=len(content),
+                file_size=file_size,
                 file_path=file_path,
                 user_id=auth.user_id,
+                file_hash=_sha256,
             )
 
             task = await task_crud.create(
@@ -208,22 +231,34 @@ async def batch_upload_documents(
                     doc=doc,
                     file_path=file_path,
                     filename=file.filename,
-                    file_size=len(content),
+                    file_size=file_size,
                     doc_type=doc_type,
                     options=options,
                     user_id=auth.user_id,
                     description=f"Batch upload: document {file.filename} uploaded and task created",
                     extra_info={
                         "filename": file.filename,
-                        "file_size": len(content),
+                        "file_size": file_size,
                         "batch_id": task.batch_id or "N/A",
                     },
                 )
                 logger.info(f"Kafka messages sent for batch task: {task.task_id}")
-            except MessageSendException as e:
-                logger.error(
-                    f"Failed to send Kafka message for batch task {task.task_id}: {e}"
+            except MessageSendException:
+                logger.exception(
+                    "Failed to send Kafka message for batch task %s",
+                    task.task_id,
                 )
+                task.status = TaskStatus.FAILED.value
+                task.error = "任务提交到消息队列失败"
+                tasks.append(
+                    TaskCreateResponse(
+                        task_id=task.task_id,
+                        doc_id=doc.doc_id,
+                        status=TaskStatus.FAILED,
+                        message="任务提交到消息队列失败",
+                    )
+                )
+                continue
 
             tasks.append(
                 TaskCreateResponse(
@@ -236,6 +271,8 @@ async def batch_upload_documents(
 
         except HTTPException as e:
             logger.warning(f"文件 {file.filename} 验证失败: {e.detail}")
+            if file_path and doc is None:
+                await asyncio.to_thread(Path(file_path).unlink, missing_ok=True)
             tasks.append(
                 TaskCreateResponse(
                     task_id="", doc_id="", status=TaskStatus.FAILED, message=e.detail
@@ -243,9 +280,11 @@ async def batch_upload_documents(
             )
         except Exception as e:
             logger.exception(f"处理文件 {file.filename} 时出错: {e}")
+            if file_path and doc is None:
+                await asyncio.to_thread(Path(file_path).unlink, missing_ok=True)
             tasks.append(
                 TaskCreateResponse(
-                    task_id="", doc_id="", status=TaskStatus.FAILED, message=str(e)
+                    task_id="", doc_id="", status=TaskStatus.FAILED, message="文件处理失败"
                 )
             )
 
@@ -325,6 +364,14 @@ async def _send_task_to_kafka(
             ),
         ),
     )
-    await event_producer.send_event(event_message)
+    try:
+        await event_producer.send_event(event_message)
+    except MessageSendException:
+        # The processing task has already been accepted.  A telemetry-event
+        # failure must not mark it failed or remove the worker's input file.
+        logger.exception(
+            "Task-created event delivery failed after task submission: %s",
+            task.task_id,
+        )
 
     return True
