@@ -1,0 +1,23 @@
+schema_id: generic
+version: "1.0"
+subject: generic
+min_entity_confidence: 55
+min_relation_confidence: 55
+candidate_confidence: 40
+
+entity_types:
+  term:
+    description: 通用英文/数字术语
+  term_cn:
+    description: 通用中文术语
+  parameter:
+    description: 带数值或单位的参数
+  model_or_code:
+    description: 型号、编号、缩写或代码
+
+relation_types:
+  co_occurs:
+    description: 同一 chunk 中共同出现的弱关联
+    min_confidence: 50
+
+forbidden_relations: []

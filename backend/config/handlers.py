@@ -372,12 +372,12 @@ class KafkaLogHandler(logging.Handler):
         self._running = True
 
         # 重连退避状态
-        import time as _time
         self._reconnect_delay = self._RECONNECT_INIT_DELAY
         self._next_reconnect_at: float = 0.0  # 允许立即初次连接
 
-        self._init_producer()
-
+        # Producer initialization may block on DNS/broker discovery.  Keep it
+        # entirely in the sender thread so importing or starting the API never
+        # waits for Kafka when the broker is unavailable.
         self._thread = threading.Thread(
             target=self._sender_loop,
             name="kafka-log-sender",
@@ -465,7 +465,7 @@ class KafkaLogHandler(logging.Handler):
 
         exc_text: str | None = None
         if record.exc_info:
-            exc_text = self.formatException(record.exc_info)
+            exc_text = logging.Formatter().formatException(record.exc_info)
 
         # 提取业务扩展字段（由 LoggerAdapter.extra 注入）
         _extra_keys = {"task_id", "document_id", "kb_id", "conversation_id"}

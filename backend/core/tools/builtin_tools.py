@@ -27,8 +27,8 @@ def ask_clarification_tool(
     - **Missing information**: Required details not provided
     - **Ambiguous requirements**: Multiple valid interpretations exist
     - **Approach choices**: Several valid approaches exist
-    - **Risky operations**: Destructive actions needing confirmation
-    - **Suggestions**: Recommendation needing user approval
+    - **Business choices**: Missing user preferences that materially change the result
+    - **Suggestions**: Recommendations that require an explicit user choice
 
     Args:
         question: The clarification question to ask the user.

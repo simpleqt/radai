@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from backend.config.loggers import get_logger
@@ -34,7 +35,10 @@ class DocumentProcessingUseCase:
 
         # 从数据库获取已处理的提取结果
         async with async_session_context() as session:
-            extraction_result = await extraction_crud.get_by_doc_id(session, document_id)
+            extraction_result = await asyncio.wait_for(
+                extraction_crud.get_by_doc_id(session, document_id),
+                timeout=30.0,
+            )
 
             if not extraction_result:
                 raise Exception(f"未找到文档处理结果: document_id={document_id}")

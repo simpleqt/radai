@@ -5,8 +5,13 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from typing import Any
 
-from backend.application.agents.prompt_registry import PromptTemplateRegistry
+from backend.application.agents.prompt_registry import (
+    PromptProvider,
+    PromptTemplateRegistry,
+)
+from backend.core.agents.context.project_instructions import load_project_instructions
 from backend.core.skills.scoped_skills_provider import ScopedSkillsProvider
 
 logger = logging.getLogger(__name__)
@@ -24,6 +29,7 @@ class PromptBuildContext:
     lightweight_has_kb: bool = False
     guardrail_instructions: str = ""
     time_context: str = ""
+    request_metadata: dict[str, Any] | None = None
 
 
 class PromptBuilder:
@@ -40,9 +46,15 @@ class PromptBuilder:
         *,
         skills_provider: ScopedSkillsProvider | None = None,
         prompt_registry: PromptTemplateRegistry | None = None,
+        prompt_provider: PromptProvider | None = None,
     ):
         self._skills_provider = skills_provider or ScopedSkillsProvider()
-        self._prompt_registry = prompt_registry or PromptTemplateRegistry()
+        self._prompt_registry = (
+            prompt_registry
+            if prompt_registry is not None
+            else (None if prompt_provider is not None else PromptTemplateRegistry())
+        )
+        self._prompt_provider = prompt_provider
 
     def build(self, context: PromptBuildContext) -> str:
         base_prompt = self._build_base_prompt(context)
@@ -74,8 +86,41 @@ class PromptBuilder:
         return prompt
 
     @staticmethod
+    def build_runtime_context(context: PromptBuildContext) -> str:
+        chunks = [context.time_context, context.guardrail_instructions]
+        metadata = context.request_metadata or {}
+        project_cwd = metadata.get("cwd")
+        if project_cwd:
+            try:
+                project_instructions = load_project_instructions(project_cwd)
+            except Exception:
+                logger.exception("[PromptBuilder] 项目 AGENTS.md 加载失败")
+                project_instructions = None
+            if project_instructions is not None and project_instructions.content:
+                chunks.append("\n" + project_instructions.content)
+        raw_file_ids = metadata.get("file_ids")
+        if isinstance(raw_file_ids, (list, tuple, set)):
+            file_ids = [
+                str(item).strip() for item in raw_file_ids if str(item or "").strip()
+            ]
+        else:
+            value = str(raw_file_ids or "").strip()
+            file_ids = [value] if value else []
+        if file_ids:
+            lines = [
+                "\n<uploaded_table_files>",
+                "The current request includes uploaded file_id values. For Excel/CSV/table analysis tools, pass file_id exactly; do not invent dataset_code or file_path.",
+            ]
+            lines.extend(f"- file_id: {file_id}" for file_id in file_ids[:10])
+            lines.append("</uploaded_table_files>\n")
+            chunks.append("\n".join(lines))
+        return "".join(chunks)
+
+    @staticmethod
     def _build_runtime_context(context: PromptBuildContext) -> str:
-        return f"{context.time_context}{context.guardrail_instructions}"
+        """Backward-compatible private alias used by older extensions/tests."""
+
+        return PromptBuilder.build_runtime_context(context)
 
     def _build_base_prompt(self, context: PromptBuildContext) -> str:
         build_system_prompt = self._resolve_prompt_builder(
@@ -91,8 +136,18 @@ class PromptBuilder:
             lightweight_has_kb=context.lightweight_has_kb,
         )
 
-    def _resolve_prompt_builder(self, prompt_profile: str | None, *, fallback_key: str | None = None):
-        return self._prompt_registry.resolve_provider(prompt_profile, fallback_key=fallback_key)
+    def _resolve_prompt_builder(
+        self, prompt_profile: str | None, *, fallback_key: str | None = None
+    ):
+        if self._prompt_provider is not None:
+            return self._prompt_provider
+        if self._prompt_registry is None:
+            raise ValueError("Prompt registry is unavailable")
+        # A declared prompt profile is authoritative. Falling back to the
+        # domain after a typo would silently run a different agent persona.
+        if str(prompt_profile or "").strip():
+            return self._prompt_registry.resolve_provider(prompt_profile)
+        return self._prompt_registry.resolve_provider(None, fallback_key=fallback_key)
 
     def _get_selected_skill_defs(self, selected_skills: set[str] | None) -> list[Any]:
         if not selected_skills:
@@ -127,24 +182,14 @@ class PromptBuilder:
         selected = context.selected_skills or set()
         chunks: list[str] = []
 
-        if "nuclear-electronics" in selected:
+        domain_skill = str(context.domain or "").strip()
+        if domain_skill and domain_skill in selected:
             chunks.append(
-                """
+                f"""
 
 <skill_enforcement>
-- For nuclear-electronics related questions, you MUST call read_local_skill_file("nuclear-electronics") before any multi_kb_search call and before drafting the final answer.
-- If not loaded yet, do not continue with retrieval/answer drafting.
-</skill_enforcement>
-"""
-            )
-
-        if "csh-hydrogeology" in selected:
-            chunks.append(
-                """
-
-<skill_enforcement>
-- For contaminated-site hydrogeology, groundwater, soil pollution, contaminant transport, risk assessment, or remediation questions, you MUST call read_local_skill_file("csh-hydrogeology") before any multi_kb_search call and before drafting the final answer.
-- If not loaded yet, do not continue with retrieval/answer drafting.
+- You MUST call read_local_skill_file("{domain_skill}") before any multi_kb_search call and before drafting the final answer for this domain.
+- If the domain skill is not loaded yet, do not continue with retrieval/answer drafting.
 </skill_enforcement>
 """
             )

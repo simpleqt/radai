@@ -1,8 +1,12 @@
 """模型配置缓存与热更新逻辑"""
 
+import asyncio
 import json
 import logging
+import os
 from typing import Dict, Optional
+
+from backend.db.redis import get_redis
 
 logger = logging.getLogger(__name__)
 
@@ -38,17 +42,10 @@ def invalidate_cache(name: str | None = None, usage_scope: str = "chat"):
         _DB_CACHE.clear()
     _DB_CACHE_TS = 0
 
-def _redis_url() -> str:
-    from backend.config.settings import settings as s
-    if getattr(s, 'redis_password', None):
-        return f"redis://:{s.redis_password}@{s.redis_host}:{s.redis_port}/{s.redis_db}"
-    return f"redis://{s.redis_host}:{s.redis_port}/{s.redis_db}"
-
 async def notify_model_change(name: str | None = None, usage_scope: str = "chat"):
     """通过 Redis 通知其他 Worker 更新缓存"""
     try:
-        import redis.asyncio as aioredis
-        r = aioredis.from_url(_redis_url(), decode_responses=True)
+        r = get_redis()
         try:
             await r.publish(
                 "model_config_changed",
@@ -59,18 +56,46 @@ async def notify_model_change(name: str | None = None, usage_scope: str = "chat"
     except Exception as e:
         logger.error(f"通知模型配置变更失败: {e}")
 
-async def subscribe_model_changes():
-    """订阅模型变更消息（需在 app lifespan 中启动）"""
+async def _subscribe_model_changes_once() -> None:
+    """Open one Redis subscription and listen until it disconnects."""
+    r = get_redis()
+    pubsub = r.pubsub()
     try:
-        import redis.asyncio as aioredis
-        r = aioredis.from_url(_redis_url(), decode_responses=True)
-        pubsub = r.pubsub()
         await pubsub.subscribe("model_config_changed")
         logger.info("已订阅模型配置变更事件 'model_config_changed'")
         async for message in pubsub.listen():
             if message["type"] == "message":
-                data = json.loads(message["data"])
+                try:
+                    data = json.loads(message["data"])
+                except (TypeError, ValueError):
+                    logger.warning("忽略格式无效的模型变更事件")
+                    continue
                 invalidate_cache(data.get("name"), data.get("usage_scope", "chat"))
                 logger.info(f"收到模型变更事件，已清理缓存: {data}")
-    except Exception as e:
-        logger.error(f"订阅模型配置变更失败: {e}")
+    finally:
+        await pubsub.aclose()
+        await r.aclose()
+
+
+async def subscribe_model_changes():
+    """Keep the Redis invalidation subscriber alive across transient failures."""
+    initial_delay = max(
+        0.1,
+        float(os.getenv("MODEL_CACHE_RECONNECT_INITIAL_SECONDS", "1") or "1"),
+    )
+    max_delay = max(
+        initial_delay,
+        float(os.getenv("MODEL_CACHE_RECONNECT_MAX_SECONDS", "30") or "30"),
+    )
+    delay = initial_delay
+    while True:
+        try:
+            await _subscribe_model_changes_once()
+            delay = initial_delay
+            logger.warning("模型配置变更订阅已结束，准备重新连接")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("模型配置变更订阅中断，%.1fs 后重试: %s", delay, exc)
+        await asyncio.sleep(delay)
+        delay = min(max_delay, delay * 2)

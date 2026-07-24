@@ -14,17 +14,19 @@ from backend.rag.keywords.models import IndexBuildResult, QueryType
 from datetime import date
 import inspect
 import os
-from types import SimpleNamespace
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config.loggers import get_logger
 from backend.config.settings import settings
 from backend.db.crud.knowledge_base_crud import KnowledgeBaseCRUD, KnowledgeBaseDocumentCRUD
-from backend.db.models import KnowledgeBase, KnowledgeBaseDocument, KnowledgeBaseStatus
+from backend.db.models import KnowledgeBase, KnowledgeBaseDocument, KnowledgeBaseStatus, SelfIngestChunk
+from backend.rag.ingestion import states as ingestion_states
 from backend.rag.keywords.index_manager import KeywordIndexManager, get_keyword_index_manager
 from backend.rag.keywords.extractor import PerKBKeywordExtractor
 from backend.rag.keywords.bm25_index import BM25Index
@@ -37,22 +39,6 @@ from backend.rag.content_filter import (
 )
 
 logger = get_logger(__name__)
-
-_KNOWN_SUBAGENT_KB_CODES: Dict[str, str] = {
-    # 通过环境变量或数据库配置加载，不再硬编码 UUID
-    **dict(
-        item.split("=", 1)
-        for item in os.getenv("SUBAGENT_KB_CODE_MAP", "").split(",")
-        if "=" in item
-    ),
-}
-_KNOWN_SUBAGENT_NEBULA_SPACES: Dict[str, str] = {
-    **dict(
-        item.split("=", 1)
-        for item in os.getenv("SUBAGENT_NEBULA_SPACE_MAP", "").split(",")
-        if "=" in item
-    ),
-}
 
 _kb_manager_local = threading.local()
 
@@ -122,6 +108,23 @@ class KnowledgeBaseManager:
         self._content_filter_manager: ContentFilterManager = get_content_filter_manager()
         self._keyword_extractors: Dict[str, PerKBKeywordExtractor] = {}
         self._building_kb_ids: set = set()
+        self._building_kb_ids_lock = threading.Lock()
+        self._keyword_build_tasks: set[asyncio.Task[None]] = set()
+
+    def _is_keyword_index_building(self, kb_id: str) -> bool:
+        with self._building_kb_ids_lock:
+            return kb_id in self._building_kb_ids
+
+    def _try_mark_keyword_index_building(self, kb_id: str) -> bool:
+        with self._building_kb_ids_lock:
+            if kb_id in self._building_kb_ids:
+                return False
+            self._building_kb_ids.add(kb_id)
+            return True
+
+    def _clear_keyword_index_building(self, kb_id: str) -> None:
+        with self._building_kb_ids_lock:
+            self._building_kb_ids.discard(kb_id)
     
     async def create_knowledge_base(
         self,
@@ -132,6 +135,10 @@ class KnowledgeBaseManager:
         description: Optional[str] = None,
         owner_id: Optional[str] = None,
         is_default: bool = False,
+        ingestion_backend: str = "legacy_lightrag",
+        retrieval_backend: str = "legacy_lightrag",
+        self_ingestion_enabled: bool = False,
+        self_retriever_enabled: bool = False,
     ) -> KnowledgeBase:
         """
         创建知识库
@@ -150,6 +157,10 @@ class KnowledgeBaseManager:
             description: 描述
             owner_id: 所有者 ID
             is_default: 是否为默认知识库
+            ingestion_backend: 入库后端
+            retrieval_backend: 查询后端
+            self_ingestion_enabled: 是否允许自研入库
+            self_retriever_enabled: 是否允许自研查询
             
         Returns:
             创建的知识库对象
@@ -173,6 +184,10 @@ class KnowledgeBaseManager:
                 description=description,
                 owner_id=owner_id,
                 is_default=is_default,
+                ingestion_backend=ingestion_backend,
+                retrieval_backend=retrieval_backend,
+                self_ingestion_enabled=self_ingestion_enabled,
+                self_retriever_enabled=self_retriever_enabled,
             )
             
             try:
@@ -196,6 +211,7 @@ class KnowledgeBaseManager:
             kb: 知识库对象
         """
         from backend.rag.storages import NebulaGraphStorage
+        from backend.rag.ingestion.storage.nebula_writer import NebulaGraphV2Writer
         
         graph_workspace = self._resolve_graph_workspace(kb)
         nebula_storage = NebulaGraphStorage(
@@ -209,6 +225,11 @@ class KnowledgeBaseManager:
             logger.warning(f"NebulaGraph Space 创建警告: {e}")
         finally:
             await nebula_storage.finalize()
+
+        try:
+            await NebulaGraphV2Writer(graph_workspace).ensure_schema()
+        except Exception as e:
+            logger.warning(f"NebulaGraph v2 Schema 创建警告: {e}")
         
         logger.info(f"存储资源初始化完成: {kb.kb_code}")
     
@@ -303,30 +324,31 @@ class KnowledgeBaseManager:
     
     async def _clear_redis_data(self, kb_code: str) -> None:
         """清理 Redis 数据"""
+        client = None
         try:
-            import redis
             if not settings.redis_host:
                 return
+            from backend.db.redis import get_redis
 
-            redis_url = f"redis://:{settings.redis_password}@{settings.redis_host}:{settings.redis_port}/{settings.redis_db}"
-
-            def _clear_sync() -> int:
-                client = redis.from_url(redis_url)
-                patterns = [f"{kb_code}:*", f"{kb_code}_*"]
-                deleted = 0
-                for pattern in patterns:
-                    keys = client.keys(pattern)
-                    if keys:
-                        client.delete(*keys)
-                        deleted += len(keys)
-                return deleted
-
-            total_deleted = await asyncio.to_thread(_clear_sync)
+            client = get_redis()
+            total_deleted = 0
+            for pattern in (f"{kb_code}:*", f"{kb_code}_*"):
+                batch: list[str] = []
+                async for key in client.scan_iter(match=pattern, count=500):
+                    batch.append(key)
+                    if len(batch) >= 500:
+                        total_deleted += int(await client.delete(*batch))
+                        batch.clear()
+                if batch:
+                    total_deleted += int(await client.delete(*batch))
 
             if total_deleted > 0:
                 logger.info(f"Redis 数据清理完成: {kb_code}, 删除 {total_deleted} 个键")
         except Exception as e:
             logger.warning(f"Redis 数据清理失败: {e}")
+        finally:
+            if client is not None:
+                await client.aclose()
     
     async def _drop_milvus_collections(self, kb_code: str) -> None:
         """删除 Milvus Collection"""
@@ -339,15 +361,23 @@ class KnowledgeBaseManager:
 
             def _drop_sync() -> list[str]:
                 dropped: list[str] = []
-                connections.connect(uri=milvus_uri)
+                alias = f"kb_cleanup_{uuid.uuid4().hex}"
+                connections.connect(alias=alias, uri=milvus_uri)
                 try:
-                    for suffix in ["entities", "relationships", "chunks"]:
-                        collection_name = f"{kb_code}_{suffix}"
-                        if utility.has_collection(collection_name):
-                            utility.drop_collection(collection_name)
+                    collection_names = [
+                        f"{kb_code}_entities",
+                        f"{kb_code}_relationships",
+                        f"{kb_code}_chunks",
+                        f"{kb_code}_entities_v2",
+                        f"{kb_code}_chunks_v2",
+                        f"{kb_code}_media_vectors_v2",
+                    ]
+                    for collection_name in collection_names:
+                        if utility.has_collection(collection_name, using=alias):
+                            utility.drop_collection(collection_name, using=alias)
                             dropped.append(collection_name)
                 finally:
-                    connections.disconnect("default")
+                    connections.disconnect(alias)
                 return dropped
 
             dropped_collections = await asyncio.to_thread(_drop_sync)
@@ -388,6 +418,7 @@ class KnowledgeBaseManager:
         session: AsyncSession,
         status: Optional[KnowledgeBaseStatus] = None,
         owner_id: Optional[str] = None,
+        query: Optional[str] = None,
         skip: int = 0,
         limit: int = 20,
     ) -> Tuple[List[KnowledgeBase], int]:
@@ -397,6 +428,7 @@ class KnowledgeBaseManager:
             session=session,
             status=status,
             owner_id=owner_id,
+            query=query,
             skip=skip,
             limit=limit,
         )
@@ -423,6 +455,7 @@ class KnowledgeBaseManager:
             ValueError: 知识库不存在或未激活
         """
         init_task: asyncio.Task[tuple[KnowledgeBase, Any]] | None = None
+        created_init_task = False
         # 使用 kb_id 作为唯一缓存键，让不同线程共享同一个 RAG 实例
         # RAG 实例的查询操作是线程安全的，不需要按线程隔离
         init_task_key = kb_id
@@ -433,15 +466,32 @@ class KnowledgeBaseManager:
                 return instance.rag
 
             init_task = self._rag_init_tasks.get(init_task_key)
+            # ``asyncio.CancelledError`` is a BaseException on supported
+            # Python versions, so the generic ``except Exception`` cleanup
+            # below does not see it.  Never let a cancelled initialization
+            # task poison this KB's cache permanently.
+            if init_task is not None and init_task.done() and init_task.cancelled():
+                self._rag_init_tasks.pop(init_task_key, None)
+                init_task = None
             if init_task is None:
                 init_task = asyncio.create_task(self._build_rag_instance(session, kb_id))
                 self._rag_init_tasks[init_task_key] = init_task
+                created_init_task = True
 
         try:
-            kb, rag = await init_task
-        except Exception:
+            # A secondary waiter must not cancel initialization owned by the
+            # first caller.  The owner still awaits directly so cancellation
+            # also stops work that relies on its database session.
+            if created_init_task:
+                kb, rag = await init_task
+            else:
+                kb, rag = await asyncio.shield(init_task)
+        except BaseException:
             async with self._lock:
-                if self._rag_init_tasks.get(init_task_key) is init_task:
+                if (
+                    init_task.done()
+                    and self._rag_init_tasks.get(init_task_key) is init_task
+                ):
                     self._rag_init_tasks.pop(init_task_key, None)
             raise
 
@@ -472,22 +522,6 @@ class KnowledgeBaseManager:
         session: AsyncSession,
         kb_id: str,
     ) -> tuple[KnowledgeBase, Any]:
-        current_thread_name = threading.current_thread().name
-        if current_thread_name.startswith("subagent-exec-") and kb_id in _KNOWN_SUBAGENT_KB_CODES:
-            # Subagent worker threads may run on event loops different from API startup.
-            # Avoid async DB access here to prevent cross-loop aiomysql/session issues.
-            kb = SimpleNamespace(
-                kb_id=kb_id,
-                kb_code=_KNOWN_SUBAGENT_KB_CODES[kb_id],
-                nebula_space=_KNOWN_SUBAGENT_NEBULA_SPACES.get(
-                    kb_id,
-                    _KNOWN_SUBAGENT_KB_CODES[kb_id],
-                ),
-                status=KnowledgeBaseStatus.ACTIVE,
-            )
-            rag = await self._create_rag_instance(kb)
-            return kb, rag
-
         kb = await self.get_knowledge_base(session, kb_id)
         if not kb:
             raise ValueError(f"知识库不存在: {kb_id}")
@@ -657,7 +691,7 @@ class KnowledgeBaseManager:
         import numpy as np
         
         async def embed(texts: list[str]) -> np.ndarray:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(trust_env=False, timeout=60.0) as client:
                 response = await client.post(
                     f"{api_base}/embeddings",
                     headers={"Authorization": f"Bearer {api_key}"},
@@ -711,7 +745,7 @@ class KnowledgeBaseManager:
 
             for attempt in range(max_retries):
                 try:
-                    async with httpx.AsyncClient(timeout=timeout) as client:
+                    async with httpx.AsyncClient(trust_env=False, timeout=timeout) as client:
                         response = await client.post(
                             f"{api_base}/chat/completions",
                             headers={"Authorization": f"Bearer {api_key}"},
@@ -830,7 +864,22 @@ class KnowledgeBaseManager:
         
         total_entities = sum(d.entity_count for d in docs)
         total_relations = sum(d.relation_count for d in docs)
-        total_chunks = sum(d.chunk_count for d in docs)
+        self_chunk_count = (
+            await session.execute(
+                select(func.count(SelfIngestChunk.id)).where(
+                    SelfIngestChunk.kb_id == kb_id,
+                    SelfIngestChunk.is_active == True,
+                    SelfIngestChunk.is_visible == True,
+                    SelfIngestChunk.doc_status == ingestion_states.DOC_VISIBLE,
+                )
+            )
+        ).scalar() or 0
+        legacy_chunk_count = sum(
+            d.chunk_count
+            for d in docs
+            if (getattr(d, "ingestion_backend", None) or "legacy_lightrag") == "legacy_lightrag"
+        )
+        total_chunks = int(legacy_chunk_count or 0) + int(self_chunk_count or 0)
         
         kb = await crud.update_stats(
             session=session,
@@ -993,18 +1042,18 @@ class KnowledgeBaseManager:
                 logger.info(f"[关键词索引] 索引未初始化: {kb.kb_code}")
                 need_build = True
             elif embedding_func and not await index.has_vector_index_async():
-                if kb_id in self._building_kb_ids:
+                if self._is_keyword_index_building(kb_id):
                     logger.info(f"[关键词索引] 索引正在构建中，跳过: {kb.kb_code}")
                 else:
                     logger.info(f"[关键词索引] 向量索引不存在，异步后台构建: {kb.kb_code}")
-                    asyncio.create_task(self._build_keyword_index_async(kb_id, embedding_func))
+                    self._schedule_keyword_index_build(kb_id, embedding_func)
 
             if need_build:
-                if kb_id in self._building_kb_ids:
+                if self._is_keyword_index_building(kb_id):
                     logger.info(f"[关键词索引] 索引正在构建中，返回临时提取器: {kb.kb_code}")
                 else:
                     logger.info(f"[关键词索引] 索引未初始化，异步后台构建: {kb.kb_code}")
-                    asyncio.create_task(self._build_keyword_index_async(kb_id, embedding_func))
+                    self._schedule_keyword_index_build(kb_id, embedding_func)
 
             extractor = PerKBKeywordExtractor(
                 kb_code=kb.kb_code,
@@ -1140,6 +1189,10 @@ class KnowledgeBaseManager:
         
         entity_queue = asyncio.Queue(maxsize=100)
         all_entities = []
+        max_cached_entities = max(
+            1,
+            int(os.getenv("KEYWORD_INDEX_MAX_CACHED_ENTITIES", "100000") or "100000"),
+        )
         inserted_count = 0
         total_count = 0
         stop_signal = object()
@@ -1157,7 +1210,13 @@ class KnowledgeBaseManager:
         async def fetch_producer():
             nonlocal total_count
             try:
-                if kb.nebula_space:
+                entities = await self._fetch_entities_from_self_ingestion_milvus_v2(kb)
+                if entities:
+                    for entity in entities:
+                        await entity_queue.put(entity)
+                    total_count = len(entities)
+                    await entity_queue.put(stop_signal)
+                elif kb.nebula_space:
                     await self._fetch_entities_streaming(kb, entity_queue, stop_signal)
                 else:
                     entities = await self._fetch_entities_from_milvus(kb)
@@ -1171,7 +1230,7 @@ class KnowledgeBaseManager:
         
         async def embed_consumer():
             
-            index._connect_milvus()
+            await asyncio.to_thread(index._connect_milvus)
             get_keyword_collection_name(kb.kb_code)
             
             collection = await index._create_milvus_collection()
@@ -1190,7 +1249,7 @@ class KnowledgeBaseManager:
                         if inserted_count == 0 and len(entity_names) > 0:
                             logger.info(f"[流水线] 首批实体名称样本: {entity_names[:3]}")
                         
-                        async with httpx.AsyncClient(timeout=120.0) as client:
+                        async with httpx.AsyncClient(trust_env=False, timeout=120.0) as client:
                             if embedding_api_base and embedding_api_key:
                                 response = await client.post(
                                     f"{embedding_api_base}/embeddings",
@@ -1227,7 +1286,8 @@ class KnowledgeBaseManager:
                         pending_tasks.append(task)
                     break
                 
-                all_entities.append(item)
+                if len(all_entities) < max_cached_entities:
+                    all_entities.append(item)
                 batch_entities.append(item)
                 
                 if len(batch_entities) >= batch_size:
@@ -1308,11 +1368,11 @@ class KnowledgeBaseManager:
                 pool = ConnectionPool()
                 host = os.getenv("NEBULA_HOST", "")
                 port = int(os.getenv("NEBULA_PORT", "9669"))
-                user = os.getenv("NEBULA_USER", "")
+                user = os.getenv("NEBULA_USER", "root")
                 password = os.getenv("NEBULA_PASSWORD", "")
-                
+
                 pool.init([(host, port)], config)
-                
+
                 session = pool.get_session(user, password)
                 try:
                     result = session.execute(f"USE `{kb.nebula_space}`")
@@ -1387,73 +1447,76 @@ class KnowledgeBaseManager:
         
         await queue.put(stop_signal)
     
+    def _schedule_keyword_index_build(
+        self,
+        kb_id: str,
+        embedding_func: Optional[Callable] = None,
+    ) -> None:
+        """Schedule one tracked build task per knowledge base."""
+        if not self._try_mark_keyword_index_building(kb_id):
+            logger.info(f"[关键词索引] 已在构建中，跳过: kb_id={kb_id}")
+            return
+
+        logger.info(f"[关键词索引] 开始后台构建: kb_id={kb_id}")
+        try:
+            task = asyncio.create_task(
+                self._build_keyword_index_async(kb_id, embedding_func),
+                name=f"build-keyword-index-{kb_id}",
+            )
+        except BaseException:
+            self._clear_keyword_index_building(kb_id)
+            raise
+        self._keyword_build_tasks.add(task)
+        task.add_done_callback(self._on_keyword_build_done)
+
+    def _on_keyword_build_done(self, task: asyncio.Task[None]) -> None:
+        """Retrieve task failures so background exceptions are never lost."""
+        self._keyword_build_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.exception("[关键词索引] 后台构建任务失败: task=%s", task.get_name())
+
     async def _build_keyword_index_async(
         self,
         kb_id: str,
         embedding_func: Optional[Callable] = None,
     ) -> None:
-        """
-        异步后台构建关键词索引（不阻塞主请求）
-        
-        使用独立线程运行，避免阻塞事件循环
-        """
-        import threading
-        
-        if kb_id in self._building_kb_ids:
-            logger.info(f"[关键词索引] 已在构建中，跳过: kb_id={kb_id}")
-            return
-        
-        self._building_kb_ids.add(kb_id)
-        
-        def run_in_thread():
-            try:
-                new_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(new_loop)
-                try:
-                    new_loop.run_until_complete(self._build_keyword_index_task(kb_id, embedding_func))
-                    logger.info(f"[关键词索引] 后台构建完成: kb_id={kb_id}")
-                    if kb_id in self._keyword_extractors:
-                        del self._keyword_extractors[kb_id]
-                        logger.info(f"[关键词索引] 已清除提取器缓存，下次查询将使用新索引: kb_id={kb_id}")
-                finally:
-                    new_loop.run_until_complete(new_loop.shutdown_asyncgens())
-                    new_loop.close()
-            except Exception as e:
-                logger.error(f"[关键词索引] 后台构建线程失败: kb_id={kb_id}, error={e}")
-            finally:
-                self._building_kb_ids.discard(kb_id)
-        
-        logger.info(f"[关键词索引] 开始后台构建: kb_id={kb_id}")
-        
-        thread = threading.Thread(target=run_in_thread, daemon=True)
-        thread.start()
-    
+        try:
+            await self._build_keyword_index_task(kb_id, embedding_func)
+            logger.info(f"[关键词索引] 后台构建完成: kb_id={kb_id}")
+            if kb_id in self._keyword_extractors:
+                del self._keyword_extractors[kb_id]
+                logger.info(
+                    "[关键词索引] 已清除提取器缓存，下次查询将使用新索引: kb_id=%s",
+                    kb_id,
+                )
+        finally:
+            self._clear_keyword_index_building(kb_id)
+
     async def _build_keyword_index_task(
         self,
         kb_id: str,
         embedding_func: Optional[Callable] = None,
     ) -> None:
-        """后台构建任务（使用独立数据库连接）"""
-        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-        from backend.config.settings import settings
-        
-        engine = create_async_engine(
-            settings.async_mysql_url,
-            pool_size=5,
-            pool_pre_ping=True,
-            echo=False,
-        )
-        async_session_factory = async_sessionmaker(
-            bind=engine,
-            class_=AsyncSession,
-            expire_on_commit=False,
-        )
-        
-        try:
-            async with async_session_factory() as session:
-                await self.build_keyword_index(session, kb_id, embedding_func)
-        finally:
-            await engine.dispose()
+        """Build through the application pool so shutdown can cancel cleanly."""
+        from backend.db.connection import async_session_context
+
+        async with async_session_context() as session:
+            await self.build_keyword_index(session, kb_id, embedding_func)
+
+    async def shutdown(self) -> None:
+        """Cancel and join all manager-owned background index builds."""
+        tasks = tuple(self._keyword_build_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._keyword_build_tasks.clear()
+        with self._building_kb_ids_lock:
+            self._building_kb_ids.clear()
     
     async def _fetch_entities_from_kb(self, kb: KnowledgeBase) -> List[Any]:
         """从知识库存储中获取实体数据"""
@@ -1461,6 +1524,10 @@ class KnowledgeBaseManager:
         entities = []
         
         try:
+            entities = await self._fetch_entities_from_self_ingestion_milvus_v2(kb)
+            if entities:
+                return entities
+
             if kb.nebula_space:
                 entities = await self._fetch_entities_from_nebula(kb)
             else:
@@ -1469,9 +1536,120 @@ class KnowledgeBaseManager:
             logger.warning(f"获取实体失败: {kb.kb_code}, {e}")
         
         return entities
+
+    async def _fetch_entities_from_self_ingestion_milvus_v2(self, kb: KnowledgeBase) -> List[Any]:
+        """从 self-ingestion v2 Milvus 实体库获取关键词实体。"""
+        from backend.rag.keywords.models import EntityData
+        from backend.rag.keywords.per_kb_index import get_self_ingestion_entity_collection_name
+
+        entities = []
+
+        try:
+            from pymilvus import Collection, connections, utility
+
+            milvus_uri = settings.milvus_connection_uri or settings.milvus_uri
+            if not milvus_uri:
+                return entities
+
+            conn_alias = f"kb_entity_v2_{kb.kb_code}"
+            if not connections.has_connection(conn_alias):
+                connect_kwargs = {
+                    "alias": conn_alias,
+                    "uri": milvus_uri,
+                }
+                db_name = settings.milvus_connection_db_name or getattr(settings, "milvus_db_name", "")
+                if db_name:
+                    connect_kwargs["db_name"] = db_name
+                if settings.milvus_user:
+                    connect_kwargs["user"] = settings.milvus_user
+                if settings.milvus_password:
+                    connect_kwargs["password"] = settings.milvus_password
+                connections.connect(**connect_kwargs)
+
+            collection_name = get_self_ingestion_entity_collection_name(kb.kb_code)
+            if not utility.has_collection(collection_name, using=conn_alias):
+                return entities
+
+            collection = Collection(collection_name, using=conn_alias)
+            collection.load()
+
+            existing_fields = {field.name for field in collection.schema.fields}
+            output_fields = [
+                field
+                for field in (
+                    "entity_name",
+                    "entity_type",
+                    "description",
+                    "source_id",
+                    "file_path",
+                    "doc_ids",
+                    "chunk_ids",
+                )
+                if field in existing_fields
+            ]
+            if "entity_name" not in output_fields:
+                logger.warning(
+                    "self-ingestion v2 Milvus collection 缺少 entity_name 字段: %s",
+                    collection_name,
+                )
+                return entities
+
+            expr_parts = []
+            if "kb_id" in existing_fields and kb.kb_id:
+                expr_parts.append(f'kb_id == "{kb.kb_id}"')
+            if "is_visible" in existing_fields:
+                expr_parts.append("is_visible == true")
+            if "status" in existing_fields:
+                expr_parts.append('status != "deleted"')
+            expr = " && ".join(expr_parts)
+
+            iterator = collection.query_iterator(
+                expr=expr,
+                output_fields=output_fields,
+                batch_size=10000,
+            )
+
+            seen_names = set()
+            try:
+                while True:
+                    results = iterator.next()
+                    if not results:
+                        break
+
+                    for item in results:
+                        entity_name = item.get("entity_name", "")
+                        if not entity_name or entity_name in seen_names:
+                            continue
+                        seen_names.add(entity_name)
+                        entities.append(
+                            EntityData(
+                                entity_name=entity_name,
+                                entity_type=item.get("entity_type", "term") or "term",
+                                description=(item.get("description", "") or "")[:500],
+                                source_id=item.get("source_id", "") or item.get("chunk_ids", ""),
+                                file_path=item.get("file_path", "") or item.get("doc_ids", ""),
+                            )
+                        )
+            finally:
+                iterator.close()
+
+            logger.info(
+                "从 self-ingestion v2 Milvus 获取 %s 个实体: %s",
+                len(entities),
+                kb.kb_code,
+            )
+
+        except Exception as e:
+            logger.warning(f"从 self-ingestion v2 Milvus 获取实体失败: {kb.kb_code}, {e}")
+
+        return entities
     
     async def _fetch_entities_from_nebula(self, kb: KnowledgeBase) -> List[Any]:
         """从 NebulaGraph 获取实体数据"""
+        return await asyncio.to_thread(self._fetch_entities_from_nebula_sync, kb)
+
+    def _fetch_entities_from_nebula_sync(self, kb: KnowledgeBase) -> List[Any]:
+        """Run the synchronous Nebula client outside the event loop."""
         from backend.rag.keywords.models import EntityData
         from nebula3.gclient.net import ConnectionPool
         from nebula3.Config import Config
@@ -1496,11 +1674,11 @@ class KnowledgeBaseManager:
             pool = ConnectionPool()
             host = os.getenv("NEBULA_HOST", "")
             port = int(os.getenv("NEBULA_PORT", "9669"))
-            user = os.getenv("NEBULA_USER", "")
+            user = os.getenv("NEBULA_USER", "root")
             password = os.getenv("NEBULA_PASSWORD", "")
-            
+
             pool.init([(host, port)], config)
-            
+
             session = pool.get_session(user, password)
             try:
                 result = session.execute(f"USE `{kb.nebula_space}`")

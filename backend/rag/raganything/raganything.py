@@ -86,6 +86,12 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
     _parser_installation_checked: bool = field(default=False, init=False)
     """Flag to track if parser installation has been checked."""
 
+    _initialization_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock,
+        init=False,
+        repr=False,
+    )
+
     def __post_init__(self):
         """Post-initialization setup following LightRAG pattern"""
         # Initialize parent mixins
@@ -279,6 +285,11 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
 
     async def _ensure_lightrag_initialized(self):
         """Ensure LightRAG instance is initialized, create if necessary"""
+        async with self._initialization_lock:
+            return await self._ensure_lightrag_initialized_unlocked()
+
+    async def _ensure_lightrag_initialized_unlocked(self):
+        """Initialize LightRAG while the instance initialization lock is held."""
         try:
             # Check parser installation first
             if not self._parser_installation_checked:
@@ -288,7 +299,7 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                         "Please install it using 'pip install' or 'uv pip install'."
                     )
                     self.logger.error(error_msg)
-                    raise Exception(error_msg) from e
+                    raise RuntimeError(error_msg)
 
                 self._parser_installation_checked = True
                 self.logger.info(f"Parser '{self.config.parser}' installation verified")
@@ -356,12 +367,12 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
             if self.llm_model_func is None:
                 error_msg = "llm_model_func must be provided when LightRAG is not pre-initialized"
                 self.logger.error(error_msg)
-                raise Exception(error_msg) from e
+                raise RuntimeError(error_msg)
 
             if self.embedding_func is None:
                 error_msg = "embedding_func must be provided when LightRAG is not pre-initialized"
                 self.logger.error(error_msg)
-                raise Exception(error_msg) from e
+                raise RuntimeError(error_msg)
 
             from lightrag.kg.shared_storage import initialize_pipeline_status
 
@@ -466,7 +477,10 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
 
             # Run all finalization tasks concurrently
             if tasks:
-                await asyncio.gather(*tasks)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                errors = [result for result in results if isinstance(result, BaseException)]
+                if errors:
+                    raise errors[0]
             else:
                 pass
 
@@ -598,7 +612,7 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
             try:
                 self.context_extractor = self._create_context_extractor()
                 # Update all processors with new context extractor
-                for processor_name, processor in self.modal_processors.items():
+                for processor in self.modal_processors.values():
                     processor.context_extractor = self.context_extractor
 
                 self.logger.info(

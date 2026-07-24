@@ -4,12 +4,13 @@
 """
 
 import asyncio
+import contextvars
 import re
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple
 
 import networkx as nx
@@ -17,7 +18,11 @@ import numpy as np
 
 from backend.config.loggers import get_logger
 from backend.rag.keywords.index_manager import KeywordIndexManager
-from backend.rag.keywords.models import ExtractionMode, KeywordExtractionResult, QueryType
+from backend.rag.keywords.models import (
+    ExtractionMode,
+    KeywordExtractionResult,
+    QueryType,
+)
 from backend.rag.keywords.per_kb_index import PerKBKeywordIndex
 
 logger = get_logger(__name__)
@@ -74,6 +79,7 @@ class PerKBKeywordExtractor:
     _graph_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _global_graph_cache: ClassVar[Dict[str, Tuple[nx.Graph, Dict[str, int]]]] = {}
     _global_graph_locks: ClassVar[Dict[str, asyncio.Lock]] = {}
+    _global_graph_locks_guard: ClassVar[threading.Lock] = threading.Lock()
     
     async def _get_index(self) -> PerKBKeywordIndex:
         """获取知识库索引"""
@@ -84,94 +90,6 @@ class PerKBKeywordExtractor:
     def _detect_query_type(self, query: str) -> QueryType:
         """检测查询类型"""
         return detect_query_type(query)
-    
-    def _rerank_keywords(
-        self,
-        query: str,
-        keywords: List[str],
-        top_k: int = 5,
-    ) -> List[Tuple[str, float]]:
-        """重排序关键词"""
-        if not keywords:
-            return []
-        
-        query_lower = query.lower()
-        query_chars = set(query_lower)
-        
-        scored_keywords: List[Tuple[str, float]] = []
-        
-        for keyword in keywords:
-            keyword_lower = keyword.lower()
-            
-            if keyword_lower in query_lower:
-                exact_match_score = 1.0
-            elif any(word in query_lower for word in keyword_lower.split()):
-                exact_match_score = 0.8
-            else:
-                exact_match_score = 0.0
-            
-            keyword_chars = set(keyword_lower)
-            if keyword_chars:
-                char_overlap = len(query_chars & keyword_chars) / len(keyword_chars)
-            else:
-                char_overlap = 0.0
-            
-            def levenshtein_distance(s1: str, s2: str) -> int:
-                if len(s1) < len(s2):
-                    return levenshtein_distance(s2, s1)
-                if len(s2) == 0:
-                    return len(s1)
-                
-                previous_row = range(len(s2) + 1)
-                for i, c1 in enumerate(s1):
-                    current_row = [i + 1]
-                    for j, c2 in enumerate(s2):
-                        insertions = previous_row[j + 1] + 1
-                        deletions = current_row[j] + 1
-                        substitutions = previous_row[j] + (c1 != c2)
-                        current_row.append(min(insertions, deletions, substitutions))
-                    previous_row = current_row
-                
-                return previous_row[-1]
-            
-            max_similarity = 0.0
-            keyword_len = len(keyword_lower)
-            for i in range(len(query_lower) - keyword_len + 1):
-                substring = query_lower[i:i + keyword_len]
-                distance = levenshtein_distance(keyword_lower, substring)
-                similarity = 1 - (distance / max(len(keyword_lower), len(substring)))
-                max_similarity = max(max_similarity, similarity)
-            
-            edit_similarity = max_similarity
-            
-            domain_bonus = 0.0
-            domain_terms = [
-                '能量', '分辨率', '增益', '带宽', '噪声', '信噪比', '计数率',
-                '死时间', '成形时间', '上升沿', '下降沿', '阈值', '高压', '偏压',
-                '探测效率', '发光效率', '时间分辨率', '能量分辨率', '采样率'
-            ]
-            for term in domain_terms:
-                if term in keyword:
-                    domain_bonus = 0.2
-                    break
-            
-            length_penalty = 1.0
-            if len(keyword) > 50:
-                length_penalty = 0.7
-            elif len(keyword) < 2:
-                length_penalty = 0.5
-            
-            final_score = (
-                exact_match_score * 0.4 +
-                char_overlap * 0.2 +
-                edit_similarity * 0.2 +
-                domain_bonus
-            ) * length_penalty
-            
-            scored_keywords.append((keyword, final_score))
-        
-        scored_keywords.sort(key=lambda x: -x[1])
-        return scored_keywords[:top_k]
     
     async def _vector_search(
         self,
@@ -343,10 +261,11 @@ class PerKBKeywordExtractor:
     async def _build_full_graph(self) -> None:
         """构建全局实体关系图 - 非阻塞版本"""
         # 进程内按 kb 共享锁和共享缓存，避免多实例并发重复建图
-        kb_lock = self._global_graph_locks.get(self.kb_id)
-        if kb_lock is None:
-            kb_lock = asyncio.Lock()
-            self._global_graph_locks[self.kb_id] = kb_lock
+        with self._global_graph_locks_guard:
+            kb_lock = self._global_graph_locks.get(self.kb_id)
+            if kb_lock is None:
+                kb_lock = asyncio.Lock()
+                self._global_graph_locks[self.kb_id] = kb_lock
 
         async with kb_lock:
             cached = self._global_graph_cache.get(self.kb_id)
@@ -368,12 +287,14 @@ class PerKBKeywordExtractor:
             try:
                 index = await self._get_index()
                 
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
+                context = contextvars.copy_context()
                 result = await loop.run_in_executor(
-                    _executor, 
-                    self._sync_build_graph, 
-                    index.entity_names, 
-                    index.entity_metadata
+                    _executor,
+                    context.run,
+                    self._sync_build_graph,
+                    index.entity_names,
+                    index.entity_metadata,
                 )
                 
                 self._graph = result["graph"]
@@ -418,7 +339,7 @@ class PerKBKeywordExtractor:
                         source_to_entities[chunk_id].append(entity_name)
         
         edges_added = 0
-        for chunk_id, entities in source_to_entities.items():
+        for entities in source_to_entities.values():
             if len(entities) > 1:
                 for i, src in enumerate(entities):
                     for tgt in entities[i + 1:]:
@@ -454,20 +375,6 @@ class PerKBKeywordExtractor:
             return None
 
     @staticmethod
-    def _cosine_similarity(vec_a: Any, vec_b: Any) -> float:
-        """计算余弦相似度。"""
-        a = np.array(vec_a, dtype=np.float32)
-        b = np.array(vec_b, dtype=np.float32)
-
-        if a.size == 0 or b.size == 0:
-            return 0.0
-
-        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-        if denom <= 0:
-            return 0.0
-
-        return float(np.dot(a, b) / denom)
-
     async def get_weighted_seeds(
         self,
         query: str,
@@ -874,7 +781,14 @@ class PerKBKeywordExtractor:
                     precomputed_query_embedding=precomputed_query_embedding,
                 )
             )
-            bm25_task = loop.run_in_executor(_executor, self._bm25_search, query, self.bm25_top_k)
+            context = contextvars.copy_context()
+            bm25_task = loop.run_in_executor(
+                _executor,
+                context.run,
+                self._bm25_search,
+                query,
+                self.bm25_top_k,
+            )
             vector_results, bm25_results = await asyncio.gather(vector_task, bm25_task)
         elif run_vector:
             vector_results = await self._vector_search(
@@ -884,7 +798,14 @@ class PerKBKeywordExtractor:
             )
         elif run_bm25:
             loop = asyncio.get_running_loop()
-            bm25_results = await loop.run_in_executor(_executor, self._bm25_search, query, self.bm25_top_k)
+            context = contextvars.copy_context()
+            bm25_results = await loop.run_in_executor(
+                _executor,
+                context.run,
+                self._bm25_search,
+                query,
+                self.bm25_top_k,
+            )
 
         if run_vector and run_bm25:
             if enable_rrf:

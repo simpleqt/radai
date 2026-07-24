@@ -14,13 +14,17 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    JSON,
     SmallInteger,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 
 from backend.db.models import Base
+from backend.domain.knowledge_base.backend_policy import LEGACY_BACKEND
 
 
 class KnowledgeBaseStatus(enum.Enum):
@@ -58,6 +62,31 @@ class KnowledgeBase(Base):
     )
     redis_key_prefix = Column(String(50), nullable=True, comment="Redis Key前缀")
 
+    ingestion_backend = Column(
+        String(32),
+        nullable=False,
+        default=LEGACY_BACKEND,
+        comment="入库后端: legacy_lightrag/self_ingestion",
+    )
+    retrieval_backend = Column(
+        String(32),
+        nullable=False,
+        default=LEGACY_BACKEND,
+        comment="查询后端: legacy_lightrag/self_ingestion/hybrid",
+    )
+    self_ingestion_enabled = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="是否允许该知识库使用自研入库",
+    )
+    self_retriever_enabled = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="是否允许该知识库使用自研查询",
+    )
+
     doc_count = Column(Integer, default=0, comment="文档数量")
     entity_count = Column(Integer, default=0, comment="实体数量")
     relation_count = Column(Integer, default=0, comment="关系数量")
@@ -90,11 +119,42 @@ class KnowledgeBase(Base):
         Index("idx_kb_status", "status"),
         Index("idx_kb_owner", "owner_id"),
         Index("idx_kb_created", "created_at"),
+        Index("idx_kb_ingestion_backend", "ingestion_backend"),
+        Index("idx_kb_retrieval_backend", "retrieval_backend"),
         {"comment": "知识库管理表"},
     )
 
     def __repr__(self):
         return f"<KnowledgeBase(kb_id={self.kb_id}, kb_code={self.kb_code}, kb_name={self.kb_name})>"
+
+
+class KnowledgeBaseAcl(Base):
+    """Explicit per-user/role grants for owner-private knowledge bases."""
+
+    __tablename__ = "knowledge_base_acl"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    kb_id = Column(String(36), nullable=False, index=True)
+    subject_type = Column(String(16), nullable=False, default="user")
+    subject_id = Column(String(64), nullable=False)
+    permission = Column(String(16), nullable=False, default="read")
+    effect = Column(String(8), nullable=False, default="allow")
+    expires_at = Column(DateTime, nullable=True)
+    created_by = Column(String(36), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "kb_id",
+            "subject_type",
+            "subject_id",
+            "permission",
+            name="uk_knowledge_base_acl",
+        ),
+        Index("idx_knowledge_base_acl_subject", "subject_type", "subject_id"),
+        Index("idx_knowledge_base_acl_kb", "kb_id"),
+        {"comment": "Explicit knowledge-base access grants"},
+    )
 
 
 class KnowledgeBaseDocument(Base):
@@ -110,12 +170,30 @@ class KnowledgeBaseDocument(Base):
         index=True,
         comment="知识库ID",
     )
-    doc_id = Column(String(64), nullable=False, comment="文档ID (LightRAG doc_id)")
+    doc_id = Column(String(64), nullable=False, comment="文档ID (兼容 LightRAG doc_id)")
     file_name = Column(String(255), nullable=False)
     file_path = Column(String(500), nullable=True)
     file_size = Column(BigInteger, nullable=True)
+    source_hash = Column(String(64), nullable=True, index=True, comment="源文件 SHA-256")
+    object_bucket = Column(String(128), nullable=True, comment="对象存储桶")
+    object_key = Column(String(500), nullable=True, comment="对象存储 Key")
+    object_storage_uri = Column(String(700), nullable=True, comment="对象存储 URI")
+    mime_type = Column(String(100), nullable=True, comment="文件 MIME 类型")
+    file_ext = Column(String(20), nullable=True, comment="文件扩展名")
     document_date = Column(Date, nullable=True, comment="文档业务日期(批次级)")
     category_path = Column(String(500), nullable=True, comment="自定义分类路径，如 '期刊名/年份' 或 '参数类/子类'")
+
+    ingestion_backend = Column(
+        String(32),
+        nullable=False,
+        default=LEGACY_BACKEND,
+        comment="入库后端: legacy_lightrag/self_ingestion",
+    )
+    doc_status = Column(String(32), nullable=True, comment="自研入库文档状态")
+    commit_version = Column(Integer, nullable=False, default=1, comment="文档提交版本")
+    latest_job_id = Column(String(64), nullable=True, index=True, comment="最近一次入库任务ID")
+    lineage_json = Column(JSON, nullable=True, comment="解析/切分/写入血缘")
+    extra_metadata_json = Column(JSON, nullable=True, comment="扩展元数据")
 
     parse_status = Column(
         SmallInteger,
@@ -134,9 +212,18 @@ class KnowledgeBaseDocument(Base):
     chunk_count = Column(Integer, default=0)
     entity_count = Column(Integer, default=0)
     relation_count = Column(Integer, default=0)
+    sort_order = Column(Integer, default=0, comment="同级展示排序（自研入库知识库）")
 
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    uploaded_at = Column(DateTime, nullable=True, comment="上传完成时间")
+    stored_at = Column(DateTime, nullable=True, comment="对象存储写入时间")
+    ingest_started_at = Column(DateTime, nullable=True, comment="入库开始时间")
+    ingest_finished_at = Column(DateTime, nullable=True, comment="入库完成时间")
+    committed_at = Column(DateTime, nullable=True, comment="索引提交时间")
+    visible_at = Column(DateTime, nullable=True, comment="查询可见时间")
+    deleted_at = Column(DateTime, nullable=True, index=True, comment="软删除时间")
+    archived_at = Column(DateTime, nullable=True, comment="归档时间")
 
     knowledge_base = relationship("KnowledgeBase", back_populates="documents")
 
@@ -146,6 +233,10 @@ class KnowledgeBaseDocument(Base):
         Index("idx_kb_doc_storage", "storage_status"),
         Index("idx_kb_doc_date", "kb_id", "document_date"),
         Index("idx_kb_doc_category", "kb_id", "category_path"),
+        Index("idx_kb_doc_backend", "kb_id", "ingestion_backend"),
+        Index("idx_kb_doc_sort", "kb_id", "category_path", "sort_order"),
+        Index("idx_kb_doc_hash", "kb_id", "source_hash"),
+        Index("idx_kb_doc_visible", "kb_id", "visible_at"),
         {"comment": "知识库文档关联表"},
     )
 
@@ -226,8 +317,20 @@ class PendingFile(Base):
     file_id = Column(String(64), unique=True, nullable=False, comment="文件唯一标识")
     file_name = Column(String(255), nullable=False, comment="原始文件名")
     file_size = Column(BigInteger, nullable=False, default=0, comment="文件大小(字节)")
-    file_type = Column(String(50), nullable=True, comment="文件类型(MIME)")
+    file_type = Column(String(100), nullable=True, comment="文件类型(MIME)")
     minio_path = Column(String(500), nullable=False, comment="MinIO存储路径")
+    source_hash = Column(String(64), nullable=True, index=True, comment="源文件 SHA-256")
+    object_bucket = Column(String(128), nullable=True, comment="对象存储桶")
+    object_key = Column(String(500), nullable=True, comment="对象存储 Key")
+    original_uri = Column(String(700), nullable=True, comment="源文件对象 URI")
+    mime_type = Column(String(100), nullable=True, comment="文件 MIME 类型")
+    file_ext = Column(String(20), nullable=True, comment="文件扩展名")
+    ingestion_backend = Column(
+        String(32),
+        nullable=True,
+        comment="任务创建时锁定的入库后端，空值兼容旧任务",
+    )
+    ingest_job_id = Column(String(64), nullable=True, index=True, comment="入库任务ID")
     document_date = Column(Date, nullable=True, comment="文档业务日期(批次级)")
     category_path = Column(String(500), nullable=True, comment="自定义分类路径")
 
@@ -243,6 +346,8 @@ class PendingFile(Base):
     created_by = Column(String(36), nullable=True, comment="上传用户ID")
     created_at = Column(DateTime, default=datetime.now, index=True)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    last_ingest_started_at = Column(DateTime, nullable=True, comment="最近一次入库开始时间")
+    last_ingest_finished_at = Column(DateTime, nullable=True, comment="最近一次入库结束时间")
 
     knowledge_base = relationship("KnowledgeBase")
 
@@ -252,8 +357,107 @@ class PendingFile(Base):
         Index("idx_pending_status", "status"),
         Index("idx_pending_doc_date", "document_date"),
         Index("idx_pending_created", "created_at"),
+        Index("idx_pending_backend", "ingestion_backend"),
+        Index("idx_pending_hash", "kb_id", "source_hash"),
         {"comment": "待入库文件缓存表"},
     )
 
     def __repr__(self):
         return f"<PendingFile(file_id={self.file_id}, file_name={self.file_name}, status={self.status})>"
+
+
+class SelfIngestJob(Base):
+    """自研入库任务表"""
+
+    __tablename__ = "kb_self_ingest_jobs"
+
+    job_id = Column(String(64), primary_key=True, comment="入库任务ID")
+    kb_id = Column(
+        String(36),
+        ForeignKey("knowledge_bases.kb_id"),
+        nullable=False,
+        index=True,
+        comment="知识库ID",
+    )
+    file_id = Column(String(64), nullable=False, index=True, comment="待入库文件ID")
+    doc_id = Column(String(64), nullable=True, index=True, comment="稳定文档ID")
+    source_hash = Column(String(64), nullable=True, index=True, comment="源文件 SHA-256")
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    stage = Column(String(64), nullable=True, comment="当前阶段")
+    error_message = Column(Text, nullable=True)
+    chunk_count = Column(Integer, nullable=False, default=0)
+    vector_count = Column(Integer, nullable=False, default=0)
+    retry_count = Column(Integer, nullable=False, default=0, comment="已重试次数")
+    max_retry = Column(Integer, nullable=False, default=3, comment="最大重试次数")
+    commit_log_json = Column(JSON, nullable=True, comment="各阶段提交审计日志")
+    metrics_json = Column(JSON, nullable=True, comment="入库耗时与产出指标")
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    extra_json = Column(JSON, nullable=True)
+    staging_uri = Column(
+        String(500), nullable=True,
+        comment="MinIO staging payload URI: staging/{kb_id}/{job_id}/payload.json",
+    )
+
+    knowledge_base = relationship("KnowledgeBase")
+
+    __table_args__ = (
+        Index("idx_self_job_kb_status", "kb_id", "status"),
+        Index("idx_self_job_file_status", "file_id", "status"),
+        Index("idx_self_job_retry", "status", "retry_count"),
+        {"comment": "自研入库任务表"},
+    )
+
+
+class SelfIngestChunk(Base):
+    """自研入库 Chunk 表"""
+
+    __tablename__ = "kb_self_chunks"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    kb_id = Column(
+        String(36),
+        ForeignKey("knowledge_bases.kb_id"),
+        nullable=False,
+        index=True,
+        comment="知识库ID",
+    )
+    doc_id = Column(String(64), nullable=False, index=True, comment="稳定文档ID")
+    chunk_id = Column(String(128), nullable=False, comment="稳定 Chunk ID")
+    job_id = Column(String(64), nullable=True, index=True, comment="入库任务ID")
+    file_name = Column(String(255), nullable=False)
+    file_path = Column(String(500), nullable=True)
+    chunk_index = Column(Integer, nullable=False)
+    block_type = Column(String(32), nullable=False, default="text")
+    content = Column(MEDIUMTEXT, nullable=False)
+    content_hash = Column(String(64), nullable=False, index=True)
+    stable_chunk_fingerprint = Column(String(64), nullable=False, index=True)
+    token_count = Column(Integer, nullable=False, default=0)
+    char_start = Column(Integer, nullable=True)
+    char_end = Column(Integer, nullable=True)
+    source_hash = Column(String(64), nullable=True, index=True)
+    document_date = Column(Date, nullable=True, comment="文档业务日期")
+    category_path = Column(String(500), nullable=True)
+    commit_version = Column(Integer, nullable=False, default=1)
+    is_visible = Column(Boolean, nullable=False, default=False, index=True)
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    doc_status = Column(String(32), nullable=False, default="staged", index=True)
+    embedding_status = Column(String(32), nullable=False, default="pending")
+    milvus_collection = Column(String(128), nullable=True)
+    extra_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    visible_at = Column(DateTime, nullable=True, index=True)
+    deleted_at = Column(DateTime, nullable=True, index=True)
+
+    knowledge_base = relationship("KnowledgeBase")
+
+    __table_args__ = (
+        Index("uk_self_chunk_id", "kb_id", "chunk_id", unique=True),
+        Index("idx_self_chunk_doc_visible", "kb_id", "doc_id", "is_visible", "is_active"),
+        Index("idx_self_chunk_status", "kb_id", "doc_status"),
+        Index("idx_self_chunk_hash", "kb_id", "content_hash"),
+        {"comment": "自研入库 Chunk 表"},
+    )

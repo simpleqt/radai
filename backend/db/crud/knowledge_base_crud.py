@@ -3,14 +3,29 @@
 from datetime import date, datetime
 from typing import List, Optional, Tuple
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.models import (
+    AgentKnowledgeBase,
     KnowledgeBase,
+    KnowledgeBaseDirectory,
     KnowledgeBaseDocument,
     KnowledgeBaseStatus,
     PendingFile,
+    SelfIngestChunk,
+    SelfIngestJob,
+)
+from backend.db.unit_of_work import flush_or_commit
+from backend.domain.knowledge_base.backend_policy import (
+    LEGACY_BACKEND,
+    VALID_INGESTION_BACKENDS,
+    VALID_RETRIEVAL_BACKENDS,
+    validate_backend_isolation,
 )
 
 
@@ -26,8 +41,23 @@ class KnowledgeBaseCRUD:
         description: Optional[str] = None,
         owner_id: Optional[str] = None,
         is_default: bool = False,
+        ingestion_backend: str = LEGACY_BACKEND,
+        retrieval_backend: str = LEGACY_BACKEND,
+        self_ingestion_enabled: bool = False,
+        self_retriever_enabled: bool = False,
     ) -> KnowledgeBase:
         """创建知识库"""
+        if ingestion_backend not in VALID_INGESTION_BACKENDS:
+            raise ValueError(f"无效的入库后端: {ingestion_backend}")
+        if retrieval_backend not in VALID_RETRIEVAL_BACKENDS:
+            raise ValueError(f"无效的查询后端: {retrieval_backend}")
+        validate_backend_isolation(
+            ingestion_backend=ingestion_backend,
+            retrieval_backend=retrieval_backend,
+            self_ingestion_enabled=self_ingestion_enabled,
+            self_retriever_enabled=self_retriever_enabled,
+        )
+
         kb = KnowledgeBase(
             kb_code=kb_code,
             kb_name=kb_name,
@@ -37,11 +67,15 @@ class KnowledgeBaseCRUD:
             nebula_space=kb_code,
             milvus_collection_prefix=kb_code,
             redis_key_prefix=kb_code,
+            ingestion_backend=ingestion_backend,
+            retrieval_backend=retrieval_backend,
+            self_ingestion_enabled=self_ingestion_enabled,
+            self_retriever_enabled=self_retriever_enabled,
             is_default=is_default,
             status=KnowledgeBaseStatus.CREATING,
         )
         session.add(kb)
-        await session.commit()
+        await flush_or_commit(session)
         await session.refresh(kb)
         return kb
 
@@ -76,6 +110,7 @@ class KnowledgeBaseCRUD:
         session: AsyncSession,
         status: Optional[KnowledgeBaseStatus] = None,
         owner_id: Optional[str] = None,
+        query: Optional[str] = None,
         skip: int = 0,
         limit: int = 20,
     ) -> Tuple[List[KnowledgeBase], int]:
@@ -85,6 +120,15 @@ class KnowledgeBaseCRUD:
             conditions.append(KnowledgeBase.status == status)
         if owner_id:
             conditions.append(KnowledgeBase.owner_id == owner_id)
+        if query:
+            like = f"%{query.strip()}%"
+            conditions.append(
+                or_(
+                    KnowledgeBase.kb_name.ilike(like),
+                    KnowledgeBase.kb_code.ilike(like),
+                    KnowledgeBase.subject.ilike(like),
+                )
+            )
 
         count_stmt = select(func.count(KnowledgeBase.kb_id))
         if conditions:
@@ -95,7 +139,10 @@ class KnowledgeBaseCRUD:
         stmt = select(KnowledgeBase)
         if conditions:
             stmt = stmt.where(*conditions)
-        stmt = stmt.offset(skip).limit(limit).order_by(KnowledgeBase.created_at.desc())
+        stmt = stmt.offset(skip).limit(limit).order_by(
+            KnowledgeBase.doc_count.desc(),
+            KnowledgeBase.created_at.desc(),
+        )
 
         result = await session.execute(stmt)
         return list(result.scalars().all()), total
@@ -112,7 +159,7 @@ class KnowledgeBaseCRUD:
             .where(KnowledgeBase.kb_id == kb_id)
             .values(status=status, updated_at=datetime.now())
         )
-        await session.commit()
+        await flush_or_commit(session)
         return await KnowledgeBaseCRUD.get_by_id(session, kb_id)
 
     @staticmethod
@@ -122,13 +169,48 @@ class KnowledgeBaseCRUD:
         **kwargs
     ) -> Optional[KnowledgeBase]:
         """更新知识库信息"""
+        current = await KnowledgeBaseCRUD.get_by_id(session, kb_id)
+        if not current:
+            return None
+
         update_data = {"updated_at": datetime.now()}
         
         # 允许的字段
-        allowed_fields = ["kb_name", "subject", "description", "owner_id", "is_default"]
+        allowed_fields = [
+            "kb_name",
+            "subject",
+            "description",
+            "owner_id",
+            "is_default",
+            "ingestion_backend",
+            "retrieval_backend",
+            "self_ingestion_enabled",
+            "self_retriever_enabled",
+        ]
         for field in allowed_fields:
             if field in kwargs and kwargs[field] is not None:
+                if field == "ingestion_backend" and kwargs[field] not in VALID_INGESTION_BACKENDS:
+                    raise ValueError(f"无效的入库后端: {kwargs[field]}")
+                if field == "retrieval_backend" and kwargs[field] not in VALID_RETRIEVAL_BACKENDS:
+                    raise ValueError(f"无效的查询后端: {kwargs[field]}")
                 update_data[field] = kwargs[field]
+
+        final_ingestion_backend = update_data.get("ingestion_backend", current.ingestion_backend) or LEGACY_BACKEND
+        final_retrieval_backend = update_data.get("retrieval_backend", current.retrieval_backend) or LEGACY_BACKEND
+        final_self_ingestion_enabled = update_data.get(
+            "self_ingestion_enabled",
+            bool(current.self_ingestion_enabled),
+        )
+        final_self_retriever_enabled = update_data.get(
+            "self_retriever_enabled",
+            bool(current.self_retriever_enabled),
+        )
+        validate_backend_isolation(
+            ingestion_backend=final_ingestion_backend,
+            retrieval_backend=final_retrieval_backend,
+            self_ingestion_enabled=bool(final_self_ingestion_enabled),
+            self_retriever_enabled=bool(final_self_retriever_enabled),
+        )
         
         if not update_data:
             return await KnowledgeBaseCRUD.get_by_id(session, kb_id)
@@ -138,7 +220,7 @@ class KnowledgeBaseCRUD:
             .where(KnowledgeBase.kb_id == kb_id)
             .values(**update_data)
         )
-        await session.commit()
+        await flush_or_commit(session)
         return await KnowledgeBaseCRUD.get_by_id(session, kb_id)
 
     @staticmethod
@@ -166,25 +248,39 @@ class KnowledgeBaseCRUD:
             .where(KnowledgeBase.kb_id == kb_id)
             .values(**update_data)
         )
-        await session.commit()
+        await flush_or_commit(session)
         return await KnowledgeBaseCRUD.get_by_id(session, kb_id)
 
     @staticmethod
     async def delete(session: AsyncSession, kb_id: str) -> bool:
         """删除知识库"""
-        # Delete child rows first to satisfy FK constraints.
-        await session.execute(
-            delete(PendingFile).where(PendingFile.kb_id == kb_id)
-        )
-        await session.execute(
-            delete(KnowledgeBaseDocument).where(KnowledgeBaseDocument.kb_id == kb_id)
+        # Production databases contain a mixture of historical foreign keys:
+        # some cascade on KB deletion and some (notably the self-ingestion
+        # tables) do not.  Delete every KB-owned row explicitly so this works
+        # against both schemas and does not leave non-FK bindings orphaned.
+        child_models = (
+            SelfIngestChunk,
+            SelfIngestJob,
+            PendingFile,
+            KnowledgeBaseDocument,
+            KnowledgeBaseDirectory,
+            AgentKnowledgeBase,
         )
 
-        result = await session.execute(
-            delete(KnowledgeBase).where(KnowledgeBase.kb_id == kb_id)
-        )
-        await session.commit()
-        return result.rowcount > 0
+        try:
+            for model in child_models:
+                await session.execute(delete(model).where(model.kb_id == kb_id))
+
+            result = await session.execute(
+                delete(KnowledgeBase).where(KnowledgeBase.kb_id == kb_id)
+            )
+            await flush_or_commit(session)
+            return result.rowcount > 0
+        except Exception:
+            # Restore the session before the manager attempts to reset the KB
+            # status after a failed database cleanup.
+            await session.rollback()
+            raise
 
 
 class KnowledgeBaseDocumentCRUD:
@@ -200,11 +296,24 @@ class KnowledgeBaseDocumentCRUD:
         file_size: Optional[int] = None,
         document_date: Optional[date] = None,
         category_path: Optional[str] = None,
+        source_hash: Optional[str] = None,
+        object_bucket: Optional[str] = None,
+        object_key: Optional[str] = None,
+        object_storage_uri: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        file_ext: Optional[str] = None,
+        ingestion_backend: str = LEGACY_BACKEND,
+        latest_job_id: Optional[str] = None,
+        lineage_json: Optional[dict] = None,
+        extra_metadata_json: Optional[dict] = None,
         chunk_count: int = 0,
         entity_count: int = 0,
         relation_count: int = 0,
     ) -> KnowledgeBaseDocument:
         """创建文档记录"""
+        if ingestion_backend not in VALID_INGESTION_BACKENDS:
+            raise ValueError(f"无效的入库后端: {ingestion_backend}")
+
         doc = KnowledgeBaseDocument(
             kb_id=kb_id,
             doc_id=doc_id,
@@ -213,14 +322,30 @@ class KnowledgeBaseDocumentCRUD:
             file_size=file_size,
             document_date=document_date,
             category_path=category_path,
+            source_hash=source_hash,
+            object_bucket=object_bucket,
+            object_key=object_key,
+            object_storage_uri=object_storage_uri,
+            mime_type=mime_type,
+            file_ext=file_ext,
+            ingestion_backend=ingestion_backend,
+            latest_job_id=latest_job_id,
+            lineage_json=lineage_json,
+            extra_metadata_json=extra_metadata_json,
             chunk_count=chunk_count,
             entity_count=entity_count,
             relation_count=relation_count,
             parse_status=1,
             storage_status=1,
+            doc_status="visible",
+            uploaded_at=datetime.now(),
+            stored_at=datetime.now(),
+            ingest_finished_at=datetime.now(),
+            committed_at=datetime.now(),
+            visible_at=datetime.now(),
         )
         session.add(doc)
-        await session.commit()
+        await flush_or_commit(session)
         await session.refresh(doc)
         return doc
 
@@ -247,6 +372,12 @@ class KnowledgeBaseDocumentCRUD:
     ) -> Tuple[List[KnowledgeBaseDocument], int]:
         """获取知识库的文档列表"""
         conditions = [KnowledgeBaseDocument.kb_id == kb_id]
+        conditions.append(
+            or_(
+                KnowledgeBaseDocument.doc_status.is_(None),
+                KnowledgeBaseDocument.doc_status != "deleted",
+            )
+        )
         if parse_status is not None:
             conditions.append(KnowledgeBaseDocument.parse_status == parse_status)
         if storage_status is not None:
@@ -290,7 +421,7 @@ class KnowledgeBaseDocumentCRUD:
             .where(KnowledgeBaseDocument.doc_id == doc_id)
             .values(**update_data)
         )
-        await session.commit()
+        await flush_or_commit(session)
         return await KnowledgeBaseDocumentCRUD.get_by_doc_id(session, kb_id, doc_id)
 
     @staticmethod
@@ -301,7 +432,7 @@ class KnowledgeBaseDocumentCRUD:
             .where(KnowledgeBaseDocument.kb_id == kb_id)
             .where(KnowledgeBaseDocument.doc_id == doc_id)
         )
-        await session.commit()
+        await flush_or_commit(session)
         return result.rowcount > 0
 
     @staticmethod
@@ -318,43 +449,93 @@ class KnowledgeBaseDocumentCRUD:
         entity_count: int = 0,
         relation_count: int = 0,
     ) -> KnowledgeBaseDocument:
-        """创建或更新文档记录"""
-        existing = await KnowledgeBaseDocumentCRUD.get_by_doc_id(session, kb_id, doc_id)
-        
-        if existing:
-            update_data = {
-                "file_name": file_name,
-                "file_path": file_path,
-                "file_size": file_size,
-                "document_date": document_date,
-                "category_path": category_path,
-                "chunk_count": chunk_count,
-                "entity_count": entity_count,
-                "relation_count": relation_count,
-                "updated_at": datetime.now(),
-            }
+        """原子创建或更新文档记录。"""
+        values = {
+            "kb_id": kb_id,
+            "doc_id": doc_id,
+            "file_name": file_name,
+            "file_path": file_path,
+            "file_size": file_size,
+            "document_date": document_date,
+            "category_path": category_path,
+            "chunk_count": chunk_count,
+            "entity_count": entity_count,
+            "relation_count": relation_count,
+        }
+        dialect_name = session.get_bind().dialect.name
+        update_fields = {
+            key: value for key, value in values.items() if key not in {"kb_id", "doc_id"}
+        }
+        if dialect_name == "mysql":
+            statement = mysql_insert(KnowledgeBaseDocument).values(**values)
             await session.execute(
-                update(KnowledgeBaseDocument)
-                .where(KnowledgeBaseDocument.id == existing.id)
-                .values(**update_data)
+                statement.on_duplicate_key_update(
+                    **{
+                        key: statement.inserted[key]
+                        for key in values
+                        if key not in {"kb_id", "doc_id"}
+                    },
+                    updated_at=datetime.now(),
+                )
             )
-            await session.commit()
-            await session.refresh(existing)
-            return existing
+        elif dialect_name == "sqlite":
+            statement = sqlite_insert(KnowledgeBaseDocument).values(**values)
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["kb_id", "doc_id"],
+                    set_={
+                        **{
+                            key: statement.excluded[key]
+                            for key in update_fields
+                        },
+                        "updated_at": datetime.now(),
+                    },
+                )
+            )
+        elif dialect_name == "postgresql":
+            statement = postgresql_insert(KnowledgeBaseDocument).values(**values)
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["kb_id", "doc_id"],
+                    set_={
+                        **{
+                            key: statement.excluded[key]
+                            for key in update_fields
+                        },
+                        "updated_at": datetime.now(),
+                    },
+                )
+            )
         else:
-            return await KnowledgeBaseDocumentCRUD.create(
-                session=session,
-                kb_id=kb_id,
-                doc_id=doc_id,
-                file_name=file_name,
-                file_path=file_path,
-                file_size=file_size,
-                document_date=document_date,
-                category_path=category_path,
-                chunk_count=chunk_count,
-                entity_count=entity_count,
-                relation_count=relation_count,
+            # Generic fallback: update first; a savepoint makes a concurrent
+            # insert recoverable without rolling back the caller's transaction.
+            updated = await session.execute(
+                update(KnowledgeBaseDocument)
+                .where(
+                    KnowledgeBaseDocument.kb_id == kb_id,
+                    KnowledgeBaseDocument.doc_id == doc_id,
+                )
+                .values(**update_fields, updated_at=datetime.now())
             )
+            if updated.rowcount == 0:
+                try:
+                    async with session.begin_nested():
+                        session.add(KnowledgeBaseDocument(**values))
+                        await session.flush()
+                except IntegrityError:
+                    await session.execute(
+                        update(KnowledgeBaseDocument)
+                        .where(
+                            KnowledgeBaseDocument.kb_id == kb_id,
+                            KnowledgeBaseDocument.doc_id == doc_id,
+                        )
+                        .values(**update_fields, updated_at=datetime.now())
+                    )
+        await flush_or_commit(session)
+        result = await KnowledgeBaseDocumentCRUD.get_by_doc_id(session, kb_id, doc_id)
+        if result is None:
+            raise RuntimeError(f"文档 upsert 后无法读取: {kb_id}/{doc_id}")
+        return result
 
 
 knowledge_base_crud = KnowledgeBaseCRUD()

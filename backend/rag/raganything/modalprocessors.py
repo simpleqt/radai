@@ -17,7 +17,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import httpx
 from lightrag.kg.shared_storage import get_namespace_data, get_pipeline_status_lock
@@ -737,6 +737,45 @@ class BaseModalProcessor:
         # Strategy 4: Fallback to regex field extraction
         return self._extract_fields_with_regex(response)
 
+    def _normalize_analysis_response(
+        self,
+        response_data: dict,
+        response: str,
+        content_type: str,
+        entity_name: str = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        description = response_data.get("detailed_description", "")
+        entity_data = response_data.get("entity_info", {})
+        if not description:
+            raise ValueError("Missing detailed_description in response")
+        if not isinstance(entity_data, dict):
+            entity_data = {}
+        if not entity_data:
+            logger.warning(
+                "%s analysis response missing entity_info; using fallback entity",
+                content_type,
+            )
+            entity_data = {}
+        entity_data.setdefault(
+            "entity_name",
+            entity_name or f"{content_type}_{compute_mdhash_id(response)}",
+        )
+        entity_data.setdefault("entity_type", content_type)
+        entity_data.setdefault(
+            "summary",
+            description[:100] + "..." if len(description) > 100 else description,
+        )
+        if not all(
+            key in entity_data for key in ["entity_name", "entity_type", "summary"]
+        ):
+            raise ValueError("Missing required fields in entity_info")
+        entity_data["entity_name"] = (
+            entity_data["entity_name"] + f" ({entity_data['entity_type']})"
+        )
+        if entity_name:
+            entity_data["entity_name"] = entity_name
+        return description, entity_data
+
     def _extract_all_json_candidates(self, response: str) -> list:
         """Extract all possible JSON candidates from response"""
         candidates = []
@@ -1040,7 +1079,7 @@ class ImageModalProcessor(BaseModalProcessor):
 
     async def _get_http_client(self) -> httpx.AsyncClient:
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=120.0)
+            self._http_client = httpx.AsyncClient(trust_env=False, timeout=120.0)
         return self._http_client
 
     async def close(self):
@@ -1361,29 +1400,13 @@ class ImageModalProcessor(BaseModalProcessor):
         try:
             logger.debug(f"Raw LLM response for image: {response[:500]}")
             response_data = self._robust_json_parse(response)
-
-            description = response_data.get("detailed_description", "")
-            entity_data = response_data.get("entity_info", {})
-
-            if not description or not entity_data:
-                raise ValueError("Missing required fields in response")
-
-            if not all(
-                key in entity_data for key in ["entity_name", "entity_type", "summary"]
-            ):
-                raise ValueError("Missing required fields in entity_info")
-
-            entity_data["entity_name"] = (
-                entity_data["entity_name"] + f" ({entity_data['entity_type']})"
+            return self._normalize_analysis_response(
+                response_data, response, "image", entity_name
             )
-            if entity_name:
-                entity_data["entity_name"] = entity_name
-
-            return description, entity_data
 
         except (json.JSONDecodeError, AttributeError, ValueError) as e:
-            logger.error(f"Error parsing image analysis response: {e}")
-            logger.error(f"Raw response (first 1000 chars): {response[:1000]}")
+            logger.warning(f"Image analysis response fallback: {e}")
+            logger.debug(f"Raw response (first 1000 chars): {response[:1000]}")
             fallback_entity = {
                 "entity_name": (
                     entity_name
@@ -1566,29 +1589,13 @@ class TableModalProcessor(BaseModalProcessor):
         try:
             logger.debug(f"Raw LLM response for table: {response[:500]}")
             response_data = self._robust_json_parse(response)
-
-            description = response_data.get("detailed_description", "")
-            entity_data = response_data.get("entity_info", {})
-
-            if not description or not entity_data:
-                raise ValueError("Missing required fields in response")
-
-            if not all(
-                key in entity_data for key in ["entity_name", "entity_type", "summary"]
-            ):
-                raise ValueError("Missing required fields in entity_info")
-
-            entity_data["entity_name"] = (
-                entity_data["entity_name"] + f" ({entity_data['entity_type']})"
+            return self._normalize_analysis_response(
+                response_data, response, "table", entity_name
             )
-            if entity_name:
-                entity_data["entity_name"] = entity_name
-
-            return description, entity_data
 
         except (json.JSONDecodeError, AttributeError, ValueError) as e:
-            logger.error(f"Error parsing table analysis response: {e}")
-            logger.error(f"Raw response (first 1000 chars): {response[:1000]}")
+            logger.warning(f"Table analysis response fallback: {e}")
+            logger.debug(f"Raw response (first 1000 chars): {response[:1000]}")
             fallback_entity = {
                 "entity_name": (
                     entity_name
@@ -1761,29 +1768,13 @@ class EquationModalProcessor(BaseModalProcessor):
         try:
             logger.debug(f"Raw LLM response for equation: {response[:500]}")
             response_data = self._robust_json_parse(response)
-
-            description = response_data.get("detailed_description", "")
-            entity_data = response_data.get("entity_info", {})
-
-            if not description or not entity_data:
-                raise ValueError("Missing required fields in response")
-
-            if not all(
-                key in entity_data for key in ["entity_name", "entity_type", "summary"]
-            ):
-                raise ValueError("Missing required fields in entity_info")
-
-            entity_data["entity_name"] = (
-                entity_data["entity_name"] + f" ({entity_data['entity_type']})"
+            return self._normalize_analysis_response(
+                response_data, response, "equation", entity_name
             )
-            if entity_name:
-                entity_data["entity_name"] = entity_name
-
-            return description, entity_data
 
         except (json.JSONDecodeError, AttributeError, ValueError) as e:
-            logger.error(f"Error parsing equation analysis response: {e}")
-            logger.error(f"Raw response (first 1000 chars): {response[:1000]}")
+            logger.warning(f"Equation analysis response fallback: {e}")
+            logger.debug(f"Raw response (first 1000 chars): {response[:1000]}")
             fallback_entity = {
                 "entity_name": (
                     entity_name
@@ -1943,28 +1934,12 @@ class GenericModalProcessor(BaseModalProcessor):
         """Parse generic analysis response"""
         try:
             response_data = self._robust_json_parse(response)
-
-            description = response_data.get("detailed_description", "")
-            entity_data = response_data.get("entity_info", {})
-
-            if not description or not entity_data:
-                raise ValueError("Missing required fields in response")
-
-            if not all(
-                key in entity_data for key in ["entity_name", "entity_type", "summary"]
-            ):
-                raise ValueError("Missing required fields in entity_info")
-
-            entity_data["entity_name"] = (
-                entity_data["entity_name"] + f" ({entity_data['entity_type']})"
+            return self._normalize_analysis_response(
+                response_data, response, content_type, entity_name
             )
-            if entity_name:
-                entity_data["entity_name"] = entity_name
-
-            return description, entity_data
 
         except (json.JSONDecodeError, AttributeError, ValueError) as e:
-            logger.error(f"Error parsing {content_type} analysis response: {e}")
+            logger.warning(f"{content_type} analysis response fallback: {e}")
             logger.debug(f"Raw response: {response}")
             fallback_entity = {
                 "entity_name": (

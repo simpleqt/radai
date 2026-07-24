@@ -67,11 +67,29 @@ def parse_skill_file(
                 if tn and tn not in seen:
                     tool_names.append(tn)
                     seen.add(tn)
+        def _string_list(value) -> list[str]:
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, list):
+                return []
+            return [str(item).strip() for item in value if str(item or "").strip()]
+
+        raw_budget = metadata.get("resource_budget")
+        resource_budget = (
+            {str(key): value for key, value in raw_budget.items()}
+            if isinstance(raw_budget, dict)
+            else {}
+        )
         return Skill(
             name=name, description=description, license=license_text,
             skill_dir=skill_file.parent, skill_file=skill_file,
             relative_path=relative_path or Path(skill_file.parent.name),
             category=category, enabled=True, tool_names=tool_names, owner_id=owner_id,
+            version=_normalize_scalar(str(metadata.get("version") or "0.0.0")),
+            dependencies=_string_list(metadata.get("dependencies")),
+            conflicts=_string_list(metadata.get("conflicts")),
+            capabilities=_string_list(metadata.get("capabilities")),
+            resource_budget=resource_budget,
         )
     except Exception as e:
         logger.error("Error parsing skill file %s: %s", skill_file, e)

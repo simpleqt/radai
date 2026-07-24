@@ -120,7 +120,7 @@ async def _upload_to_minio(local_path: str) -> str | None:
 
 def _resolve_file_path(relative_path: str) -> str | None:
     """将相对路径解析为绝对路径，查找数据集文件"""
-    # 项目根目录
+    # 项目根目录（langchian_project）
     project_root = Path(__file__).resolve().parents[2]
     # backend 目录
     backend_root = Path(__file__).resolve().parent

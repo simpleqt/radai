@@ -4,9 +4,10 @@ Kafka 客户端封装
 """
 
 import asyncio
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.errors import KafkaError
@@ -31,6 +32,18 @@ from backend.kafka.schemas import (
 logger = get_logger(__name__)
 
 
+def _timeout_ms_from_env(name: str, default: int) -> int:
+    try:
+        return max(1000, int(os.getenv(name, str(default)) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+async def _model_dump_json(model: Any) -> str:
+    """Serialize potentially large Pydantic messages off the event loop."""
+    return await asyncio.to_thread(model.model_dump_json)
+
+
 class KafkaClient:
     """
     Kafka 客户端单例
@@ -38,20 +51,44 @@ class KafkaClient:
     """
 
     _instance: Optional["KafkaClient"] = None
-    _producer: AIOKafkaProducer | None = None
-    _consumers: dict[str, AIOKafkaConsumer] = {}
-    _lock: asyncio.Lock = asyncio.Lock()
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
+            cls._instance._producer = None
+            cls._instance._consumers = {}
+            cls._instance._lock = None
+            cls._instance._lock_loop = None
         return cls._instance
+
+    def _lifecycle_lock(self) -> asyncio.Lock:
+        """Create the lifecycle lock lazily in the loop that owns the client."""
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            if self._lock_loop is not None and (
+                self._producer is not None or self._consumers
+            ):
+                raise RuntimeError("Kafka client is active in a different event loop")
+            self._lock = asyncio.Lock()
+            self._lock_loop = loop
+        return self._lock
 
     async def start(self) -> None:
         """启动 Kafka 客户端"""
-        async with self._lock:
+        async with self._lifecycle_lock():
             if self._producer is None:
                 try:
+                    request_timeout_ms = _timeout_ms_from_env(
+                        "KAFKA_PRODUCER_REQUEST_TIMEOUT_MS",
+                        10_000,
+                    )
+                    delivery_timeout_ms = max(
+                        request_timeout_ms,
+                        _timeout_ms_from_env(
+                            "KAFKA_PRODUCER_DELIVERY_TIMEOUT_MS",
+                            30_000,
+                        ),
+                    )
                     self._producer = AIOKafkaProducer(
                         bootstrap_servers=settings.kafka_bootstrap_servers,
                         value_serializer=lambda v: (
@@ -62,6 +99,10 @@ class KafkaClient:
                         ),
                         acks=settings.kafka_producer_acks,
                         enable_idempotence=settings.kafka_producer_enable_idempotence,
+                        max_request_size=settings.kafka_producer_max_request_size,
+                        compression_type=settings.kafka_producer_compression_type,
+                        request_timeout_ms=request_timeout_ms,
+                        delivery_timeout_ms=delivery_timeout_ms,
                     )
                     await self._producer.start()
                     logger.info(
@@ -72,7 +113,7 @@ class KafkaClient:
 
     async def stop(self) -> None:
         """停止 Kafka 客户端"""
-        async with self._lock:
+        async with self._lifecycle_lock():
             if self._producer:
                 try:
                     await self._producer.stop()
@@ -225,9 +266,10 @@ class TaskProducer:
         """
         await self._ensure_started()
         try:
+            payload = await _model_dump_json(task)
             await self._client.producer.send_and_wait(
                 topic=settings.kafka_task_topic,
-                value=task.model_dump_json(),
+                value=payload,
                 key=task.body.task_id,
             )
             logger.info(f"Task submitted: {task.body.task_id}")
@@ -245,18 +287,25 @@ class TaskProducer:
         if not tasks:
             return
 
-        async with self._client.producer:
-            for task in tasks:
-                try:
+        await self._ensure_started()
+        payloads = await asyncio.gather(
+            *(_model_dump_json(task) for task in tasks)
+        )
+        sends = []
+        for task, payload in zip(tasks, payloads):
+            try:
+                sends.append(
                     await self._client.producer.send(
                         topic=settings.kafka_task_topic,
-                        value=task.model_dump_json(),
+                        value=payload,
                         key=task.body.task_id,
                     )
-                except KafkaError as e:
-                    logger.error(f"Failed to submit task {task.body.task_id}: {e}")
-
-            logger.info(f"Batch submitted: {len(tasks)} tasks")
+                )
+            except KafkaError as e:
+                logger.error(f"Failed to submit task {task.body.task_id}: {e}")
+        if sends:
+            await asyncio.gather(*sends)
+        logger.info(f"Batch submitted: {len(sends)}/{len(tasks)} tasks")
 
     async def retry_task(self, retry: RetryMessage) -> None:
         """
@@ -265,10 +314,12 @@ class TaskProducer:
         Args:
             retry: 重试消息
         """
+        await self._ensure_started()
         try:
+            payload = await _model_dump_json(retry)
             await self._client.producer.send_and_wait(
                 topic=settings.kafka_retry_topic,
-                value=retry.model_dump_json(),
+                value=payload,
                 key=retry.body.task_id,
             )
             logger.info(
@@ -285,10 +336,12 @@ class TaskProducer:
         Args:
             message: 死信消息
         """
+        await self._ensure_started()
         try:
+            payload = await _model_dump_json(message)
             await self._client.producer.send_and_wait(
                 topic=settings.kafka_dead_letter_topic,
-                value=message.model_dump_json(),
+                value=payload,
                 key=message.original_message.get("body", {}).get("task_id", "unknown"),
             )
             logger.warning(f"Message sent to dead letter: {message.original_message}")
@@ -319,9 +372,10 @@ class StatusProducer:
         """
         await self._ensure_started()
         try:
+            payload = await _model_dump_json(status)
             await self._client.producer.send_and_wait(
                 topic=settings.kafka_status_topic,
-                value=status.model_dump_json(),
+                value=payload,
                 key=status.body.task_id,
             )
             logger.debug(
@@ -338,10 +392,12 @@ class StatusProducer:
         Args:
             progress: 进度消息
         """
+        await self._ensure_started()
         try:
+            payload = await _model_dump_json(progress)
             await self._client.producer.send_and_wait(
                 topic=settings.kafka_status_topic,
-                value=progress.model_dump_json(),
+                value=payload,
                 key=progress.body.task_id,
             )
             logger.debug(f"Progress update sent: {progress.body.task_id}")
@@ -372,9 +428,73 @@ class ResultProducer:
         """
         await self._ensure_started()
         try:
+            payload = await _model_dump_json(result)
+            max_payload_bytes = max(
+                1,
+                int(settings.kafka_producer_max_request_size * 0.9),
+            )
+            if (
+                len(payload.encode("utf-8")) > max_payload_bytes
+                and result.body.result is not None
+            ):
+                extraction = result.body.result
+                compact_text_chars = min(
+                    settings.kafka_result_text_max_chars,
+                    max(1024, max_payload_bytes // 8),
+                )
+                compact_extraction = extraction.model_copy(
+                    update={
+                        "extracted_text": extraction.extracted_text[
+                            :compact_text_chars
+                        ],
+                        "tables": [],
+                        "formulas": [],
+                        "images": [],
+                    }
+                )
+                compact_body = result.body.model_copy(
+                    update={"result": compact_extraction}
+                )
+                payload = await _model_dump_json(
+                    result.model_copy(update={"body": compact_body})
+                )
+                logger.warning(
+                    "Result notification compacted to fit Kafka request limit: "
+                    "task_id=%s",
+                    result.body.task_id,
+                )
+
+            if len(payload.encode("utf-8")) > max_payload_bytes:
+                compact_error = result.body.error
+                if compact_error is not None:
+                    compact_error = compact_error.model_copy(
+                        update={
+                            "message": compact_error.message[:4096],
+                            "details": None,
+                        }
+                    )
+                compact_body = result.body.model_copy(
+                    update={"result": None, "error": compact_error}
+                )
+                payload = await _model_dump_json(
+                    result.model_copy(update={"body": compact_body})
+                )
+                logger.warning(
+                    "Result payload omitted from Kafka notification because it "
+                    "exceeded the request limit: task_id=%s",
+                    result.body.task_id,
+                )
+
+            payload_size = len(payload.encode("utf-8"))
+            if payload_size > max_payload_bytes:
+                raise ProducerException(
+                    "Result notification remains too large after compaction: "
+                    f"{payload_size} > {max_payload_bytes} bytes"
+                )
+
             await self._client.producer.send_and_wait(
                 topic=settings.kafka_result_topic,
-                value=result.model_dump_json(),
+                value=payload,
                 key=result.body.task_id,
             )
             logger.info(f"Result sent: {result.body.task_id} -> {result.body.status}")
@@ -405,9 +525,10 @@ class EventProducer:
         """
         await self._ensure_started()
         try:
+            payload = await _model_dump_json(event)
             await self._client.producer.send_and_wait(
                 topic=settings.kafka_event_topic,
-                value=event.model_dump_json(),
+                value=payload,
                 key=event.body.task_id,
             )
             logger.debug(f"Event sent: {event.body.event_type} -> {event.body.task_id}")

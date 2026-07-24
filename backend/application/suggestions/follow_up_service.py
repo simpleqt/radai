@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from backend.application.llm_content import normalize_llm_content as _normalize_content
 from backend.config.settings import settings
 from backend.application.suggestions.follow_up_prompts import (
     build_follow_up_context_prompt,
@@ -274,7 +275,14 @@ class FollowUpSuggestionService:
                 selected_skills=selected_skills,
             )
             source = "llm_context"
-        response = await model.ainvoke([HumanMessage(content=prompt)])
+        timeout_seconds = max(
+            1.0,
+            float(settings.follow_up_suggestion_timeout_ms or 30000) / 1000.0,
+        )
+        response = await asyncio.wait_for(
+            model.ainvoke([HumanMessage(content=prompt)]),
+            timeout=timeout_seconds,
+        )
         content = _normalize_content(getattr(response, "content", ""))
         suggestions = _parse_suggestions(content)
         if not suggestions:
@@ -400,6 +408,62 @@ async def persist_follow_up_to_checkpoint(
         logger.debug("[FollowUp] checkpoint persist skipped: %s", exc)
 
 
+async def persist_corrected_answer_to_checkpoint(
+    *,
+    checkpointer: Any,
+    graph: Any = None,
+    internal_thread_id: str,
+    corrected_answer: str,
+) -> None:
+    """Overwrite the latest AI message content in the LangGraph checkpoint with the corrected answer."""
+    if not corrected_answer or checkpointer is None or graph is None:
+        return
+    try:
+        config = {"configurable": {"thread_id": internal_thread_id}}
+        checkpoint = await checkpointer.aget(config)
+        if not checkpoint:
+            return
+        channel_values = checkpoint.get("channel_values", {}) or {}
+        messages = list(channel_values.get("messages", []) or [])
+        if not messages:
+            return
+
+        last_idx = None
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            role = str(getattr(msg, "type", "") or "").lower()
+            if role in {"ai", "assistant"}:
+                last_idx = idx
+                break
+        if last_idx is None:
+            return
+
+        msg = messages[last_idx]
+        if hasattr(msg, "model_copy"):
+            messages[last_idx] = msg.model_copy(update={"content": corrected_answer})
+        else:
+            msg.content = corrected_answer
+
+        from langgraph.types import Overwrite
+        state = await graph.aget_state(config)
+        as_node = state.next[0] if state and state.next else None
+        if not as_node and state and getattr(state, "created_by", None):
+            as_node = state.created_by
+        if not as_node:
+            node_names = list(getattr(graph, "nodes", {}).keys())
+            as_node = next((n for n in node_names if not n.startswith("__")), None)
+
+        update_kwargs: dict[str, Any] = {
+            "values": {"messages": Overwrite(value=messages)},
+        }
+        if as_node:
+            update_kwargs["as_node"] = as_node
+        await graph.aupdate_state(config, **update_kwargs)
+        logger.info("[FollowUp] Successfully updated checkpointer with corrected answer")
+    except Exception as exc:
+        logger.warning("[FollowUp] Failed to persist corrected answer to checkpoint: %s", exc)
+
+
 def _resolve_model_name(model_name: str | None) -> str | None:
     """与主对话一致：优先使用前端传入的模型，否则取系统默认模型。"""
     resolved = str(model_name or "").strip()
@@ -412,26 +476,11 @@ def _resolve_model_name(model_name: str | None) -> str | None:
     except Exception:
         return None
 
-
 def _truncate(text: str, limit: int) -> str:
     value = str(text or "").strip()
     if len(value) <= limit:
         return value
     return value[: limit - 1] + "…"
-
-
-def _normalize_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-        return "\n".join(parts)
-    return str(content or "")
 
 
 def _parse_suggestions(content: str) -> list[str]:

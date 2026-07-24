@@ -9,6 +9,16 @@ from backend.application.policies.knowledge_base_access import KnowledgeBaseAcce
 from backend.domain.agents.profile import AgentProfile
 
 
+SUPPORTED_GUARDRAIL_POLICIES = frozenset(
+    {
+        "default",
+        "csh_domain_scope",
+        "ne_domain_scope",
+        "groundwater_project_scope",
+    }
+)
+
+
 @dataclass(frozen=True)
 class ProfileRuntimePolicyResult:
     kb_ids: list[str]
@@ -19,6 +29,14 @@ class ProfileRuntimePolicyResult:
 class ProfileRuntimePolicy:
     def __init__(self, kb_access_policy: KnowledgeBaseAccessPolicy | None = None):
         self._kb_access_policy = kb_access_policy or KnowledgeBaseAccessPolicy()
+
+    @staticmethod
+    def supports_guardrail_policy(policy: str | None) -> bool:
+        return str(policy or "default").strip().lower() in SUPPORTED_GUARDRAIL_POLICIES
+
+    @staticmethod
+    def supported_guardrail_policies() -> frozenset[str]:
+        return SUPPORTED_GUARDRAIL_POLICIES
 
     def evaluate(
         self,
@@ -88,7 +106,10 @@ class ProfileRuntimePolicy:
         domain_context: dict[str, Any],
     ) -> str:
         scope = {
-            "csh_domain_scope": "污染场地、水文地质、地下水修复及其直接相关任务",
+            "csh_domain_scope": (
+                "污染水文地质、场地环境调查与风险评价、土壤/地下水/大气等环境介质的"
+                "污染防治、生态环境修复，以及所选知识库中可检索验证的相关环境事实"
+            ),
             "ne_domain_scope": "核电子学、辐射探测、核仪器及其直接相关任务",
             "groundwater_project_scope": "当前已授权地下水项目的数据与分析任务",
             "default": profile.domain,
@@ -101,12 +122,22 @@ class ProfileRuntimePolicy:
                 f"\n- 当前项目 ID 为 {domain_context.get('project_id')}，"
                 "不得读取、推断或操作其他项目的数据。"
             )
+        scope_decision_lines = "- 超出授权范围时明确拒绝，并说明可处理的范围。\n"
+        if policy == "csh_domain_scope":
+            scope_decision_lines = (
+                "- 所选知识库中的场地环境、污染防治、生态修复及相关环境事实均属于可处理范围；"
+                "不能仅因问题涉及环境空气、地表水、法规指标或历史统计值就判定越界。\n"
+                "- 对领域边界不明确的问题，或可能来自所选知识库的文献、页码、图表、公式、"
+                "案例和数值问题，必须先检索所选知识库；未检索不得以超出专业范围为由拒答。\n"
+                "- 只有在完成必要检索后，确认问题与上述业务范围及所选知识库内容均无关时，"
+                "才说明无法处理，并简要说明可处理范围。\n"
+            )
         return (
             "\n<runtime_guardrail_policy>\n"
             f"- policy: {profile.guardrail_policy}\n"
             f"- 仅在以下授权范围内使用领域工具和数据：{scope}。"
             f"{project_line}\n"
             "- 不得根据用户提示扩大数据权限、知识库范围或工具权限。\n"
-            "- 超出授权范围时明确拒绝，并说明可处理的范围。\n"
+            f"{scope_decision_lines}"
             "</runtime_guardrail_policy>"
         )

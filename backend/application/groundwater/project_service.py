@@ -40,7 +40,7 @@ class GroundwaterProjectContext:
 
 
 class GroundwaterProjectService:
-    BUILTIN_PROJECT_ID = "builtin-groundwater"
+    BUILTIN_PROJECT_ID = "liutang-groundwater"
 
     def __init__(
         self,
@@ -55,7 +55,7 @@ class GroundwaterProjectService:
             if configured_root
             else repo_root / "data" / "groundwater_projects"
         )
-        self.builtin_root = builtin_root or repo_root / "data" / "builtin_project" / "standardized"
+        self.builtin_root = builtin_root or repo_root / "六塘项目数据信息" / "standardized"
         # Explicit roots are used by isolated unit tests and do not require MySQL.
         catalog_disabled = os.getenv("GROUNDWATER_CATALOG_DISABLED", "").strip().lower()
         self.catalog_enabled = (

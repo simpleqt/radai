@@ -24,9 +24,9 @@ You are running with subagent capabilities enabled. Your role is to be a **task 
 2. **DELEGATE**: Launch multiple subagents simultaneously using parallel `task` calls
 3. **SYNTHESIZE**: Collect and integrate results into a coherent answer
 
-**HARD CONCURRENCY LIMIT: MAXIMUM {n} `task` CALLS PER RESPONSE.**
-- Each response may include at most {n} task tool calls. Excess calls are silently discarded.
-- For >{n} sub-tasks, split into sequential batches of ≤{n} across multiple turns.
+**HARD CONCURRENCY LIMIT: MAXIMUM {n} ACTIVE `task` CALLS.**
+- The runtime preserves delegated calls and queues work above {n}; do not rely on this queue for unrelated work.
+- Prefer batches of ≤{n} independent sub-tasks so progress remains visible and prompt context stays focused.
 
 **Available Subagents:**
 - **general-purpose**: For ANY non-trivial task — web research, code exploration, file operations, analysis, etc.
@@ -83,7 +83,7 @@ You are {agent_name}, a professional domain agent.
 
 def apply_prompt_template(
     subagent_enabled: bool = False,
-    max_concurrent_subagents: int = 3,
+    max_concurrent_subagents: int = 5,
     *,
     agent_name: str | None = None,
     available_skills: set[str] | None = None,

@@ -1,0 +1,92 @@
+{
+  "核电子学:符合定时技术": {
+    "root": {
+      "id": "n_root",
+      "title": "符合定时技术",
+      "summary": "利用核事件时间相关性实现信号筛选与符合探测的电子学技术"
+    },
+    "children": [
+      {
+        "id": "n_e7b64dbd9d",
+        "title": "符合定时原理",
+        "summary": "基于核事件时间相关性，通过时间窗口筛选同时发生的信号对",
+        "expandable": true
+      },
+      {
+        "id": "n_c0ee776d18",
+        "title": "定时方法",
+        "summary": "实现精确时间测量的技术手段，包括前沿定时、恒比定时等",
+        "expandable": true
+      },
+      {
+        "id": "n_164d8c0ef6",
+        "title": "时间分辨率",
+        "summary": "衡量符合系统时间精度的关键指标，受多因素影响",
+        "expandable": true
+      },
+      {
+        "id": "n_f2c5911373",
+        "title": "符合电路",
+        "summary": "实现符合判别功能的电子学模块，处理时间与逻辑关系",
+        "expandable": true
+      },
+      {
+        "id": "n_ea56af1ec3",
+        "title": "符合类型",
+        "summary": "区分真符合、随机符合和散射符合等不同符合事件",
+        "expandable": true
+      },
+      {
+        "id": "n_3ffc6ade0d",
+        "title": "应用领域",
+        "summary": "在PET成像、谱仪系统等核探测场景中的实际应用",
+        "expandable": true
+      }
+    ]
+  },
+  "场地污染水文地质:抽出处理": {
+    "root": {
+      "id": "n_root",
+      "title": "抽出处理",
+      "summary": "通过抽提并处理污染地下水以去除污染物的修复技术。"
+    },
+    "children": [
+      {
+        "id": "n_1eb2bfabc7",
+        "title": "抽提系统设计",
+        "summary": "设计抽水井和泵系统以有效提取污染地下水。",
+        "expandable": true
+      },
+      {
+        "id": "n_323041c854",
+        "title": "处理工艺选择",
+        "summary": "选择合适的物理、化学或生物方法处理抽出水。",
+        "expandable": true
+      },
+      {
+        "id": "n_246f52b9a3",
+        "title": "监测与评估",
+        "summary": "监测污染物浓度变化，评估处理效果和系统性能。",
+        "expandable": true
+      },
+      {
+        "id": "n_7b152b8e72",
+        "title": "运营与维护",
+        "summary": "确保系统持续运行，进行日常维护和优化。",
+        "expandable": true
+      },
+      {
+        "id": "n_ebc776c03b",
+        "title": "环境影响管理",
+        "summary": "管理处理过程中的二次污染和环境风险。",
+        "expandable": true
+      },
+      {
+        "id": "n_5f7643eda3",
+        "title": "法规与标准",
+        "summary": "遵守相关环境法规，确保处理达标排放。",
+        "expandable": true
+      }
+    ]
+  }
+}

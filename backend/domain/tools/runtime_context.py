@@ -13,6 +13,9 @@ class ToolRuntimeContext:
     agent_code: str
     domain: str
     thread_id: str
+    # Authenticated role/claims are injected by the application service.  Tool
+    # arguments and public metadata must never be used to derive this value.
+    role: str = "user"
     permissions: dict[str, Any] = field(default_factory=dict)
     time_context: str = ""
     request_metadata: dict[str, Any] = field(default_factory=dict)

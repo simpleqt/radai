@@ -2,114 +2,212 @@ tools:
   multi_kb_search:
     provider: backend.application.tools.providers.multi_kb_search_tool:multi_kb_search_tool
     description: 搜索当前请求范围内的知识库并返回证据片段
-    domains: [nuclear-electronics, csh-hydrogeology, groundwater-project-analysis]
+    domains: ["*"]
     workflows: [lightweight, full, deep_research, plan_solve]
     required_skills: []
     risk_level: safe
     enabled_by_default: true
+    instructions: 仅在需要从当前授权知识库获取证据片段时调用；不得绕过运行时 kb_ids 范围。
+    timeout_seconds: 60
+    side_effect: none
+    policy_source: registry:multi_kb_search
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 8
+    max_attempts: 2
+    retryable_errors: [timeout, connection, unavailable]
+    max_output_chars: 30000
+    cache_enabled: true
+    cache_ttl_seconds: 300
 
   chat_file_search:
     provider: backend.application.tools.providers.chat_file_search_tool:create_scoped_chat_file_search_tool
     description: 检索当前会话上传的长文档索引
-    domains: [nuclear-electronics, csh-hydrogeology, groundwater-project-analysis]
+    domains: ["*"]
     workflows: [lightweight, full, deep_research, plan_solve]
     required_skills: []
     risk_level: safe
     enabled_by_default: true
+    timeout_seconds: 30
+    side_effect: none
+    policy_source: registry:chat_file_search
+    max_concurrency: 8
+    max_output_chars: 30000
+
+  read_context_artifact:
+    provider: backend.application.tools.providers.context_artifact_tool:get_scoped_read_context_artifact_tool
+    description: 读取上下文压缩阶段保存的大结果 artifact 引用
+    domains: ["*"]
+    workflows: [full, deep_research, plan_solve]
+    required_skills: []
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 仅当需要核查 ContextItem.raw_ref 或 handoff.raw_artifact_refs 的原始大结果时调用；返回内容必须受 max_chars 限制。
+    timeout_seconds: 15
+    side_effect: none
+    policy_source: registry:read_context_artifact
+    max_concurrency: 8
+    max_output_chars: 30000
 
   web_search:
     provider: backend.application.tools.providers.async_web_search_tool:get_async_web_search_tool
     description: 联网搜索公开网页信息
-    domains: [nuclear-electronics, csh-hydrogeology, groundwater-project-analysis]
-    workflows: [full, deep_research, plan_solve]
+    domains: ["*"]
+    workflows: [lightweight, full, deep_research, plan_solve]
     required_skills: []
     risk_level: network
     enabled_by_default: false
+    instructions: 仅在问题需要最新或外部公开信息时调用；结果必须回到证据链并标注来源。
+    timeout_seconds: 45
+    side_effect: external_read
+    policy_source: registry:web_search
+    max_concurrency: 8
+    # Firecrawl's provider already owns its two bounded attempts.  Retrying the
+    # whole provider here multiplies one logical web_search into four network
+    # attempts and can consume the branch's entire retrieval window.
+    max_attempts: 1
+    retryable_errors: [timeout, connection, rate_limited, unavailable]
+    max_output_chars: 30000
+    cache_enabled: true
+    cache_ttl_seconds: 300
 
   academic_search:
     provider: backend.application.tools.providers.academic_search_tool:academic_search
     description: 学术检索工具
-    domains: [nuclear-electronics, csh-hydrogeology]
+    domains: [nuclear-electronics, csh-hydrogeology, fundamental-mechanics-course]
     workflows: [full, deep_research, plan_solve]
-    required_skills: [academic-search]
+    required_skills: [academic-search, paper-review]
     risk_level: network
     enabled_by_default: false
+    instructions: 仅在学术论文、标准或研究证据不足时调用；优先返回可引用来源。
+    timeout_seconds: 60
+    side_effect: external_read
+    policy_source: registry:academic_search
+    max_concurrency: 4
+    max_attempts: 2
+    retryable_errors: [timeout, connection, rate_limited, unavailable]
+    max_output_chars: 30000
+    cache_enabled: true
+    cache_ttl_seconds: 900
 
   generate_html_ppt:
     provider: backend.application.tools.providers.html_ppt_tool:generate_html_ppt_tool
     description: 生成 HTML/PPT 风格演示产物
-    domains: [nuclear-electronics, csh-hydrogeology]
+    domains: [nuclear-electronics, csh-hydrogeology, fundamental-mechanics-course]
     workflows: [full, deep_research]
     required_skills: [html-ppt]
     risk_level: write
     enabled_by_default: false
-
-  excel_data_analysis:
-    provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
-    description: Excel 实验数据分析工具集
-    domains: [nuclear-electronics, csh-hydrogeology]
-    workflows: [full, deep_research]
-    required_skills: [general-table-analysis, excel-experiment-analysis]
-    risk_level: safe
-    enabled_by_default: false
+    instructions: 仅在用户明确需要演示产物时调用；写入内容必须来自当前任务上下文。
+    timeout_seconds: 120
+    side_effect: artifact_write
+    policy_source: registry:generate_html_ppt
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 2
+    max_output_chars: 10000
 
   list_experiment_datasets:
     provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
     description: 列出可用实验数据集
-    domains: [nuclear-electronics, csh-hydrogeology]
+    domains: [nuclear-electronics, csh-hydrogeology, fundamental-mechanics-course]
     workflows: [full, deep_research]
     required_skills: [general-table-analysis, excel-experiment-analysis]
     risk_level: safe
     enabled_by_default: false
+    timeout_seconds: 20
+    side_effect: local_read
+    policy_source: registry:list_experiment_datasets
+    max_concurrency: 4
+    max_output_chars: 20000
 
   inspect_excel_data:
     provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
     description: 查看 Excel 数据结构和字段信息
-    domains: [nuclear-electronics, csh-hydrogeology]
-    workflows: [full, deep_research]
+    domains: [nuclear-electronics, csh-hydrogeology, fundamental-mechanics-course]
+    workflows: [lightweight, full, deep_research]
     required_skills: [general-table-analysis, excel-experiment-analysis]
     risk_level: safe
     enabled_by_default: false
+    timeout_seconds: 20
+    side_effect: local_read
+    policy_source: registry:inspect_excel_data
+    max_concurrency: 4
+    max_output_chars: 20000
 
   query_excel_data:
     provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
     description: 使用 SQL 查询 Excel 数据
-    domains: [nuclear-electronics, csh-hydrogeology]
-    workflows: [full, deep_research]
+    domains: [nuclear-electronics, csh-hydrogeology, fundamental-mechanics-course]
+    workflows: [lightweight, full, deep_research]
     required_skills: [general-table-analysis, excel-experiment-analysis]
     risk_level: safe
     enabled_by_default: false
+    timeout_seconds: 45
+    side_effect: compute
+    policy_source: registry:query_excel_data
+    max_concurrency: 4
+    max_output_chars: 30000
 
   summarize_excel_data:
     provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
     description: 汇总分析 Excel 数据
-    domains: [nuclear-electronics, csh-hydrogeology]
-    workflows: [full, deep_research]
+    domains: [nuclear-electronics, csh-hydrogeology, fundamental-mechanics-course]
+    workflows: [lightweight, full, deep_research]
     required_skills: [general-table-analysis, excel-experiment-analysis]
     risk_level: safe
     enabled_by_default: false
+    timeout_seconds: 45
+    side_effect: compute
+    policy_source: registry:summarize_excel_data
+    max_concurrency: 4
+    max_output_chars: 30000
 
   visualize_excel_data:
     provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
     description: 生成 Excel 数据可视化图表
-    domains: [nuclear-electronics, csh-hydrogeology]
-    workflows: [full, deep_research]
+    domains: [nuclear-electronics, csh-hydrogeology, fundamental-mechanics-course]
+    workflows: [lightweight, full, deep_research]
     required_skills: [general-table-analysis, excel-experiment-analysis]
-    risk_level: safe
+    risk_level: write
     enabled_by_default: false
+    timeout_seconds: 60
+    side_effect: artifact_write
+    policy_source: registry:visualize_excel_data
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 2
+    max_output_chars: 10000
 
   save_deep_research_report:
     provider: backend.application.tools.providers.deep_research_report_tool:save_deep_research_report_tool
     description: 保存深度研究报告工件
-    domains: [nuclear-electronics, csh-hydrogeology]
+    domains: [nuclear-electronics, csh-hydrogeology, fundamental-mechanics-course]
     workflows: [deep_research, plan_solve]
     required_skills: [deep-research]
     risk_level: write
     enabled_by_default: false
+    instructions: 仅在深度研究写作完成后保存最终报告；文件名必须使用安全名称。
+    timeout_seconds: 120
+    side_effect: artifact_write
+    policy_source: registry:save_deep_research_report
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 2
+    max_output_chars: 10000
 
   groundwater_project_skill_read:
     provider: backend.application.tools.providers.groundwater_project_tools:get_groundwater_project_skill_read_tool
     description: 读取当前地下水项目的 Skill、清单、背景和标准化数据
+    domains: [groundwater-project-analysis]
+    workflows: [full]
+    required_skills: [groundwater-project-analysis]
+    risk_level: safe
+    enabled_by_default: true
+
+  groundwater_project_bootstrap:
+    provider: backend.application.tools.providers.groundwater_project_tools:get_groundwater_project_bootstrap_tool
+    description: 加载当前地下水项目的真实表、字段、质量摘要和选表路径
     domains: [groundwater-project-analysis]
     workflows: [full]
     required_skills: [groundwater-project-analysis]
@@ -154,7 +252,16 @@ tools:
 
   groundwater_quality_check:
     provider: backend.application.tools.providers.groundwater_project_tools:get_groundwater_quality_check_tool
-    description: 检查当前项目数据质量、坐标确认状态和疑似错误记录
+    description: 检查当前项目数据质量；传入点位时按地下水 IV 类限值快速判断水质超标
+    domains: [groundwater-project-analysis]
+    workflows: [full]
+    required_skills: [groundwater-project-analysis]
+    risk_level: safe
+    enabled_by_default: true
+
+  groundwater_kml_summary:
+    provider: backend.application.tools.providers.groundwater_project_tools:get_groundwater_kml_summary_tool
+    description: 汇总和筛选当前项目 KML 地物、分组、坐标范围及重复名称
     domains: [groundwater-project-analysis]
     workflows: [full]
     required_skills: [groundwater-project-analysis]

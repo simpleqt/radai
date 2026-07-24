@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any
@@ -13,6 +14,22 @@ from backend.db.connection import get_async_session_factory
 from backend.db.models import Conversation, User
 
 logger = logging.getLogger(__name__)
+
+
+class ConversationStateError(RuntimeError):
+    """Raised when a thread cannot be safely reused by an agent request."""
+
+
+class ConversationAgentMismatchError(ConversationStateError):
+    """The external thread already belongs to another agent profile."""
+
+
+class ConversationDeletedError(ConversationStateError):
+    """A deleted thread id must not be revived with stale checkpoint state."""
+
+
+class ConversationBusyError(ConversationStateError):
+    """Another request currently owns the conversation row lock."""
 
 
 class ConversationStore:
@@ -31,8 +48,11 @@ class ConversationStore:
         session_factory = get_async_session_factory()
         async with session_factory() as session:
             try:
-                user_result = await session.execute(
-                    select(User.user_id).where(User.user_id == user_id)
+                user_result = await asyncio.wait_for(
+                    session.execute(
+                        select(User.user_id).where(User.user_id == user_id)
+                    ),
+                    timeout=10.0,
                 )
                 if user_result.scalar_one_or_none() is None:
                     logger.info(
@@ -42,13 +62,11 @@ class ConversationStore:
                     )
                     return
 
-                result = await session.execute(
-                    select(Conversation).where(
-                        Conversation.thread_id == thread_id,
-                        Conversation.user_id == user_id,
-                    )
+                conversation = await self._lock_conversation(
+                    session,
+                    user_id=user_id,
+                    thread_id=thread_id,
                 )
-                conversation = result.scalar_one_or_none()
                 title = self._title_from_question(question)
                 now = datetime.now()
 
@@ -60,6 +78,7 @@ class ConversationStore:
                         metadata_=self._build_metadata(
                             agent_code=agent_code,
                             workflow_name=workflow_name,
+                            question=question,
                             metadata=metadata,
                         ),
                     )
@@ -76,16 +95,17 @@ class ConversationStore:
                         return
                     except IntegrityError:
                         await session.rollback()
-                        result = await session.execute(
-                            select(Conversation).where(
-                                Conversation.thread_id == thread_id,
-                                Conversation.user_id == user_id,
-                            )
+                        conversation = await self._lock_conversation(
+                            session,
+                            user_id=user_id,
+                            thread_id=thread_id,
                         )
-                        conversation = result.scalar_one_or_none()
                         if conversation is None:
-                            user_result = await session.execute(
-                                select(User.user_id).where(User.user_id == user_id)
+                            user_result = await asyncio.wait_for(
+                                session.execute(
+                                    select(User.user_id).where(User.user_id == user_id)
+                                ),
+                                timeout=10.0,
                             )
                             if user_result.scalar_one_or_none() is None:
                                 logger.info(
@@ -96,17 +116,26 @@ class ConversationStore:
                                 return
                             raise
 
-                changed = False
                 if conversation.is_deleted:
-                    conversation.is_deleted = False
-                    conversation.title = title
-                    changed = True
+                    raise ConversationDeletedError(
+                        f"Conversation thread has been deleted: {thread_id}"
+                    )
+
+                base_meta = dict(conversation.metadata_ or {})
+                runtime_meta = dict(base_meta.get("agent_runtime") or {})
+                owner_agent_code = str(runtime_meta.get("agent_code") or "").strip().lower()
+                requested_agent_code = str(agent_code or "").strip().lower()
+                if owner_agent_code and owner_agent_code != requested_agent_code:
+                    raise ConversationAgentMismatchError(
+                        "Conversation thread belongs to a different agent: "
+                        f"thread_id={thread_id} owner={owner_agent_code} requested={requested_agent_code}"
+                    )
+
+                changed = False
                 if not conversation.title or conversation.title == "新对话":
                     conversation.title = title
                     changed = True
 
-                base_meta = dict(conversation.metadata_ or {})
-                runtime_meta = dict(base_meta.get("agent_runtime") or {})
                 runtime_meta.update(
                     {
                         "agent_code": agent_code,
@@ -131,6 +160,9 @@ class ConversationStore:
                         agent_code,
                         workflow_name,
                     )
+            except ConversationStateError:
+                await session.rollback()
+                raise
             except Exception:
                 logger.exception(
                     "[ConversationStore] 运行时会话记录保存失败: user_id=%s thread_id=%s agent=%s workflow=%s",
@@ -142,19 +174,108 @@ class ConversationStore:
                 try:
                     await session.rollback()
                 except Exception:
-                    pass
+                    logger.warning(
+                        "[ConversationStore] 运行时会话回滚失败: user_id=%s thread_id=%s",
+                        user_id,
+                        thread_id,
+                        exc_info=True,
+                    )
+                # AgentService deliberately fails closed when the runtime
+                # conversation cannot be recorded.  Swallowing this exception
+                # made the service continue with an unpersisted turn and
+                # produced stream/refresh divergence.
+                raise
+
+    async def update_conversation_images(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        registered_images: dict[str, Any],
+    ) -> None:
+        if not registered_images:
+            return
+        session_factory = get_async_session_factory()
+        async with session_factory() as session:
+            try:
+                conversation = await self._lock_conversation(
+                    session,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                )
+                if conversation is None:
+                    return
+
+                base_meta = dict(conversation.metadata_ or {})
+                existing_images = dict(base_meta.get("registered_images") or {})
+                existing_images.update(registered_images)
+                base_meta["registered_images"] = existing_images
+                conversation.metadata_ = base_meta
+                conversation.updated_at = datetime.now()
+                await session.commit()
+                logger.info(
+                    "[ConversationStore] 已更新会话图片注册表: user_id=%s thread_id=%s count=%d",
+                    user_id,
+                    thread_id,
+                    len(existing_images),
+                )
+            except Exception:
+                logger.exception(
+                    "[ConversationStore] 更新会话图片注册表失败: user_id=%s thread_id=%s",
+                    user_id,
+                    thread_id,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.warning(
+                        "[ConversationStore] 图片注册表回滚失败: user_id=%s thread_id=%s",
+                        user_id,
+                        thread_id,
+                        exc_info=True,
+                    )
+                raise
+
+    async def _lock_conversation(
+        self,
+        session,
+        *,
+        user_id: str,
+        thread_id: str,
+    ) -> Conversation | None:
+        """Acquire a row lock for the conversation, waiting if another request holds it.
+
+        Prefer plain ``FOR UPDATE`` over ``SKIP LOCKED``: many MySQL/MariaDB
+        deployments in this environment do not support ``SKIP LOCKED`` and reject
+        the statement with SQL syntax error 1064, which surfaces as
+        ``conversation_persistence_unavailable`` to the client.
+        """
+
+        predicate = (
+            Conversation.thread_id == thread_id,
+            Conversation.user_id == user_id,
+        )
+        result = await asyncio.wait_for(
+            session.execute(
+                select(Conversation).where(*predicate).with_for_update()
+            ),
+            timeout=10.0,
+        )
+        return result.scalar_one_or_none()
 
     def _build_metadata(
         self,
         *,
         agent_code: str,
         workflow_name: str,
+        question: str,
         metadata: dict[str, Any] | None,
     ) -> dict[str, Any]:
         return {
             "agent_runtime": {
                 "agent_code": agent_code,
                 "workflow_name": workflow_name,
+                "last_question": str(question or "")[:500],
                 "request_metadata": metadata or {},
                 "created_at": datetime.now().isoformat(),
             }

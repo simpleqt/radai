@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import os
 import uuid
@@ -29,9 +30,10 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 
-from backend.api.dependencies.auth import ApiKeyAuth, verify_api_key as get_api_key_auth
+from backend.api.dependencies.auth import ApiKeyAuth, require_admin, verify_api_key as get_api_key_auth
+from backend.api.upload_utils import UploadTooLargeError, read_upload_with_limit
 from backend.config.loggers import get_logger
 from backend.db.connection import get_async_session_factory
 
@@ -61,6 +63,16 @@ class DatasetCreateRequest(BaseModel):
     is_public: bool = True
 
 
+class DatasetUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    domain: Optional[str] = None
+    tags: Optional[List[str]] = None
+    agent_codes: Optional[List[str]] = None
+    is_public: Optional[bool] = None
+    status: Optional[str] = None
+
+
 class SetAgentCodesRequest(BaseModel):
     agent_codes: List[str]
 
@@ -83,6 +95,7 @@ def _to_response(ds: Any) -> dict:
         "is_public": ds.is_public,
         "status": ds.status,
         "created_at": ds.created_at.isoformat() if ds.created_at else None,
+        "updated_at": ds.updated_at.isoformat() if ds.updated_at else None,
     }
 
 
@@ -129,6 +142,21 @@ def _parse_schema(file_path: str) -> dict:
     except Exception as e:
         logger.warning("[DatasetsAPI] schema 解析失败: %s", e)
         return {}
+
+
+def _parse_preview(file_path: str, *, sheet: Optional[str], rows: int) -> dict:
+    """Parse a bounded dataset preview outside the event-loop thread."""
+    import pandas as pd
+
+    ext = Path(file_path).suffix.lower()
+    if ext == ".csv":
+        df = pd.read_csv(file_path, nrows=rows)
+        return {"data": df.to_dict(orient="records")}
+
+    sheets = pd.read_excel(file_path, sheet_name=None, nrows=rows)
+    if sheet and sheet in sheets:
+        return {sheet: sheets[sheet].to_dict(orient="records")}
+    return {name: frame.to_dict(orient="records") for name, frame in sheets.items()}
 
 
 async def _upload_content_to_minio(content: bytes, filename: str, ext: str) -> Optional[str]:
@@ -182,6 +210,8 @@ async def list_datasets(
     domain: Optional[str] = None,
     agent_code: Optional[str] = None,
     status: str = "active",
+    offset: int = 0,
+    limit: int = 100,
     auth: ApiKeyAuth = Depends(get_api_key_auth),
 ):
     """列出数据集，支持按领域和智能体过滤。
@@ -190,14 +220,21 @@ async def list_datasets(
     """
     from backend.db.crud.dataset_crud import DatasetCRUD
 
+    is_admin = (auth.role or "").lower() == "admin"
+    normalized_status = None if is_admin and status in {"", "all"} else status
+    if not normalized_status:
+        normalized_status = "active"
+
     factory = get_async_session_factory()
     async with factory() as session:
         datasets = await DatasetCRUD.list_all(
             session,
             domain=domain,
             agent_code=agent_code,
-            status=status,
-            is_public=True if auth.role != "admin" else None,
+            status=normalized_status,
+            is_public=True if not is_admin else None,
+            offset=max(0, offset),
+            limit=min(500, max(1, limit)),
         )
     return {"total": len(datasets), "datasets": [_to_response(ds) for ds in datasets]}
 
@@ -206,6 +243,8 @@ async def list_datasets(
 async def list_datasets_by_agent(
     agent_code: str,
     status: str = "active",
+    offset: int = 0,
+    limit: int = 100,
     auth: ApiKeyAuth = Depends(get_api_key_auth),
 ):
     """返回 agent_code 对应智能体可见的所有数据集（全局 + 专属）"""
@@ -214,7 +253,12 @@ async def list_datasets_by_agent(
     factory = get_async_session_factory()
     async with factory() as session:
         datasets = await DatasetCRUD.list_all(
-            session, agent_code=agent_code, status=status, is_public=True,
+            session,
+            agent_code=agent_code,
+            status=status,
+            is_public=True,
+            offset=max(0, offset),
+            limit=min(500, max(1, limit)),
         )
     return {"agent_code": agent_code, "total": len(datasets), "datasets": [_to_response(ds) for ds in datasets]}
 
@@ -231,13 +275,15 @@ async def get_dataset(
         ds = await DatasetCRUD.get_by_id(session, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="数据集不存在")
+    if (auth.role or "").lower() != "admin" and (not ds.is_public or ds.status != "active"):
+        raise HTTPException(status_code=403, detail="无权访问该数据集")
     return _to_response(ds)
 
 
 @router.post("/datasets", summary="注册新数据集（引用已有本地/MinIO 文件）")
 async def create_dataset(
     req: DatasetCreateRequest,
-    auth: ApiKeyAuth = Depends(get_api_key_auth),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     from backend.db.crud.dataset_crud import DatasetCRUD
 
@@ -264,7 +310,7 @@ async def create_dataset(
 
         # 解析 schema（本地文件才能解析）
         if req.storage_type == "local":
-            schema = _parse_schema(req.file_path)
+            schema = await asyncio.to_thread(_parse_schema, req.file_path)
             if schema:
                 await DatasetCRUD.update_metadata(
                     session, ds.id,
@@ -278,6 +324,28 @@ async def create_dataset(
     return _to_response(ds)
 
 
+@router.put("/datasets/{dataset_id}", summary="更新实验数据集元数据与权限")
+async def update_dataset(
+    dataset_id: str,
+    req: DatasetUpdateRequest,
+    auth: ApiKeyAuth = Depends(require_admin),
+):
+    """更新数据集基础信息、用户可见范围和智能体绑定。"""
+    from backend.db.crud.dataset_crud import DatasetCRUD
+
+    updates = req.model_dump(exclude_unset=True)
+    allowed_statuses = {"active", "archived", "processing", "error"}
+    if "status" in updates and updates["status"] not in allowed_statuses:
+        raise HTTPException(status_code=400, detail=f"不支持的数据集状态: {updates['status']}")
+
+    factory = get_async_session_factory()
+    async with factory() as session:
+        ds = await DatasetCRUD.update_details(session, dataset_id, **updates)
+    if not ds:
+        raise HTTPException(status_code=404, detail="数据集不存在")
+    return _to_response(ds)
+
+
 @router.post("/datasets/upload", summary="上传 Excel/CSV 文件并注册数据集（优先存 MinIO）")
 async def upload_dataset(
     file: UploadFile = File(...),
@@ -288,7 +356,7 @@ async def upload_dataset(
     tags: str = Form("[]"),
     agent_codes: str = Form("[]"),
     is_public: bool = Form(True),
-    auth: ApiKeyAuth = Depends(get_api_key_auth),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     """上传 Excel/CSV 数据集文件：
     1. 文件优先上传到 MinIO（storage_type=minio）
@@ -301,9 +369,12 @@ async def upload_dataset(
     if ext not in _ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"不支持的文件类型: {ext}，仅支持 xlsx/xls/csv")
 
-    content = await file.read()
-    if len(content) > _MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="文件过大，最大支持 100MB")
+    try:
+        content = await read_upload_with_limit(file, _MAX_FILE_SIZE)
+    except UploadTooLargeError as exc:
+        raise HTTPException(status_code=413, detail="文件过大，最大支持 100MB") from exc
+    if not content:
+        raise HTTPException(status_code=400, detail="文件不能为空")
 
     try:
         tags_list = _json.loads(tags) if tags.strip() else []
@@ -321,7 +392,7 @@ async def upload_dataset(
         stored_path = minio_object
         storage_type = "minio"
     else:
-        stored_path = _save_local_fallback(content, ext)
+        stored_path = await asyncio.to_thread(_save_local_fallback, content, ext)
         storage_type = "local"
 
     factory = get_async_session_factory()
@@ -346,16 +417,16 @@ async def upload_dataset(
         )
 
         # 解析 schema（本地文件直接解析；MinIO 文件写临时文件后解析）
+        tmp_path: str | None = None
         try:
             if storage_type == "local":
-                schema = _parse_schema(stored_path)
+                schema = await asyncio.to_thread(_parse_schema, stored_path)
             else:
                 import tempfile
                 with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
                     tmp.write(content)
                     tmp_path = tmp.name
-                schema = _parse_schema(tmp_path)
-                Path(tmp_path).unlink(missing_ok=True)
+                schema = await asyncio.to_thread(_parse_schema, tmp_path)
 
             if schema:
                 await DatasetCRUD.update_metadata(
@@ -368,6 +439,9 @@ async def upload_dataset(
                 await session.refresh(ds)
         except Exception as e:
             logger.warning("[DatasetsAPI] schema 解析失败（不影响注册）: %s", e)
+        finally:
+            if tmp_path is not None:
+                await asyncio.to_thread(Path(tmp_path).unlink, missing_ok=True)
 
     logger.info("[DatasetsAPI] 上传成功: code=%s, storage=%s", code, storage_type)
     return _to_response(ds)
@@ -380,7 +454,6 @@ async def preview_dataset(
     rows: int = 20,
     auth: ApiKeyAuth = Depends(get_api_key_auth),
 ):
-    import pandas as pd
     from backend.db.crud.dataset_crud import DatasetCRUD
 
     factory = get_async_session_factory()
@@ -388,25 +461,20 @@ async def preview_dataset(
         ds = await DatasetCRUD.get_by_id(session, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="数据集不存在")
+    if (auth.role or "").lower() != "admin" and (not ds.is_public or ds.status != "active"):
+        raise HTTPException(status_code=403, detail="无权访问该数据集")
 
-    local_path = _get_local_file(ds)
+    local_path = await asyncio.to_thread(_get_local_file, ds)
     if not local_path:
         raise HTTPException(status_code=404, detail="数据集文件不可访问（MinIO 下载失败或本地文件不存在）")
 
     rows = min(rows, 200)
     try:
-        ext = Path(local_path).suffix.lower()
-        if ext == ".csv":
-            df = pd.read_csv(local_path, nrows=rows)
-            sheet_data = {"data": df.to_dict(orient="records")}
-        else:
-            sheets = pd.read_excel(local_path, sheet_name=None, nrows=rows)
-            if sheet and sheet in sheets:
-                sheet_data = {sheet: sheets[sheet].to_dict(orient="records")}
-            else:
-                sheet_data = {k: v.to_dict(orient="records") for k, v in sheets.items()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"读取文件失败: {e}")
+        sheet_data = await asyncio.to_thread(
+            _parse_preview, local_path, sheet=sheet, rows=rows
+        )
+    except Exception:
+        raise HTTPException(status_code=500, detail="读取文件失败")
 
     return {
         "dataset_id": dataset_id,
@@ -420,7 +488,7 @@ async def preview_dataset(
 @router.post("/datasets/{dataset_id}/refresh", summary="重新解析数据集 schema")
 async def refresh_dataset_schema(
     dataset_id: str,
-    auth: ApiKeyAuth = Depends(get_api_key_auth),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     from backend.db.crud.dataset_crud import DatasetCRUD
     from backend.application.tools.providers.excel_engine import invalidate_cache
@@ -436,11 +504,11 @@ async def refresh_dataset_schema(
         except Exception:
             pass
 
-        local_path = _get_local_file(ds)
+        local_path = await asyncio.to_thread(_get_local_file, ds)
         if not local_path:
             raise HTTPException(status_code=404, detail="数据集文件不可访问")
 
-        schema = _parse_schema(local_path)
+        schema = await asyncio.to_thread(_parse_schema, local_path)
         if not schema:
             raise HTTPException(status_code=500, detail="schema 解析失败")
 
@@ -460,7 +528,7 @@ async def refresh_dataset_schema(
 async def set_dataset_agents(
     dataset_id: str,
     req: SetAgentCodesRequest,
-    auth: ApiKeyAuth = Depends(get_api_key_auth),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     """设置数据集对哪些智能体可见。
     
@@ -483,7 +551,7 @@ async def set_dataset_agents(
 async def delete_dataset(
     dataset_id: str,
     delete_file: bool = False,
-    auth: ApiKeyAuth = Depends(get_api_key_auth),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     """物理删除数据集记录。
     
@@ -515,10 +583,10 @@ async def delete_dataset(
                     secure=getattr(settings, "minio_secure", False),
                 )
                 bucket = get_user_minio_bucket_name()
-                client.remove_object(bucket, file_path)
+                await asyncio.to_thread(client.remove_object, bucket, file_path)
                 logger.info("[DatasetsAPI] MinIO 对象已删除: %s", file_path)
             else:
-                Path(file_path).unlink(missing_ok=True)
+                await asyncio.to_thread(Path(file_path).unlink, missing_ok=True)
                 logger.info("[DatasetsAPI] 本地文件已删除: %s", file_path)
         except Exception as e:
             logger.warning("[DatasetsAPI] 文件删除失败（记录已删除）: %s", e)

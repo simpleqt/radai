@@ -92,7 +92,7 @@ async def call_rerank_api(
         rerank_endpoint = f"{api_base}/reranks"
     
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(trust_env=False, timeout=60.0) as client:
             resp = await client.post(
                 rerank_endpoint,
                 json={
@@ -289,7 +289,25 @@ def time_aware_fusion(
         beta_doc = float(chunk.get("_doc_time_confidence", 0.0))
         beta_doc = max(0.0, min(1.0, beta_doc))
 
-        if not valid_flags[i] or beta_doc <= 0.0:
+        if not valid_flags[i]:
+            if beta_doc > 0.0:
+                # Soft fallback for missing date: assign a neutral default time score (e.g. 0.7)
+                time_score = 0.7
+                gate = alpha_time * beta_doc
+                final_score = (1.0 - gate) * semantic_score + gate * time_score
+                chunk["_time_score"] = time_score
+                chunk["_time_alpha"] = alpha_time
+                chunk["_time_beta"] = beta_doc
+                chunk["_fused_score"] = final_score
+                continue
+            else:
+                chunk["_time_score"] = 0.0
+                chunk["_time_alpha"] = alpha_time
+                chunk["_time_beta"] = beta_doc
+                chunk["_fused_score"] = semantic_score
+                continue
+
+        if beta_doc <= 0.0:
             chunk["_time_score"] = 0.0
             chunk["_time_alpha"] = alpha_time
             chunk["_time_beta"] = beta_doc

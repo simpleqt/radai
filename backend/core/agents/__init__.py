@@ -1,11 +1,63 @@
 """Core agent infrastructure — graph factory, state, features."""
 
+from backend.core.agents.control import (
+    AgentBudgetExceededError,
+    AgentCancellationToken,
+    AgentCapacityError,
+    AgentControl,
+    AgentControlError,
+    AgentControlLimits,
+    AgentDepthError,
+    AgentInfo,
+    AgentNotFoundError,
+    AgentRuntimeManager,
+    AgentStateError,
+    AgentStateMachine,
+    AgentStatus,
+    InMemoryAgentRuntimeManager,
+    RunBudget,
+    RunBudgetSnapshot,
+    get_agent_control,
+    get_agent_runtime_manager,
+    get_current_agent_id,
+)
 from backend.core.agents.factory import create_agent_graph
 from backend.core.agents.features import Next, Prev, RuntimeFeatures
+from backend.core.agents.runtime_manager import (
+    create_agent_runtime_manager,
+    create_agent_runtime_store_from_env,
+    get_live_agent_runtime_manager,
+    register_agent_runtime_manager,
+    unregister_agent_runtime_manager,
+)
 from backend.core.agents.state import ThreadState
 
 __all__ = [
+    "AgentBudgetExceededError",
+    "AgentCapacityError",
+    "AgentControl",
+    "AgentControlError",
+    "AgentControlLimits",
+    "AgentCancellationToken",
+    "AgentDepthError",
+    "AgentInfo",
+    "AgentNotFoundError",
+    "AgentRuntimeManager",
+    "AgentStateError",
+    "AgentStateMachine",
+    "AgentStatus",
+    "InMemoryAgentRuntimeManager",
+    "RunBudget",
+    "RunBudgetSnapshot",
+    "create_agent_runtime_manager",
+    "create_agent_runtime_store_from_env",
+    "get_live_agent_runtime_manager",
+    "register_agent_runtime_manager",
+    "unregister_agent_runtime_manager",
     "create_agent_graph",
+    "get_current_agent_id",
+    "get_agent_control",
+    "get_agent_runtime_manager",
     "RuntimeFeatures",
     "Next",
     "Prev",

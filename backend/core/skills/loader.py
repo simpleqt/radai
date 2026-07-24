@@ -19,6 +19,10 @@ def get_skills_root_path() -> Path:
     return current.parents[3] / "backend" / "skills"
 
 
+def get_managed_skills_root_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "data" / "managed_skills"
+
+
 def load_skills(
     skills_path: Path | None = None, enabled_only: bool = False
 ) -> list[Skill]:
@@ -27,13 +31,13 @@ def load_skills(
     if not skills_path.exists():
         return []
 
-    skills: list[Skill] = []
+    skills_by_name: dict[str, Skill] = {}
     for category in ["public", "custom"]:
         category_path = skills_path / category
         if not category_path.exists() or not category_path.is_dir():
             continue
         for current_root, dir_names, file_names in os.walk(
-            category_path, followlinks=True
+            category_path, followlinks=False
         ):
             dir_names[:] = sorted(
                 name for name in dir_names if not name.startswith(".")
@@ -46,7 +50,11 @@ def load_skills(
                 skill_file, category=category, relative_path=relative_path
             )
             if skill:
-                skills.append(skill)
+                # Within one root custom is the explicit override for public;
+                # deterministic sorting keeps nested packages reproducible.
+                skills_by_name[skill.name] = skill
+
+    skills = list(skills_by_name.values())
 
     try:
         from backend.core.config.extensions_config import ExtensionsConfig

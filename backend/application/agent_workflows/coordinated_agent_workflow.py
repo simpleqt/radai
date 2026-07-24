@@ -4,76 +4,380 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
+import logging
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass, field, replace
-from typing import Any
+from dataclasses import replace
+from typing import TYPE_CHECKING, Any
+from weakref import WeakKeyDictionary
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
-from backend.application.agent_executors.stream_utils import (
-    extract_web_search_metadata,
-    make_process_event,
+from backend.application.agent_trace import AgentTraceRecorder
+from backend.application.agent_workflows.coordination_handoff import (
+    CoordinationHandoffService,
+)
+from backend.application.agent_workflows.coordination_persistence import (
+    CoordinationPersistenceMixin,
+)
+from backend.application.agent_workflows.coordination_types import (
+    CoordinationUnitResult,
+    ResearchTask,
+)
+from backend.application.agent_workflows.research_planning import (
+    build_planner_prompt,
+    fallback_research_tasks,
+    parse_research_tasks,
+)
+from backend.application.agent_workflows.research_specialists import (
+    normalize_research_specialist,
 )
 from backend.application.agent_workflows.standard_agent_workflow import (
     StandardAgentWorkflow,
 )
+from backend.application.agents.runtime_agent_loader import RuntimeAgentLoader
 from backend.application.artifacts.artifact_utils import (
-    build_registered_artifact_metadata,
+    build_registered_artifact_metadata as _default_artifact_metadata_builder,
 )
-from backend.application.blocking import run_blocking
 from backend.application.coordination import (
     CoordinationStrategy,
     DefaultCoordinationStrategy,
 )
-from backend.application.tools.providers.async_web_search_tool import execute_web_search
-from backend.application.tools.providers.deep_research_report_tool import (
-    save_deep_research_report_direct,
-)
-from backend.application.tools.providers.multi_kb_search_tool import (
-    execute_multi_kb_search,
+from backend.application.tools.runtime_invoker import RuntimeToolInvoker
+from backend.core.agents.context.subagent_adapter import format_handoff_bundle
+from backend.core.agents.resource_lease import (
+    InMemoryResourceLeaseManager,
+    Lease,
+    RedisResourceLeaseManager,
+    ResourceLeaseManager,
 )
 from backend.domain.agents.events import AgentEvent
 from backend.domain.agents.request import AgentRequest
+from backend.domain.agents.retrieval_policy import RetrievalRuntimePolicy
+from backend.domain.agents.runtime_agent import RuntimeAgentSpec
+from backend.domain.agents.runtime_budget import AgentRuntimeBudget
 from backend.domain.agents.runtime_context import AgentRuntimeContext
 
-
-@dataclass(frozen=True)
-class ResearchTask:
-    key: str
-    title: str
-    question: str
-
-
-@dataclass(frozen=True)
-class CoordinationUnitResult:
-    role: str
-    answer: str
-    error: str | None = None
-    process_events: tuple[dict[str, Any], ...] = field(default_factory=tuple)
-
+if TYPE_CHECKING:
+    from backend.application.agents.definition import ResolvedAgentDefinition
 
 WorkflowEventSink = Callable[[tuple[str, dict[str, Any]]], Awaitable[None]]
 
+# Persistence resolves this public symbol dynamically so deployments and tests
+# can inject an alternate artifact metadata builder through the workflow facade.
+build_registered_artifact_metadata = _default_artifact_metadata_builder
 
-class _AsyncTaskBarrier:
-    def __init__(self, parties: int):
-        self._parties = max(1, parties)
-        self._arrived = 0
+# Static defaults are retained as compatibility aliases for older tests and
+# internal imports.  Runtime configuration is deliberately *not* read here:
+# each workflow instance captures its own immutable budget below.
+_DEFAULT_RUNTIME_BUDGET = AgentRuntimeBudget()
+_MAX_CONCURRENT_RESEARCH = _DEFAULT_RUNTIME_BUDGET.max_concurrent_research
+_MAX_CONCURRENT_PER_USER_MODEL = _DEFAULT_RUNTIME_BUDGET.max_concurrent_per_user_model
+_PLAN_SOLVE_MAX_CONCURRENT = _DEFAULT_RUNTIME_BUDGET.plan_solve_max_concurrent_subagents
+_EVENT_QUEUE_MAXSIZE = _DEFAULT_RUNTIME_BUDGET.event_queue_maxsize
+_UNIT_HEARTBEAT_SECONDS = _DEFAULT_RUNTIME_BUDGET.unit_heartbeat_seconds
+_UNIT_IDLE_TIMEOUT_SECONDS = _DEFAULT_RUNTIME_BUDGET.unit_idle_timeout_seconds
+_UNIT_TOTAL_TIMEOUT_SECONDS = _DEFAULT_RUNTIME_BUDGET.unit_total_timeout_seconds
+_KB_SEARCH_TIMEOUT_SECONDS = _DEFAULT_RUNTIME_BUDGET.kb_search_timeout_seconds
+_PARTIAL_HANDOFF_GRACE_SECONDS = _DEFAULT_RUNTIME_BUDGET.partial_handoff_grace_seconds
+_PARTIAL_WRITER_MIN_BRANCHES = _DEFAULT_RUNTIME_BUDGET.partial_writer_min_branches
+_PARTIAL_FINALIZATION_WAIT_SECONDS = (
+    _DEFAULT_RUNTIME_BUDGET.partial_finalization_wait_seconds
+)
+_WEB_SEARCH_TIMEOUT_SECONDS = _DEFAULT_RUNTIME_BUDGET.web_search_timeout_seconds
+_WORKFLOW_TOTAL_TIMEOUT_SECONDS = _DEFAULT_RUNTIME_BUDGET.workflow_total_timeout_seconds
+_DEEP_RESEARCH_RESEARCH_PHASE_TIMEOUT_SECONDS = (
+    _DEFAULT_RUNTIME_BUDGET.deep_research_research_phase_timeout_seconds
+)
+_DEEP_RESEARCH_WRITER_TIMEOUT_SECONDS = (
+    _DEFAULT_RUNTIME_BUDGET.deep_research_writer_timeout_seconds
+)
+_DEEP_RESEARCH_REPORT_TIMEOUT_SECONDS = (
+    _DEFAULT_RUNTIME_BUDGET.deep_research_report_timeout_seconds
+)
+_DEEP_RESEARCH_BRANCH_WEB_CALLS = 3
+_DEEP_RESEARCH_WEB_MAX_RESULTS = 3
+_RESEARCH_PHASE_TIMEOUT_ERROR = (
+    "研究阶段预算已耗尽；已停止继续检索，并保留已完成证据供最终写作。"
+)
+_FAST_MODEL_RESEARCH_ROLES = frozenset(
+    {"domain_analyst", "evidence_researcher", "risk_reviewer"}
+)
+_HIGH_RISK_LEVELS = frozenset({"high", "critical", "severe", "高", "高风险"})
+_LEGACY_RUNTIME_BUDGET_ALIASES = {
+    "max_concurrent_research": "_MAX_CONCURRENT_RESEARCH",
+    "max_concurrent_per_user_model": "_MAX_CONCURRENT_PER_USER_MODEL",
+    "plan_solve_max_concurrent_subagents": "_PLAN_SOLVE_MAX_CONCURRENT",
+    "event_queue_maxsize": "_EVENT_QUEUE_MAXSIZE",
+    "unit_heartbeat_seconds": "_UNIT_HEARTBEAT_SECONDS",
+    "unit_idle_timeout_seconds": "_UNIT_IDLE_TIMEOUT_SECONDS",
+    "unit_total_timeout_seconds": "_UNIT_TOTAL_TIMEOUT_SECONDS",
+    "kb_search_timeout_seconds": "_KB_SEARCH_TIMEOUT_SECONDS",
+    "partial_handoff_grace_seconds": "_PARTIAL_HANDOFF_GRACE_SECONDS",
+    "partial_writer_min_branches": "_PARTIAL_WRITER_MIN_BRANCHES",
+    "partial_finalization_wait_seconds": "_PARTIAL_FINALIZATION_WAIT_SECONDS",
+    "web_search_timeout_seconds": "_WEB_SEARCH_TIMEOUT_SECONDS",
+    "workflow_total_timeout_seconds": "_WORKFLOW_TOTAL_TIMEOUT_SECONDS",
+    "deep_research_research_phase_timeout_seconds": "_DEEP_RESEARCH_RESEARCH_PHASE_TIMEOUT_SECONDS",
+    "deep_research_writer_timeout_seconds": "_DEEP_RESEARCH_WRITER_TIMEOUT_SECONDS",
+    "deep_research_report_timeout_seconds": "_DEEP_RESEARCH_REPORT_TIMEOUT_SECONDS",
+}
+_RESOURCE_LEASE_MANAGERS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, ResourceLeaseManager
+] = WeakKeyDictionary()
+# Compatibility alias for tests and callers that only clear the old cache.
+_RESEARCH_LIMITERS = _RESOURCE_LEASE_MANAGERS
+_MANIFEST_RESEARCH_ROLES: tuple[str, ...] = (
+    "domain_analyst",
+    "data_analyst",
+    "evidence_researcher",
+    "risk_reviewer",
+    "solution_architect",
+)
+
+
+def _join_unique_errors(*values: str | None) -> str | None:
+    """Join user-facing errors without repeating the same contract failure."""
+
+    unique: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in unique:
+            unique.append(text)
+    return "; ".join(unique) or None
+
+
+def _tool_result_error(payload: dict[str, Any]) -> str | None:
+    error = payload.get("error")
+    if not error and str(payload.get("status") or "").lower() != "error":
+        return None
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("code") or "工具调用失败")
+    return str(error or payload.get("summary") or "工具调用失败")
+
+
+def _compact_web_repair_evidence(
+    payload: dict[str, Any],
+    raw_result: Any,
+    *,
+    max_chars: int = 14000,
+) -> str:
+    """Keep URLs and bounded page excerpts for the no-tool repair pass."""
+
+    results = payload.get("results")
+    if isinstance(results, list):
+        compact_results: list[dict[str, str]] = []
+        for item in results[:_DEEP_RESEARCH_WEB_MAX_RESULTS]:
+            if not isinstance(item, dict):
+                continue
+            compact_results.append(
+                {
+                    "title": str(item.get("title") or "")[:500],
+                    "url": str(
+                        item.get("url") or item.get("href") or item.get("link") or ""
+                    )[:2000],
+                    "content": str(
+                        item.get("content")
+                        or item.get("markdown")
+                        or item.get("description")
+                        or ""
+                    )[:3000],
+                }
+            )
+        text = json.dumps(
+            {
+                "query": payload.get("query"),
+                "results": compact_results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    elif isinstance(raw_result, str):
+        text = raw_result
+    else:
+        text = json.dumps(raw_result, ensure_ascii=False, default=str)
+    return text[:max_chars]
+
+
+logger = logging.getLogger(__name__)
+
+
+class _ManagedCoordinationUnitFailure(RuntimeError):
+    """Carry an encoded unit failure through the manager state machine."""
+
+    def __init__(self, result: CoordinationUnitResult):
+        super().__init__(result.error or "coordination unit failed")
+        self.result = result
+
+
+class _ManagedCoordinationUnitTimeout(
+    _ManagedCoordinationUnitFailure,
+    TimeoutError,
+):
+    """Preserve a partial unit result while marking its runtime as timed out."""
+
+
+def _capture_runtime_budget(
+    runtime_budget: AgentRuntimeBudget | None,
+) -> AgentRuntimeBudget:
+    """Capture one workflow-scoped budget without import-time environment reads."""
+
+    snapshot = AgentRuntimeBudget.snapshot(runtime_budget)
+    if runtime_budget is not None:
+        return snapshot
+
+    # Preserve compatibility with older callers that monkeypatch the module
+    # constants.  Only values changed away from built-in defaults override the
+    # newly captured environment snapshot.
+    legacy_overrides = {
+        field_name: globals()[alias]
+        for field_name, alias in _LEGACY_RUNTIME_BUDGET_ALIASES.items()
+        if globals()[alias] != getattr(_DEFAULT_RUNTIME_BUDGET, field_name)
+    }
+    if legacy_overrides:
+        snapshot = replace(snapshot, **legacy_overrides)
+    return snapshot
+
+
+def _cancel_child_on_parent_exit(child: asyncio.Task[Any]) -> None:
+    """Ensure independently-created child tasks cannot outlive their coroutine."""
+    parent = asyncio.current_task()
+    if parent is None:
+        return
+
+    def cancel_child(_completed_parent: asyncio.Task[Any]) -> None:
+        if not child.done():
+            child.cancel()
+
+    parent.add_done_callback(cancel_child)
+
+
+def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except (asyncio.CancelledError, StopAsyncIteration):
+        pass
+    except Exception:
+        logger.warning(
+            "[CoordinatedAgentWorkflow] background task failed",
+            exc_info=True,
+        )
+
+
+async def _cancel_task_bounded(
+    task: asyncio.Task[Any] | None,
+    *,
+    timeout: float = 1.0,
+) -> bool:
+    """Signal cancellation without allowing cleanup to wait forever."""
+
+    if task is None:
+        return True
+    if not task.done():
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=max(0.0, timeout))
+        if not done:
+            logger.warning(
+                "[CoordinatedAgentWorkflow] task cancellation exceeded %.2fs: task=%s",
+                max(0.0, timeout),
+                task.get_name(),
+            )
+            task.add_done_callback(_consume_background_task_result)
+            return False
+    _consume_background_task_result(task)
+    return True
+
+
+def _get_resource_lease_manager() -> ResourceLeaseManager:
+    loop = asyncio.get_running_loop()
+    manager = _RESOURCE_LEASE_MANAGERS.get(loop)
+    if manager is not None:
+        return manager
+
+    backend = os.getenv("AGENT_RESOURCE_LEASE_BACKEND", "memory").strip().lower()
+    if backend == "redis":
+        # ``get_redis`` constructs a lazy redis-py client; no network I/O is
+        # performed until the first atomic Lua acquire.
+        from backend.db.redis import get_redis
+
+        manager = RedisResourceLeaseManager(
+            get_redis(),
+            namespace=os.getenv(
+                "AGENT_RESOURCE_LEASE_NAMESPACE",
+                "agent-runtime-lease",
+            ),
+        )
+    elif backend == "memory":
+        manager = InMemoryResourceLeaseManager()
+    else:
+        raise ValueError("AGENT_RESOURCE_LEASE_BACKEND must be 'memory' or 'redis'")
+    _RESOURCE_LEASE_MANAGERS[loop] = manager
+    return manager
+
+
+def _resource_lease_ttl_seconds() -> float:
+    try:
+        return max(
+            3.0,
+            float(os.getenv("AGENT_RESOURCE_LEASE_TTL_SECONDS", "30")),
+        )
+    except (TypeError, ValueError):
+        return 30.0
+
+
+async def _renew_resource_lease(
+    lease: Lease,
+    *,
+    ttl_seconds: float,
+    owner_task: asyncio.Task[Any] | None,
+) -> None:
+    """Keep a lease alive and fail closed if distributed ownership is lost."""
+
+    interval = max(1.0, ttl_seconds / 3.0)
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            await asyncio.wait_for(
+                lease.renew(ttl_seconds=ttl_seconds),
+                timeout=max(1.0, ttl_seconds / 2.0),
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "resource lease renewal failed; cancelling owner: resource=%s owner=%s token=%s",
+            lease.resource,
+            lease.owner_id,
+            lease.fencing_token,
+        )
+        if owner_task is not None and not owner_task.done():
+            owner_task.cancel()
+
+
+class _AdaptiveAnalysisGate:
+    """Small, timeout-bounded rendezvous so fast branches are not held by slow ones."""
+
+    def __init__(self, *, min_ready: int, timeout_seconds: float):
+        self._min_ready = max(1, min_ready)
+        self._timeout_seconds = max(0.0, timeout_seconds)
+        self._ready_count = 0
         self._lock = asyncio.Lock()
-        self._ready = asyncio.Event()
+        self._event = asyncio.Event()
 
-    async def wait(self) -> None:
+    async def mark_ready_and_wait(self) -> None:
         async with self._lock:
-            self._arrived += 1
-            if self._arrived >= self._parties:
-                self._ready.set()
-        await self._ready.wait()
+            self._ready_count += 1
+            if self._ready_count >= self._min_ready:
+                self._event.set()
+        if self._timeout_seconds <= 0:
+            return
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._event.wait(), timeout=self._timeout_seconds)
 
 
-class CoordinatedAgentWorkflow:
+class CoordinatedAgentWorkflow(CoordinationPersistenceMixin):
     """Coordinate isolated agent units with deterministic evidence collection."""
 
     def __init__(
@@ -84,195 +388,124 @@ class CoordinatedAgentWorkflow:
         runnable_config: RunnableConfig | None = None,
         strategy: CoordinationStrategy | None = None,
         delegate: StandardAgentWorkflow | None = None,
+        runtime_budget: AgentRuntimeBudget | None = None,
+        resource_lease_manager: ResourceLeaseManager | None = None,
+        agent_specs: dict[str, RuntimeAgentSpec] | None = None,
+        context_policy: Any | None = None,
+        resolved_definition: ResolvedAgentDefinition | None = None,
     ):
         self.name = name
+        self._resolved_definition = resolved_definition
+        self._runtime_budget = _capture_runtime_budget(runtime_budget)
+        self._agent_specs = dict(agent_specs or {})
+        self._context_policy = context_policy
         self._strategy = strategy or DefaultCoordinationStrategy(name)
         self._delegate = delegate or StandardAgentWorkflow(
             name="full",
             checkpointer=checkpointer,
             runnable_config=runnable_config,
+            runtime_budget=self._runtime_budget,
+            agent_specs=self._agent_specs,
+            context_policy=self._context_policy,
+            resolved_definition=resolved_definition,
         )
+        self._checkpointer = checkpointer
         self._runnable_config = runnable_config
-        # The RAG provider rejects overlapping multi_kb_search calls in one request.
-        # Queue only that I/O step while keeping web search and agent analysis concurrent.
-        self._kb_search_lock = asyncio.Lock()
+        self._runtime_agent_loader = RuntimeAgentLoader()
+        self._resource_lease_manager = resource_lease_manager
+        self._active_traces: dict[str, AgentTraceRecorder] = {}
+        # Components are imported lazily because they depend on the host's
+        # compatibility hooks while this module remains the public facade.
+        from backend.application.agent_workflows.coordination_runtime_lifecycle import (
+            CoordinationRuntimeLifecycle,
+        )
+        from backend.application.agent_workflows.coordination_unit_runner import (
+            CoordinationUnitRunner,
+        )
+        from backend.application.agent_workflows.deep_research_supervisor import (
+            DeepResearchSupervisor,
+        )
+        from backend.application.agent_workflows.report_convergence_builder import (
+            ReportConvergenceBuilder,
+        )
+        from backend.application.agent_workflows.research_branch_runner import (
+            ResearchBranchRunner,
+        )
+        from backend.application.agent_workflows.research_scheduler import (
+            ResearchScheduler,
+        )
+
+        self._research_scheduler = ResearchScheduler(self)
+        self._research_branch_runner = ResearchBranchRunner(self)
+        self._unit_runner = CoordinationUnitRunner(self)
+        self._runtime_lifecycle = CoordinationRuntimeLifecycle(self)
+        self._deep_research_supervisor = DeepResearchSupervisor(self)
+        self._report_convergence_builder = ReportConvergenceBuilder(self)
+
+    @property
+    def runtime_budget(self) -> AgentRuntimeBudget:
+        """Immutable execution limits captured for this workflow instance."""
+
+        return self._runtime_budget
+
+    @staticmethod
+    def _invoke_runtime_tool_structured_blocking(
+        context: AgentRuntimeContext,
+        workflow_name: str,
+        tool_name: str,
+        args: dict[str, Any],
+        invoker_type: type[RuntimeToolInvoker] = RuntimeToolInvoker,
+        resolved_definition: ResolvedAgentDefinition | None = None,
+    ) -> dict[str, Any]:
+        async def invoke() -> dict[str, Any]:
+            invoker_kwargs: dict[str, Any] = {
+                "context": context,
+                "workflow_name": workflow_name,
+                "enforce_skill_load": False,
+            }
+            if resolved_definition is not None:
+                invoker_kwargs["resolved_agent_definition"] = resolved_definition
+            invoker = invoker_type(
+                **invoker_kwargs,
+            )
+            structured_method = getattr(invoker, "invoke_structured", None)
+            if callable(structured_method):
+                return await structured_method(tool_name, args)
+            value = await invoker.invoke(tool_name, args)
+            return {"text": str(value or ""), "evidence_records": [], "stats": {}}
+
+        return asyncio.run(invoke())
 
     async def run(
         self,
         request: AgentRequest,
         context: AgentRuntimeContext,
     ) -> AsyncIterator[AgentEvent]:
-        sequence = 0
-        plan = self._strategy.build_plan(request, context)
-        yield self._event(
-            context,
-            sequence,
-            "workflow.started",
-            {
-                "workflow": self.name,
-                "agent_code": context.agent_profile.code,
-                "coordination_mode": self.name,
-            },
+        async for event in self._runtime_lifecycle.run(request, context):
+            yield event
+
+    def _finish_active_trace(
+        self,
+        *,
+        request: AgentRequest,
+        context: AgentRuntimeContext,
+        status: str,
+        error: str | None,
+    ) -> None:
+        self._runtime_lifecycle._finish_active_trace(
+            request=request,
+            context=context,
+            status=status,
+            error=error,
         )
 
-        sequence += 1
-        yield self._event(
-            context,
-            sequence,
-            "plan.created",
-            {
-                "workflow": self.name,
-                "summary": plan.summary,
-                "stages": [
-                    {
-                        "key": stage.key,
-                        "title": stage.title,
-                        "description": stage.description,
-                    }
-                    for stage in plan.stages
-                ],
-                "metadata": dict(plan.metadata),
-            },
-        )
-
-        research_tasks: list[ResearchTask] = []
-        streamed_process_events = False
-        try:
-            if self.name in {"plan_solve", "deep_research"}:
-                streamed_process_events = True
-                event_queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
-                outcome: dict[str, Any] = {}
-
-                async def execute_plan_solve() -> None:
-                    try:
-                        outcome["value"] = await self._run_plan_solve(
-                            request,
-                            context,
-                            event_sink=event_queue.put,
-                        )
-                    except BaseException as exc:  # noqa: BLE001
-                        outcome["error"] = exc
-                    finally:
-                        await event_queue.put(None)
-
-                execution_task = asyncio.create_task(execute_plan_solve())
-                try:
-                    while True:
-                        queued_event = await event_queue.get()
-                        if queued_event is None:
-                            break
-                        event_type, payload = queued_event
-                        sequence += 1
-                        yield self._event(context, sequence, event_type, payload)
-                    await execution_task
-                finally:
-                    if not execution_task.done():
-                        execution_task.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await execution_task
-                if "error" in outcome:
-                    raise outcome["error"]
-                results, research_tasks = outcome["value"]
-            elif self.name == "multi_agent_parallel":
-                results = await self._run_parallel(request, context)
-            elif self.name == "multi_agent_alternating":
-                results = await self._run_alternating(request, context)
-            else:
-                raise ValueError(f"Unsupported coordinated workflow: {self.name}")
-        except Exception as exc:  # noqa: BLE001
-            sequence += 1
-            yield self._event(
-                context,
-                sequence,
-                "error",
-                {"message": str(exc), "error": str(exc), "workflow": self.name},
-            )
-            sequence += 1
-            yield self._event(context, sequence, "done", {})
-            return
-
-        if research_tasks and not streamed_process_events:
-            sequence += 1
-            yield self._event(
-                context,
-                sequence,
-                "plan.updated",
-                {
-                    "workflow": self.name,
-                    "tasks": [
-                        {"key": task.key, "title": task.title, "question": task.question}
-                        for task in research_tasks
-                    ],
-                },
-            )
-
-        for result in results:
-            if not streamed_process_events:
-                for process_event in result.process_events:
-                    sequence += 1
-                    yield self._event(
-                        context,
-                        sequence,
-                        "workflow.step",
-                        {"event": process_event},
-                    )
-            sequence += 1
-            event_type = "coordination.unit.failed" if result.error else "coordination.unit.completed"
-            yield self._event(
-                context,
-                sequence,
-                event_type,
-                {
-                    "workflow": self.name,
-                    "role": result.role,
-                    "error": result.error,
-                    "answer_preview": result.answer[:300],
-                },
-            )
-
-        answered = [result for result in results if result.answer]
-        successful = [result for result in answered if not result.error]
-        if not answered:
-            sequence += 1
-            message = "All coordination units failed"
-            yield self._event(
-                context,
-                sequence,
-                "error",
-                {"message": message, "error": message, "workflow": self.name},
-            )
-        else:
-            final_answer = results[-1].answer or answered[-1].answer
-            sequence += 1
-            yield self._event(context, sequence, "message.delta", {"content": final_answer})
-
-            if self._should_generate_report(request):
-                async for report_event in self._save_report(
-                    request=request,
-                    context=context,
-                    content=final_answer,
-                    sequence=sequence,
-                ):
-                    sequence = report_event.sequence
-                    yield report_event
-
-        sequence += 1
-        yield self._event(
-            context,
-            sequence,
-            "coordination.completed",
-            {
-                "workflow": self.name,
-                "mode": self.name,
-                "units": len(results),
-                "successful_units": len(successful),
-                "research_tasks": len(research_tasks),
-                "kb_search_enabled": bool(context.kb_ids),
-                "web_search_enabled": context.use_search,
-            },
-        )
-        sequence += 1
-        yield self._event(context, sequence, "done", {})
+    async def _run_impl(
+        self,
+        request: AgentRequest,
+        context: AgentRuntimeContext,
+    ) -> AsyncIterator[AgentEvent]:
+        async for event in self._runtime_lifecycle._run_impl(request, context):
+            yield event
 
     async def _run_plan_solve(
         self,
@@ -280,128 +513,132 @@ class CoordinatedAgentWorkflow:
         context: AgentRuntimeContext,
         event_sink: WorkflowEventSink | None = None,
     ) -> tuple[list[CoordinationUnitResult], list[ResearchTask]]:
-        await self._emit_process_event(
-            event_sink,
-            make_process_event(
-                "status",
-                "正在规划研究任务",
-                "规划智能体正在拆解问题并确定并行研究方向。",
-                level="active",
-                metadata={"runtime_type": "planner_started"},
-            ),
+        return await self._deep_research_supervisor._run_plan_solve(
+            request,
+            context,
+            event_sink=event_sink,
         )
-        planner = await self._run_unit(
-            role="planner",
-            question=self._planner_prompt(request, context),
-            request=request,
-            context=context,
-            tool_access=False,
-        )
-        tasks = self._parse_research_tasks(planner.answer, request.question)
-        used_fallback = not tasks
-        if used_fallback:
-            tasks = self._fallback_research_tasks(request.question)
-        await self._emit_event(
-            event_sink,
-            "plan.updated",
-            {
-                "workflow": self.name,
-                "tasks": [
-                    {"key": task.key, "title": task.title, "question": task.question}
-                    for task in tasks
-                ],
-            },
-        )
-        await self._emit_process_event(
-            event_sink,
-            make_process_event(
-                "status",
-                "研究计划已生成",
-                f"已拆分为 {len(tasks)} 个并行研究子任务。",
-                level="success",
-                metadata={
-                    "runtime_type": "planner_completed",
-                    "task_count": len(tasks),
-                    "used_fallback": used_fallback,
-                },
-            ),
-        )
-        research_barrier = _AsyncTaskBarrier(len(tasks))
 
-        branch_results = list(
-            await asyncio.gather(
-                *[
-                    self._run_research_task(
-                        task=task,
-                        index=index,
-                        role=(
-                            "solver"
-                            if used_fallback and self.name == "plan_solve" and index == 1
-                            else f"researcher_{index}"
-                        ),
-                        research_barrier=research_barrier,
-                        request=request,
-                        context=context,
-                        event_sink=event_sink,
-                    )
-                    for index, task in enumerate(tasks, start=1)
-                ]
-            )
-        )
-        branch_evidence = "\n\n".join(
-            f"## {task.title}\n{result.answer or result.error or '该分支未返回结果'}"
-            for task, result in zip(tasks, branch_results, strict=True)
-        )
-        writer_role = "report_writer" if self.name == "deep_research" else "reviewer"
-        await self._emit_process_event(
-            event_sink,
-            make_process_event(
-                "status",
-                "正在汇总研究结论",
-                "答案输出智能体正在核对各分支证据、处理冲突并编写最终报告。",
-                level="active",
-                metadata={"runtime_type": "writer_started"},
-            ),
-        )
-        writer = await self._run_unit(
-            role=writer_role,
-            question=(
-                "你是答案输出智能体。基于规划和所有子智能体结果，解决冲突、标明不确定性，"
-                "输出结构完整的最终 Markdown 报告。不得声称使用了未出现在证据中的来源；"
-                "优先保留知识库文献名、网页标题和 URL 等可核验引用。\n\n"
-                f"原始任务：\n{request.question}\n\n"
-                f"规划结果：\n{planner.answer}\n\n"
-                f"子智能体结果：\n{branch_evidence}"
-            ),
+    async def _run_research_reflection(
+        self,
+        *,
+        request: AgentRequest,
+        context: AgentRuntimeContext,
+        planner: CoordinationUnitResult,
+        tasks: list[ResearchTask],
+        branch_results: list[CoordinationUnitResult],
+        kb_circuit_open: asyncio.Event,
+        event_sink: WorkflowEventSink | None,
+        research_deadline: float | None = None,
+    ) -> tuple[
+        list[ResearchTask],
+        list[CoordinationUnitResult],
+        list[CoordinationUnitResult],
+    ]:
+        return await self._deep_research_supervisor._run_research_reflection(
             request=request,
             context=context,
-            tool_access=False,
+            planner=planner,
+            tasks=tasks,
+            branch_results=branch_results,
+            kb_circuit_open=kb_circuit_open,
+            event_sink=event_sink,
+            research_deadline=research_deadline,
         )
-        writer_fallback_used = not writer.answer
-        if writer_fallback_used:
-            writer = replace(
-                writer,
-                answer=self._build_fallback_report(
-                    request=request,
-                    planner=planner,
-                    tasks=tasks,
-                    branch_results=branch_results,
-                ),
-            )
-        await self._emit_process_event(
-            event_sink,
-            make_process_event(
-                "answer",
-                "研究报告内容已完成",
-                "已完成多分支证据汇总，正在生成可下载报告。",
-                level="warning" if writer.error else "success",
-                metadata={
-                    "runtime_type": "writer_completed",
-                    "fallback_used": writer_fallback_used,
-                },
-            ),
+
+    @staticmethod
+    def _prepare_followup_tasks(
+        proposed_tasks: tuple[ResearchTask, ...],
+        *,
+        existing_tasks: list[ResearchTask],
+        context: AgentRuntimeContext,
+        round_index: int,
+    ) -> list[ResearchTask]:
+        from backend.application.agent_workflows.research_scheduler import (
+            ResearchScheduler,
         )
-        return [planner, *branch_results, writer], tasks
+
+        return ResearchScheduler._prepare_followup_tasks(
+            proposed_tasks,
+            existing_tasks=existing_tasks,
+            context=context,
+            round_index=round_index,
+        )
+
+    @staticmethod
+    def _prepare_quality_recovery_tasks(
+        *,
+        tasks: list[ResearchTask],
+        branch_results: list[CoordinationUnitResult],
+        context: AgentRuntimeContext,
+        round_index: int,
+        limit: int,
+    ) -> list[ResearchTask]:
+        from backend.application.agent_workflows.research_scheduler import (
+            ResearchScheduler,
+        )
+
+        return ResearchScheduler._prepare_quality_recovery_tasks(
+            tasks=tasks,
+            branch_results=branch_results,
+            context=context,
+            round_index=round_index,
+            limit=limit,
+        )
+
+    @staticmethod
+    def _prepare_conflict_resolution_task(
+        *,
+        existing_tasks: list[ResearchTask],
+        branch_results: list[CoordinationUnitResult],
+        context: AgentRuntimeContext,
+        round_index: int,
+    ) -> ResearchTask | None:
+        from backend.application.agent_workflows.research_scheduler import (
+            ResearchScheduler,
+        )
+
+        return ResearchScheduler._prepare_conflict_resolution_task(
+            existing_tasks=existing_tasks,
+            branch_results=branch_results,
+            context=context,
+            round_index=round_index,
+        )
+
+    def _research_phase_timeout_result(
+        self,
+        *,
+        task: ResearchTask,
+        index: int,
+        context: AgentRuntimeContext,
+        used_fallback: bool,
+    ) -> CoordinationUnitResult:
+        return self._deep_research_supervisor._research_phase_timeout_result(
+            task=task,
+            index=index,
+            context=context,
+            used_fallback=used_fallback,
+        )
+
+    async def _run_scheduled_research_tasks(
+        self,
+        *,
+        scheduled_tasks: list[tuple[int, ResearchTask]],
+        used_fallback: bool,
+        kb_circuit_open: asyncio.Event,
+        request: AgentRequest,
+        context: AgentRuntimeContext,
+        event_sink: WorkflowEventSink | None,
+        analysis_gate: _AdaptiveAnalysisGate | None,
+        partial_result_limit: int | None = None,
+        partial_result_sink: (
+            Callable[[list[CoordinationUnitResult]], Awaitable[None]] | None
+        ) = None,
+        research_deadline: float | None = None,
+    ) -> list[CoordinationUnitResult]:
+        arguments = dict(locals())
+        arguments.pop("self")
+        return await self._research_scheduler._run_scheduled_research_tasks(**arguments)
 
     async def _run_research_task(
         self,
@@ -409,187 +646,238 @@ class CoordinatedAgentWorkflow:
         task: ResearchTask,
         index: int,
         role: str,
-        research_barrier: _AsyncTaskBarrier,
+        kb_circuit_open: asyncio.Event,
         request: AgentRequest,
         context: AgentRuntimeContext,
         event_sink: WorkflowEventSink | None = None,
+        analysis_gate: _AdaptiveAnalysisGate | None = None,
+        research_deadline: float | None = None,
+        dependency_results: list[CoordinationUnitResult] | None = None,
     ) -> CoordinationUnitResult:
-        task_id = f"{context.request_id}:research:{index}"
-        process_events: list[dict[str, Any]] = []
+        arguments = dict(locals())
+        arguments.pop("self")
+        return await self._research_branch_runner._run_research_task(**arguments)
 
-        async def record(process_event: dict[str, Any]) -> None:
-            process_events.append(process_event)
-            await self._emit_process_event(event_sink, process_event)
-
-        await record(
-            make_process_event(
-                "task_start",
-                task.title,
-                task.question,
-                tool="task",
-                level="active",
-                metadata={
-                    "task_id": task_id,
-                    "description": task.title,
-                    "subagent_type": "researcher",
-                    "runtime_type": "task_started",
-                },
-            )
+    async def _run_research_task_unmanaged(
+        self,
+        *,
+        task: ResearchTask,
+        index: int,
+        role: str,
+        kb_circuit_open: asyncio.Event,
+        request: AgentRequest,
+        context: AgentRuntimeContext,
+        event_sink: WorkflowEventSink | None = None,
+        analysis_gate: _AdaptiveAnalysisGate | None = None,
+        research_deadline: float | None = None,
+        dependency_results: list[CoordinationUnitResult] | None = None,
+    ) -> CoordinationUnitResult:
+        arguments = dict(locals())
+        arguments.pop("self")
+        return await self._research_branch_runner._run_research_task_unmanaged(
+            **arguments
         )
-        evidence_parts: list[str] = []
-        errors: list[str] = []
-        web_task: asyncio.Task[str] | None = None
 
-        if context.use_search:
-            await record(
-                make_process_event(
-                    "tool_start",
-                    "联网检索",
-                    task.question,
-                    tool="web_search",
-                    level="active",
-                    metadata={"task_id": task_id, "query": task.question},
-                )
-            )
-            web_task = asyncio.create_task(execute_web_search(task.question, max_results=5))
+    def _research_role(
+        self,
+        *,
+        task: ResearchTask,
+        index: int,
+        used_fallback: bool,
+        context: AgentRuntimeContext | None,
+    ) -> str:
+        return normalize_research_specialist(
+            task.agent_type,
+            agent_specs=self._runtime_agent_specs(context),
+            default_index=index,
+        )
 
-        if context.kb_ids:
-            await record(
-                make_process_event(
-                    "tool_start",
-                    "检索已选知识库",
-                    task.question,
-                    tool="multi_kb_search",
-                    level="active",
-                    metadata={
-                        "task_id": task_id,
-                        "query": task.question,
-                        "kb_ids": list(context.kb_ids),
-                    },
-                )
-            )
-            try:
-                async with self._kb_search_lock:
-                    kb_result = await execute_multi_kb_search(
-                        query=task.question,
-                        kb_ids=list(context.kb_ids),
-                        top_k=8,
-                        chunk_top_k=5,
-                        merge_strategy="rrf",
-                        max_result_chars=6500,
-                    )
-                evidence_parts.append("### 知识库证据\n" + kb_result)
-                await record(
-                    make_process_event(
-                        "tool_result",
-                        "知识库检索完成",
-                        "已将选中知识库的召回结果交给子智能体。",
-                        tool="multi_kb_search",
-                        level="success",
-                        metadata={
-                            "task_id": task_id,
-                            "query": task.question,
-                            "kb_ids": list(context.kb_ids),
-                        },
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"知识库检索失败: {exc}")
-                await record(
-                    make_process_event(
-                        "tool_result",
-                        "知识库检索失败",
-                        str(exc),
-                        tool="multi_kb_search",
-                        level="warning",
-                        metadata={"task_id": task_id, "query": task.question},
-                    )
-                )
+    def _runtime_agent_specs(
+        self,
+        context: AgentRuntimeContext | None = None,
+    ) -> dict[str, RuntimeAgentSpec]:
+        specs: dict[str, RuntimeAgentSpec] = {}
+        specs.update(self._agent_specs)
+        try:
+            specs.update(self._runtime_agent_loader.load_all())
+        except Exception:
+            logger.debug("runtime agent manifest unavailable", exc_info=True)
+        if context is not None:
+            specs.update(getattr(context, "agent_specs", None) or {})
+        return specs
 
-        if web_task is not None:
-            try:
-                web_result = await web_task
-                evidence_parts.append("### 联网证据\n" + web_result)
-                await record(
-                    make_process_event(
-                        "tool_result",
-                        "联网检索完成",
-                        "已将网页检索结果交给子智能体。",
-                        tool="web_search",
-                        level="success",
-                        metadata={
-                            "task_id": task_id,
-                            **extract_web_search_metadata(web_result),
-                        },
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"联网检索失败: {exc}")
-                await record(
-                    make_process_event(
-                        "tool_result",
-                        "联网检索失败",
-                        str(exc),
-                        tool="web_search",
-                        level="warning",
-                        metadata={"task_id": task_id, "query": task.question},
-                    )
-                )
+    def _role_spec(
+        self,
+        context: AgentRuntimeContext | None,
+        role: str,
+    ) -> RuntimeAgentSpec | None:
+        return self._runtime_agent_specs(context).get(str(role or "").strip())
 
-        seed_evidence = "\n\n".join(evidence_parts) or "当前未配置可用的知识库或联网检索。"
-        # Start all answer subagents together after their planned evidence is ready.
-        await research_barrier.wait()
-        await record(
-            make_process_event(
-                "task_progress",
-                "子智能体正在分析证据",
-                "检索证据已准备完成，研究子智能体正在提取事实、出处和争议。",
-                tool="task",
-                level="active",
-                metadata={
-                    "task_id": task_id,
-                    "description": task.title,
-                    "subagent_type": "researcher",
-                    "runtime_type": "task_running",
-                },
+    def _role_instruction(
+        self,
+        role: str,
+        context: AgentRuntimeContext | None,
+    ) -> str:
+        spec = self._role_spec(context, role)
+        return spec.system_prompt if spec is not None else ""
+
+    def _effective_tool_access(
+        self,
+        *,
+        role: str,
+        requested: bool,
+        context: AgentRuntimeContext | None,
+    ) -> bool:
+        spec = self._role_spec(context, role)
+        return bool(requested and (spec.tool_access if spec is not None else True))
+
+    def _effective_allowed_tools(
+        self,
+        *,
+        role: str,
+        requested_allowed_tools: set[str] | None,
+        context: AgentRuntimeContext | None,
+    ) -> set[str] | None:
+        spec = self._role_spec(context, role)
+        if spec is None:
+            return (
+                set(requested_allowed_tools)
+                if requested_allowed_tools is not None
+                else None
             )
-        )
-        result = await self._run_unit(
-            role=role,
-            question=(
-                "你是独立研究子智能体。请围绕分配的子问题分析下方检索证据，提取事实、"
-                "数据、出处、冲突和证据缺口，形成可供最终报告直接引用的研究结论。"
-                "若证据不足，可使用当前允许的工具继续核验，但不要编造引用。\n\n"
-                f"原始任务：\n{request.question}\n\n"
-                f"子问题：\n{task.question}\n\n"
-                f"编排层预检索证据：\n{seed_evidence}"
-            ),
-            request=request,
-            context=context,
-            tool_access=True,
-        )
-        combined_error = "; ".join([*errors, *([result.error] if result.error else [])]) or None
-        await record(
-            make_process_event(
-                "task_end",
-                task.title,
-                result.answer[:500] if result.answer else (combined_error or "子任务未返回内容"),
-                tool="task",
-                level="warning" if combined_error and not result.answer else "success",
-                metadata={
-                    "task_id": task_id,
-                    "description": task.title,
-                    "subagent_type": "researcher",
-                    "runtime_type": "task_completed" if result.answer else "task_failed",
-                    "search_queries": [task.question],
-                },
+        if spec.allowed_tools is None:
+            allowed = (
+                set(requested_allowed_tools)
+                if requested_allowed_tools is not None
+                else None
             )
+        elif requested_allowed_tools is None:
+            allowed = set(spec.allowed_tools)
+        else:
+            allowed = set(requested_allowed_tools) & set(spec.allowed_tools)
+        return allowed - set(spec.disallowed_tools) if allowed is not None else None
+
+    def _role_timeout_seconds(
+        self,
+        role: str,
+        context: AgentRuntimeContext | None,
+    ) -> float:
+        spec = self._role_spec(context, role)
+        return float(
+            spec.timeout_seconds
+            if spec is not None
+            else self._runtime_budget.unit_total_timeout_seconds
         )
-        return replace(
-            result,
-            error=combined_error if not result.answer else result.error,
-            process_events=tuple(process_events),
+
+    def _role_model_name(
+        self,
+        role: str,
+        context: AgentRuntimeContext,
+    ) -> str | None:
+        context_model_name = getattr(context, "model_name", None)
+        spec = self._role_spec(context, role)
+        if spec is not None and spec.model:
+            if spec.model == "fast":
+                if self.name == "deep_research":
+                    return (
+                        self._runtime_budget.deep_research_fast_model_name
+                        or context_model_name
+                    )
+                return context_model_name
+            if spec.model != "default":
+                return spec.model
+        return context_model_name
+
+    def _research_task_model_name(
+        self,
+        *,
+        task: ResearchTask,
+        role: str,
+        context: AgentRuntimeContext,
+    ) -> str | None:
+        """Route only bounded, low-risk research branches to the fast model."""
+
+        role_model = self._role_model_name(role, context)
+        fast_model = self._runtime_budget.deep_research_fast_model_name
+        if self.name != "deep_research" or not fast_model:
+            return role_model
+        spec = self._role_spec(context, role)
+        if spec is not None and spec.model not in {None, "default", "fast"}:
+            return role_model
+        if self._runtime_budget.deep_research_fast_model_max_budget <= 0:
+            return role_model
+        if task.budget > self._runtime_budget.deep_research_fast_model_max_budget:
+            return role_model
+        if str(task.risk or "").strip().lower() in _HIGH_RISK_LEVELS:
+            return role_model
+        if role not in _FAST_MODEL_RESEARCH_ROLES:
+            return role_model
+        return fast_model
+
+    def _model_tier(
+        self,
+        model_name: str | None,
+        context: AgentRuntimeContext,
+    ) -> str:
+        fast_model = self._runtime_budget.deep_research_fast_model_name
+        request_metadata = getattr(context, "request_metadata", None) or {}
+        primary_model = request_metadata.get(
+            "coordination_primary_model_name",
+            getattr(context, "model_name", None),
         )
+        if fast_model and model_name == fast_model and model_name != primary_model:
+            return "fast"
+        return "primary"
+
+    def _role_runnable_config(
+        self,
+        role: str,
+        context: AgentRuntimeContext,
+    ) -> RunnableConfig | None:
+        spec = self._role_spec(context, role)
+        if spec is None:
+            return self._runnable_config
+        config: dict[str, Any] = dict(self._runnable_config or {})
+        metadata = dict(config.get("metadata") or {})
+        metadata.update(
+            {
+                "runtime_agent": spec.name,
+                "runtime_agent_output_schema": spec.output_schema,
+                "runtime_agent_max_turns": spec.max_turns,
+            }
+        )
+        config["metadata"] = metadata
+        # This graph has several middleware nodes per logical model/tool turn,
+        # and a model may issue multiple independent searches in one turn.
+        # Keep the semantic turn limit in the agent spec while allowing enough
+        # graph supersteps to finish its answer. Retrieval/tool budgets still
+        # provide the hard loop bound.
+        config["recursion_limit"] = min(128, max(32, spec.max_turns * 8 + 8))
+        return config
+
+    def _role_can_use_network(
+        self,
+        role: str,
+        context: AgentRuntimeContext | None,
+    ) -> bool:
+        spec = self._role_spec(context, role)
+        return bool(spec.can_use_network if spec is not None else True)
+
+    def _role_can_read_kb(
+        self,
+        role: str,
+        context: AgentRuntimeContext | None,
+    ) -> bool:
+        spec = self._role_spec(context, role)
+        return bool(spec.can_read_kb if spec is not None else True)
+
+    def _role_required_tools(
+        self,
+        role: str,
+        context: AgentRuntimeContext | None,
+    ) -> set[str]:
+        spec = self._role_spec(context, role)
+        return set(spec.required_tools if spec is not None else set())
 
     @staticmethod
     async def _emit_event(
@@ -608,6 +896,27 @@ class CoordinatedAgentWorkflow:
     ) -> None:
         await cls._emit_event(event_sink, "workflow.step", {"event": process_event})
 
+    async def _build_research_report(
+        self,
+        *,
+        request: AgentRequest,
+        context: AgentRuntimeContext,
+        planner: CoordinationUnitResult,
+        tasks: list[ResearchTask],
+        branch_results: list[CoordinationUnitResult],
+        event_sink: WorkflowEventSink | None,
+        research_budget_exhausted: bool,
+    ) -> CoordinationUnitResult:
+        return await self._report_convergence_builder._build_research_report(
+            request=request,
+            context=context,
+            planner=planner,
+            tasks=tasks,
+            branch_results=branch_results,
+            event_sink=event_sink,
+            research_budget_exhausted=research_budget_exhausted,
+        )
+
     @staticmethod
     def _build_fallback_report(
         *,
@@ -616,42 +925,35 @@ class CoordinatedAgentWorkflow:
         tasks: list[ResearchTask],
         branch_results: list[CoordinationUnitResult],
     ) -> str:
-        sections = [
-            f"# 深度研究报告：{request.question.strip()}",
-            "",
-            "## 研究说明",
-            "最终写作智能体未返回完整内容，以下报告由规划结果和各研究分支的有效证据自动汇编。",
-        ]
-        if planner.answer:
-            sections.extend(["", "## 研究计划", planner.answer])
-        for task, result in zip(tasks, branch_results, strict=True):
-            sections.extend(
-                [
-                    "",
-                    f"## {task.title}",
-                    result.answer or f"该研究分支未返回有效内容。{result.error or ''}".strip(),
-                ]
-            )
-        sections.extend(
-            [
-                "",
-                "## 结论与证据缺口",
-                "请结合上述分支结论交叉核验引用；未被检索证据支持的内容不应视为确定事实。",
-            ]
+        from backend.application.agent_workflows.report_convergence_builder import (
+            ReportConvergenceBuilder,
         )
-        return "\n".join(sections).strip()
+
+        return ReportConvergenceBuilder._build_fallback_report(
+            request=request,
+            planner=planner,
+            tasks=tasks,
+            branch_results=branch_results,
+        )
 
     async def _run_parallel(
         self,
         request: AgentRequest,
         context: AgentRuntimeContext,
     ) -> list[CoordinationUnitResult]:
-        roles = {
-            "domain_analyst": "从领域知识、关键概念和技术约束角度独立分析。",
-            "evidence_researcher": "从知识库、工具证据和事实核验角度独立分析。",
-            "risk_reviewer": "从遗漏、风险、反例和授权边界角度独立分析。",
+        first_wave_roles = {
+            role: (
+                self._role_instruction(role, context),
+                self._effective_tool_access(
+                    role=role,
+                    requested=True,
+                    context=context,
+                ),
+            )
+            for role in _MANIFEST_RESEARCH_ROLES
+            if role != "solution_architect"
         }
-        branch_results = list(
+        first_wave_results = list(
             await asyncio.gather(
                 *[
                     self._run_unit(
@@ -659,20 +961,42 @@ class CoordinatedAgentWorkflow:
                         question=f"{instruction}\n\n原始任务：\n{request.question}",
                         request=request,
                         context=context,
+                        tool_access=tool_access,
                     )
-                    for role, instruction in roles.items()
+                    for role, (instruction, tool_access) in first_wave_roles.items()
                 ]
             )
         )
-        evidence = "\n\n".join(
-            f"[{item.role}]\n{item.answer or item.error or '无结果'}" for item in branch_results
+        architect_handoffs = format_handoff_bundle(
+            [result.handoff for result in first_wave_results if result.handoff],
+            max_chars=14000,
+        )
+        architect = await self._run_unit(
+            role="solution_architect",
+            question=(
+                f"{self._role_instruction('solution_architect', context)}\n\n"
+                f"原始任务：\n{request.question}\n\n"
+                f"前置分支结构化交接：\n{architect_handoffs}"
+            ),
+            request=request,
+            context=context,
+            tool_access=self._effective_tool_access(
+                role="solution_architect",
+                requested=True,
+                context=context,
+            ),
+        )
+        branch_results = [*first_wave_results, architect]
+        handoffs = format_handoff_bundle(
+            [result.handoff for result in branch_results if result.handoff],
+            max_chars=18000,
         )
         synthesizer = await self._run_unit(
             role="synthesizer",
             question=(
                 "你是并行结果聚合智能体。比较各分支结论，解决冲突，"
                 "保留有证据支持的内容并直接输出最终答案。\n\n"
-                f"原始任务：\n{request.question}\n\n分支结果：\n{evidence}"
+                f"原始任务：\n{request.question}\n\n结构化分支交接：\n{handoffs}"
             ),
             request=request,
             context=context,
@@ -686,24 +1010,27 @@ class CoordinatedAgentWorkflow:
         context: AgentRuntimeContext,
     ) -> list[CoordinationUnitResult]:
         rounds = [
-            ("analyst", "提出初步分析、假设和证据需求。"),
-            ("critic", "审查上一轮结果，指出错误、遗漏和未经证实的结论并修正。"),
-            ("finalizer", "吸收前两轮结果，必要时补充工具验证，直接输出最终答案。"),
+            ("analyst", "提出初步分析、假设和证据需求。", True),
+            ("critic", "审查上一轮结果，指出错误、遗漏和未经证实的结论并修正。", False),
+            ("finalizer", "吸收前两轮结果并直接输出最终答案。", False),
         ]
         results: list[CoordinationUnitResult] = []
-        shared = ""
-        for role, instruction in rounds:
+        for role, instruction, tool_access in rounds:
+            handoffs = format_handoff_bundle(
+                [result.handoff for result in results if result.handoff],
+                max_chars=14000,
+            )
             result = await self._run_unit(
                 role=role,
                 question=(
                     f"{instruction}\n\n原始任务：\n{request.question}"
-                    + (f"\n\n已有协作结果：\n{shared}" if shared else "")
+                    + (f"\n\n已有结构化交接：\n{handoffs}" if handoffs else "")
                 ),
                 request=request,
                 context=context,
+                tool_access=tool_access,
             )
             results.append(result)
-            shared += f"\n\n[{role}]\n{result.answer or result.error or '无结果'}"
         return results
 
     async def _run_unit(
@@ -714,198 +1041,261 @@ class CoordinatedAgentWorkflow:
         request: AgentRequest,
         context: AgentRuntimeContext,
         tool_access: bool = True,
+        event_sink: WorkflowEventSink | None = None,
+        progress_title: str | None = None,
+        task_id: str | None = None,
+        handoff_evidence_refs: list[str] | None = None,
+        handoff_evidence_records: list[dict[str, Any]] | None = None,
+        stream_answer: bool = False,
+        allowed_tools: set[str] | None = None,
+        timeout_override_seconds: float | None = None,
     ) -> CoordinationUnitResult:
-        unit_request = replace(
-            request,
-            question=question,
-            requested_workflow="full",
-            subagent_enabled=False,
-            metadata={
-                **dict(request.metadata or {}),
-                "coordination_workflow": self.name,
-                "coordination_role": role,
-            },
-        )
-        unit_context = replace(
-            context,
-            workflow_name="full",
-            internal_thread_id=f"{context.internal_thread_id}:coord:{self.name}:{context.request_id}:{role}",
-            subagent_enabled=False,
-            use_search=context.use_search if tool_access else False,
-            kb_ids=list(context.kb_ids) if tool_access else [],
-            selected_skills=list(context.selected_skills) if tool_access else [],
-        )
-        answer_parts: list[str] = []
-        errors: list[str] = []
-        try:
-            executor = await run_blocking(self._delegate.build_executor, unit_request, unit_context)
-            async for raw_event in executor.aquery_stream(
-                question,
-                unit_context.internal_thread_id,
-                self._runnable_config,
-            ):
-                event = self._normalize_event(raw_event, context)
-                if event.type == "message.delta":
-                    answer_parts.append(str(event.payload.get("content") or ""))
-                elif event.type == "error":
-                    errors.append(str(event.payload.get("message") or event.payload.get("error") or ""))
-        except Exception as exc:  # noqa: BLE001
-            errors.append(str(exc))
-        return CoordinationUnitResult(
-            role=role,
-            answer="".join(answer_parts).strip(),
-            error="; ".join(filter(None, errors)) or None,
-        )
+        arguments = dict(locals())
+        arguments.pop("self")
+        return await self._unit_runner._run_unit(**arguments)
 
-    def _planner_prompt(self, request: AgentRequest, context: AgentRuntimeContext) -> str:
-        source_requirements = []
-        if context.kb_ids:
-            source_requirements.append(f"必须检索用户选中的 {len(context.kb_ids)} 个知识库")
-        if context.use_search:
-            source_requirements.append("必须进行联网检索以补充和核验时效性信息")
-        if not source_requirements:
-            source_requirements.append("当前没有外部检索源，只能规划基于模型知识的分析")
-        return (
-            "你是研究规划智能体。把任务拆成 2-4 个可并行、边界清晰、合并后能完整回答"
-            "原问题的研究子任务。只输出 JSON，不要 Markdown。格式："
-            '{"summary":"...","tasks":[{"key":"t1","title":"...","question":"..."}]}。'
-            "每个 question 必须是可直接用于检索的完整查询。\n"
-            f"检索约束：{'；'.join(source_requirements)}。\n\n原始任务：\n{request.question}"
-        )
-
-    def _parse_research_tasks(self, planner_answer: str, original_question: str) -> list[ResearchTask]:
-        text = str(planner_answer or "").strip()
-        if not text:
-            return []
-        fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
-        candidate = fenced.group(1).strip() if fenced else text
-        start = min([pos for pos in (candidate.find("{"), candidate.find("[")) if pos >= 0], default=-1)
-        if start > 0:
-            candidate = candidate[start:]
-        try:
-            parsed, _ = json.JSONDecoder().raw_decode(candidate)
-        except Exception:
-            return []
-        raw_tasks = parsed.get("tasks") if isinstance(parsed, dict) else parsed
-        if not isinstance(raw_tasks, list):
-            return []
-        tasks: list[ResearchTask] = []
-        for index, item in enumerate(raw_tasks[:4], start=1):
-            if not isinstance(item, dict):
-                continue
-            question = str(item.get("question") or item.get("query") or "").strip()
-            if not question:
-                continue
-            tasks.append(
-                ResearchTask(
-                    key=str(item.get("key") or f"t{index}").strip() or f"t{index}",
-                    title=str(item.get("title") or f"研究子任务 {index}").strip(),
-                    question=question,
-                )
-            )
-        return tasks
-
-    def _fallback_research_tasks(self, question: str) -> list[ResearchTask]:
-        if self.name == "plan_solve":
-            return [ResearchTask("t1", "执行计划", question)]
-        return [
-            ResearchTask("t1", "核心事实与技术依据", f"{question} 核心事实 技术依据"),
-            ResearchTask("t2", "现状、案例与最新进展", f"{question} 现状 案例 最新进展"),
-            ResearchTask("t3", "局限、风险与争议", f"{question} 局限 风险 争议"),
-        ]
-
-    def _should_generate_report(self, request: AgentRequest) -> bool:
-        return self.name == "deep_research" or "deep-research" in request.selected_skills
-
-    async def _save_report(
+    async def _run_unit_unmanaged(
         self,
         *,
+        role: str,
+        question: str,
         request: AgentRequest,
         context: AgentRuntimeContext,
-        content: str,
-        sequence: int,
-    ) -> AsyncIterator[AgentEvent]:
-        title_seed = re.sub(r"\s+", " ", request.question).strip()[:48]
-        title = f"深度研究报告：{title_seed}" if title_seed else "深度研究报告"
-        sequence += 1
-        yield self._event(
+        tool_access: bool = True,
+        event_sink: WorkflowEventSink | None = None,
+        progress_title: str | None = None,
+        task_id: str | None = None,
+        handoff_evidence_refs: list[str] | None = None,
+        handoff_evidence_records: list[dict[str, Any]] | None = None,
+        stream_answer: bool = False,
+        allowed_tools: set[str] | None = None,
+        timeout_override_seconds: float | None = None,
+    ) -> CoordinationUnitResult:
+        arguments = dict(locals())
+        arguments.pop("self")
+        return await self._unit_runner._run_unit_unmanaged(**arguments)
+
+    @staticmethod
+    def _evidence_record_ref(record: dict[str, Any]) -> str:
+        return CoordinationHandoffService.evidence_record_ref(**locals())
+
+    @staticmethod
+    def _captured_evidence_ref_map(
+        evidence_refs: list[str],
+        evidence_records: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        return CoordinationHandoffService.captured_evidence_ref_map(**locals())
+
+    @staticmethod
+    def _resolve_captured_ref(
+        raw_ref: str,
+        allowed_refs: dict[str, str],
+    ) -> str | None:
+        return CoordinationHandoffService.resolve_captured_ref(**locals())
+
+    @staticmethod
+    def _parse_structured_convergence_payload(
+        payload: Any,
+    ) -> dict[str, Any] | None:
+        return CoordinationHandoffService.parse_structured_payload(**locals())
+
+    @staticmethod
+    def _sanitize_structured_convergence_handoff(
+        payload: Any,
+        *,
+        role: str,
+        objective: str,
+        answer_fallback: str,
+        task_id: str,
+        evidence_refs: list[str],
+        evidence_records: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        return CoordinationHandoffService.sanitize_structured_handoff(**locals())
+
+    @staticmethod
+    def _build_tool_free_convergence_prompt(
+        *,
+        objective: str,
+        partial_answer: str,
+        evidence_refs: list[str],
+        evidence_records: list[dict[str, Any]],
+    ) -> str:
+        return CoordinationHandoffService.build_tool_free_convergence_prompt(**locals())
+
+    @staticmethod
+    def _collect_dynamic_web_evidence(
+        process_events: list[dict[str, Any]],
+        *,
+        evidence_refs: list[str] | None = None,
+        evidence_records: list[dict[str, Any]] | None = None,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        return CoordinationHandoffService.collect_dynamic_web_evidence(**locals())
+
+    @staticmethod
+    def _task_scoped_unit_process_event(
+        event: AgentEvent,
+        *,
+        task_id: str | None,
+        role: str,
+    ) -> dict[str, Any] | None:
+        return CoordinationHandoffService.task_scoped_unit_process_event(**locals())
+
+    def _planner_prompt(
+        self, request: AgentRequest, context: AgentRuntimeContext
+    ) -> str:
+        return build_planner_prompt(
+            request,
             context,
-            sequence,
-            "workflow.step",
-            {
-                "status": "正在生成可下载的深度研究报告",
-                "content": "正在生成可下载的深度研究报告",
-            },
+            max_tasks=self._research_llm_capacity(),
         )
-        sequence += 1
-        yield self._event(
+
+    def _research_llm_capacity(self) -> int:
+        if self.name == "plan_solve":
+            return self._runtime_budget.plan_solve_max_concurrent_subagents
+        return self._runtime_budget.max_concurrent_research
+
+    def _minimum_research_branch_start_seconds(self) -> float:
+        """Return the floor below which a new branch cannot make a safe handoff."""
+
+        return max(
+            0.0,
+            float(self._runtime_budget.deep_research_branch_min_start_seconds),
+        )
+
+    def _max_spawned_agents(self) -> int:
+        """Size the tree for every bounded attempt the workflow can schedule."""
+
+        if self.name == "deep_research":
+            attempts = max(
+                1,
+                int(self._runtime_budget.deep_research_structured_output_attempts),
+            )
+            reflection_units = max(
+                0,
+                int(self._runtime_budget.deep_research_reflection_rounds),
+            ) * (
+                attempts
+                + max(0, int(self._runtime_budget.deep_research_followup_tasks))
+            )
+            return max(
+                16,
+                attempts
+                + int(self._runtime_budget.max_concurrent_research)
+                + reflection_units
+                + 1,  # final report writer
+            )
+        if self.name == "plan_solve":
+            return max(
+                16,
+                int(self._runtime_budget.deep_research_structured_output_attempts)
+                + int(self._runtime_budget.plan_solve_max_concurrent_subagents)
+                + 1,  # reviewer
+            )
+        # Parallel mode currently uses five specialists plus one synthesizer;
+        # alternating mode uses three sequential roles. Preserve headroom for
+        # future bounded additions without sharing deep-research assumptions.
+        return 16
+
+    def _coordinated_retrieval_budgets(
+        self,
+        context: AgentRuntimeContext,
+    ) -> dict[str, int]:
+        """Bound a request without making parallel branches share one quota."""
+
+        if self.name != "deep_research":
+            return {
+                "multi_kb_search": 3,
+                "web_search": 10,
+                "academic_search": 5,
+            }
+
+        per_branch = RetrievalRuntimePolicy.for_mode(
+            deep_research=True,
+            academic_enabled=("academic-search" in set(context.selected_skills or [])),
+        ).tool_budgets()
+        per_branch["web_search"] = min(
+            per_branch.get("web_search", _DEEP_RESEARCH_BRANCH_WEB_CALLS),
+            _DEEP_RESEARCH_BRANCH_WEB_CALLS,
+        )
+        max_branch_executions = self._research_llm_capacity() + (
+            self._runtime_budget.deep_research_reflection_rounds
+            * self._runtime_budget.deep_research_followup_tasks
+        )
+        return {
+            tool_name: calls * max(1, max_branch_executions)
+            for tool_name, calls in per_branch.items()
+        }
+
+    def _parse_research_tasks(
+        self,
+        planner_answer: str,
+        original_question: str,
+        context: AgentRuntimeContext | None = None,
+    ) -> list[ResearchTask]:
+        return parse_research_tasks(
+            planner_answer,
+            original_question,
             context,
-            sequence,
-            "workflow.step",
-            {
-                "event": make_process_event(
-                    "artifact_update",
-                    "深度研究报告（预览）",
-                    "最终 Markdown 报告已生成，DOCX 文件正在归档。",
-                    tool="save_deep_research_report",
-                    level="active",
-                    metadata={
-                        "id": f"deep-research-preview:{context.request_id}",
-                        "file_id": f"deep-research-preview:{context.request_id}",
-                        "title": title,
-                        "type": "markdown",
-                        "content": content,
-                        "previewable": True,
-                        "virtual_artifact": True,
-                        "is_streaming": False,
-                    },
-                )
-            },
+            max_tasks=self._research_llm_capacity(),
         )
-        try:
-            report_payload = await save_deep_research_report_direct(
-                thread_id=context.internal_thread_id,
-                title=title,
-                content=content,
-            )
-            artifact_path = str(report_payload.get("artifact_path") or "")
-            artifact_metadata = await build_registered_artifact_metadata(
-                internal_thread_id=context.internal_thread_id,
-                artifact_path=artifact_path,
-                title=str(report_payload.get("title") or title),
-                minio_object=str(report_payload.get("minio_object") or "") or None,
-            )
-            sequence += 1
-            yield self._event(
-                context,
-                sequence,
-                "workflow.step",
-                {
-                    "event": make_process_event(
-                        "artifact",
-                        str(report_payload.get("title") or title),
-                        "研究报告已生成，可下载 DOCX 文件。",
-                        tool="save_deep_research_report",
-                        level="success",
-                        metadata=artifact_metadata,
-                    )
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
-            sequence += 1
-            yield self._event(
-                context,
-                sequence,
-                "workflow.step",
-                {
-                    "event": make_process_event(
-                        "status",
-                        "报告归档失败",
-                        f"答案已生成，但 DOCX 报告保存失败：{exc}",
-                        level="warning",
-                    )
-                },
-            )
+
+    def _fallback_research_tasks(
+        self,
+        question: str,
+        context: AgentRuntimeContext | None = None,
+    ) -> list[ResearchTask]:
+        return fallback_research_tasks(self.name, question, context)
+
+    @staticmethod
+    def _writer_safe_branch_results(
+        branch_results: list[CoordinationUnitResult],
+    ) -> list[CoordinationUnitResult]:
+        return CoordinationHandoffService.writer_safe_branch_results(**locals())
+
+    @staticmethod
+    def _format_evidence_matrix(
+        branch_results: list[CoordinationUnitResult],
+        *,
+        max_chars: int = 24000,
+    ) -> str:
+        from backend.application.agent_workflows.report_convergence_builder import (
+            ReportConvergenceBuilder,
+        )
+
+        return ReportConvergenceBuilder._format_evidence_matrix(
+            branch_results,
+            max_chars=max_chars,
+        )
+
+    @staticmethod
+    def _claim_fingerprint(text: str) -> set[str]:
+        from backend.application.agent_workflows.report_convergence_builder import (
+            ReportConvergenceBuilder,
+        )
+
+        return ReportConvergenceBuilder._claim_fingerprint(text)
+
+    @staticmethod
+    def _answer_claim_candidates(answer: str) -> list[str]:
+        from backend.application.agent_workflows.report_convergence_builder import (
+            ReportConvergenceBuilder,
+        )
+
+        return ReportConvergenceBuilder._answer_claim_candidates(answer)
+
+    @staticmethod
+    def _verify_answer_against_matrix(
+        answer: str,
+        branch_results: list[CoordinationUnitResult],
+    ) -> str:
+        from backend.application.agent_workflows.report_convergence_builder import (
+            ReportConvergenceBuilder,
+        )
+
+        return ReportConvergenceBuilder._verify_answer_against_matrix(
+            answer,
+            branch_results,
+        )
 
     @staticmethod
     def _normalize_event(raw_event: Any, context: AgentRuntimeContext) -> AgentEvent:
@@ -939,6 +1329,19 @@ class CoordinatedAgentWorkflow:
             thread_id=context.external_thread_id,
             sequence=sequence,
             payload=payload,
+        )
+
+    def _unit_thread_id(
+        self,
+        context: AgentRuntimeContext,
+        *,
+        unit_key: str,
+    ) -> str:
+        """Return the stable checkpointer thread for one child execution."""
+
+        return (
+            f"{context.internal_thread_id}:coord:{self.name}:"
+            f"{context.request_id}:{unit_key}"
         )
 
     def build_executor(self, request: AgentRequest, context: AgentRuntimeContext):

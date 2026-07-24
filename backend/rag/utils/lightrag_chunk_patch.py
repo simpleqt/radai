@@ -10,12 +10,23 @@ LightRAG chunk 查询 Monkey Patch
     在 RAG 初始化时调用 apply_chunk_query_patch()
 """
 
-import asyncio
-from typing import List, Dict, Any, Optional
-from lightrag.utils import split_string_by_multi_markers, GRAPH_FIELD_SEP
 import logging
+import time
+from typing import Any, Dict, List, Optional
+
+from backend.core.utils.env import positive_float_from_env
 
 logger = logging.getLogger(__name__)
+
+
+# MilvusClient.query 是同步 RPC，不能直接在异步事件循环中调用。
+# 外层线程等待略长于 RPC timeout，用于接收服务端返回的超时异常。
+_MILVUS_CHUNK_QUERY_TIMEOUT_SECONDS = positive_float_from_env(
+    "MILVUS_CHUNK_QUERY_TIMEOUT_SECONDS", 15.0
+)
+_MILVUS_CHUNK_QUERY_WAIT_SECONDS = positive_float_from_env(
+    "MILVUS_CHUNK_QUERY_WAIT_SECONDS", 17.0
+)
 
 
 async def _query_chunks_from_milvus_batch(
@@ -36,6 +47,10 @@ async def _query_chunks_from_milvus_batch(
     """
     milvus_client = chunks_vdb._client
     collection_name = chunks_vdb.final_namespace
+
+    # run_blocking 使用应用级有界线程池：请求超时后不会继续占用事件循环，
+    # 同时会保留线程池容量直到未协作的底层 RPC 真正结束，避免无限制创建线程。
+    from backend.application.blocking import run_blocking
     
     query_fields = ["id", "content", "file_path", "full_doc_id", "created_at"]
     
@@ -51,12 +66,29 @@ async def _query_chunks_from_milvus_batch(
                 chunk_ids_str = '", "'.join(batch_chunk_ids)
                 expr = f'id in ["{chunk_ids_str}"]'
             
-            milvus_results = milvus_client.query(
-                collection_name=collection_name,
-                filter=expr,
-                output_fields=query_fields,
-                limit=len(batch_chunk_ids)
-            )
+            def _query_sync():
+                return milvus_client.query(
+                    collection_name=collection_name,
+                    filter=expr,
+                    output_fields=query_fields,
+                    limit=len(batch_chunk_ids),
+                    timeout=_MILVUS_CHUNK_QUERY_TIMEOUT_SECONDS,
+                )
+
+            started_at = time.monotonic()
+            try:
+                milvus_results = await run_blocking(
+                    _query_sync,
+                    timeout_seconds=_MILVUS_CHUNK_QUERY_WAIT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Milvus chunk 查询批次 %d 超时（%.1fs），跳过 fallback，避免阻塞事件循环: collection=%s",
+                    i // batch_size + 1,
+                    time.monotonic() - started_at,
+                    collection_name,
+                )
+                break
             
             if milvus_results:
                 for record in milvus_results:
@@ -133,8 +165,6 @@ def patch_find_related_text_unit_from_entities():
     - 新逻辑：优先从 text_chunks_db 查询，缺失时 fallback 到 chunks_vdb (Milvus)
     """
     import lightrag.operate as operate_module
-    
-    original_func = operate_module._find_related_text_unit_from_entities
     
     async def patched_func(
         node_datas: list[dict],
@@ -295,8 +325,6 @@ def patch_find_related_text_unit_from_relations():
     Patch _find_related_text_unit_from_relations 函数添加 Milvus fallback
     """
     import lightrag.operate as operate_module
-    
-    original_func = operate_module._find_related_text_unit_from_relations
     
     async def patched_func(
         edge_datas: list[dict],

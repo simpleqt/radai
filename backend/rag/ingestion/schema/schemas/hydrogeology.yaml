@@ -1,0 +1,71 @@
+schema_id: hydrogeology
+version: "1.0"
+subject: hydrogeology
+min_entity_confidence: 60
+min_relation_confidence: 60
+candidate_confidence: 40
+
+entity_types:
+  aquifer:
+    description: 含水层、隔水层或地层单元
+    aliases: [含水层, 隔水层, 地层, 地层单元]
+  contaminant:
+    description: 污染物、离子、化学指标
+    aliases: [污染物, 离子, 化学指标]
+  location:
+    description: 区域、井位、剖面或采样点
+    aliases: [区域, 井位, 剖面, 采样点, 地点, 位置]
+  parameter:
+    description: 水位、渗透系数、浓度、流速等参数
+    aliases: [参数, 水位, 渗透系数, 浓度, 流速]
+  process:
+    description: 补给、径流、排泄、迁移、吸附等过程
+    aliases: [过程, 补给, 径流, 排泄, 迁移, 吸附]
+  method:
+    description: 试验、模型、监测或评价方法
+    aliases: [方法, 试验, 模型, 监测, 评价方法]
+  term:
+    description: 其他专业术语
+  term_cn:
+    description: 其他中文专业术语
+  model_or_code:
+    description: 型号、编号、缩写或代码
+
+relation_types:
+  located_in:
+    description: 实体位于某区域或层位
+    aliases: [位于, 所在, 位于区域]
+    allowed_source_types: [aquifer, contaminant, parameter, process]
+    allowed_target_types: [location, aquifer]
+    min_confidence: 65
+  has_parameter:
+    description: 实体具有某参数
+    aliases: [具有参数, 参数]
+    allowed_source_types: [aquifer, contaminant, process, location]
+    allowed_target_types: [parameter]
+    min_confidence: 60
+  affects:
+    description: 过程或污染物影响对象/参数
+    aliases: [影响, 作用于]
+    allowed_source_types: [process, contaminant, aquifer]
+    allowed_target_types: [aquifer, contaminant, parameter, location]
+    min_confidence: 70
+  measured_by:
+    description: 指标由方法测得
+    aliases: [测得, 测量方法, 由方法测得]
+    allowed_source_types: [parameter, contaminant, aquifer]
+    allowed_target_types: [method]
+    min_confidence: 65
+  intersects:
+    description: 地质体、断层或层位之间存在切割、交切或穿越关系
+    aliases: [切割, 交切, 穿越]
+    allowed_source_types: [aquifer, model_or_code, term, term_cn]
+    allowed_target_types: [aquifer, location, term, term_cn]
+    min_confidence: 65
+  co_occurs:
+    description: 同一 chunk 中共同出现的弱关联
+    aliases: [共现, 共同出现, 相关]
+    min_confidence: 50
+
+forbidden_relations:
+  - causality_without_evidence

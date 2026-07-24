@@ -10,19 +10,24 @@
 
 from __future__ import annotations
 
-import logging
+import asyncio
 import os
 import time
 from typing import Any, Dict, List, Optional, Union
 
+import httpx
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult, ChatGenerationChunk
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from backend.config.loggers import get_logger
 
 logger = get_logger(__name__)
+
+
+def _is_cancelled_error(error: BaseException) -> bool:
+    return isinstance(error, asyncio.CancelledError)
 
 def _extract_llm_token_usage(response: LLMResult) -> dict[str, Any]:
     llm_output = response.llm_output if isinstance(response.llm_output, dict) else {}
@@ -60,11 +65,18 @@ def _extract_chat_finish_reasons(response: LLMResult) -> list[str]:
 class LLMPerformanceCallback(BaseCallbackHandler):
     """Callback to log LLM performance and context size."""
 
-    def _elapsed_ms(self) -> float:
-        start = getattr(self, "start_time", None)
+    def _elapsed_ms(self, run_id: Any | None = None) -> float:
+        starts = getattr(self, "_run_start_times", {})
+        start = starts.get(run_id) if run_id is not None else None
+        if start is None:
+            start = getattr(self, "start_time", None)
         if start is None:
             return 0.0
         return (time.time() - start) * 1000
+
+    def _finish_run(self, run_id: Any) -> None:
+        getattr(self, "_run_start_times", {}).pop(run_id, None)
+        getattr(self, "_first_token_times", {}).pop(run_id, None)
 
     def on_chat_model_start(
         self,
@@ -77,7 +89,8 @@ class LLMPerformanceCallback(BaseCallbackHandler):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
-        model_name = metadata.get("model_name") or serialized.get("name") or "unknown"
+        safe_metadata = metadata or {}
+        model_name = safe_metadata.get("model_name") or serialized.get("name") or "unknown"
         total_chars = 0
         for msg_list in messages:
             for msg in msg_list:
@@ -90,10 +103,14 @@ class LLMPerformanceCallback(BaseCallbackHandler):
                             total_chars += len(part["text"])
         
         logger.info(
-            f"[LLMPerformance] 开始调用 model={model_name}, messages_count={len(messages[0])}, total_chars={total_chars}, run_id={run_id}"
+            f"[LLMPerformance] 开始调用 model={model_name}, messages_count={sum(len(item) for item in messages)}, total_chars={total_chars}, run_id={run_id}"
         )
-        self.start_time = time.time()
-        self.first_token_time = None
+        started_at = time.time()
+        self.start_time = started_at
+        self._run_start_times = getattr(self, "_run_start_times", {})
+        self._run_start_times[run_id] = started_at
+        self._first_token_times = getattr(self, "_first_token_times", {})
+        self._first_token_times.pop(run_id, None)
 
     def on_llm_new_token(
         self,
@@ -104,9 +121,13 @@ class LLMPerformanceCallback(BaseCallbackHandler):
         parent_run_id: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
-        if self.first_token_time is None:
-            self.first_token_time = time.time()
-            ttft = (self.first_token_time - self.start_time) * 1000
+        first_tokens = getattr(self, "_first_token_times", {})
+        if run_id not in first_tokens:
+            first_token_time = time.time()
+            first_tokens[run_id] = first_token_time
+            self._first_token_times = first_tokens
+            started_at = getattr(self, "_run_start_times", {}).get(run_id, first_token_time)
+            ttft = (first_token_time - started_at) * 1000
             logger.info(f"[LLMPerformance] 首包延迟 (TTFT): {ttft:.2f}ms, run_id={run_id}")
 
     def on_chat_model_end(
@@ -123,11 +144,12 @@ class LLMPerformanceCallback(BaseCallbackHandler):
         logger.info(
             "[LLMPerformance] Chat模型调用结束 duration=%.2fms, total_tokens=%s, "
             "finish_reason=%s, run_id=%s",
-            self._elapsed_ms(),
+            self._elapsed_ms(run_id),
             total_tokens,
             finish_reasons or "-",
             run_id,
         )
+        self._finish_run(run_id)
 
     def on_chat_model_error(
         self,
@@ -137,13 +159,23 @@ class LLMPerformanceCallback(BaseCallbackHandler):
         parent_run_id: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
+        if _is_cancelled_error(error):
+            logger.info(
+                "[LLMPerformance] Chat模型调用已取消 run_id=%s, duration=%.2fms, error=%r",
+                run_id,
+                self._elapsed_ms(run_id),
+                error,
+            )
+            self._finish_run(run_id)
+            return
         logger.error(
             "[LLMPerformance] Chat模型调用异常 run_id=%s, duration=%.2fms, error=%r",
             run_id,
-            self._elapsed_ms(),
+            self._elapsed_ms(run_id),
             error,
             exc_info=error,
         )
+        self._finish_run(run_id)
 
     def on_llm_end(
         self,
@@ -157,10 +189,11 @@ class LLMPerformanceCallback(BaseCallbackHandler):
         total_tokens = usage.get("total_tokens", 0)
         logger.info(
             "[LLMPerformance] LLM调用结束 duration=%.2fms, total_tokens=%s, run_id=%s",
-            self._elapsed_ms(),
+            self._elapsed_ms(run_id),
             total_tokens,
             run_id,
         )
+        self._finish_run(run_id)
 
     def on_llm_error(
         self,
@@ -170,17 +203,39 @@ class LLMPerformanceCallback(BaseCallbackHandler):
         parent_run_id: Optional[Any] = None,
         **kwargs: Any,
     ) -> None:
+        if _is_cancelled_error(error):
+            logger.info(
+                "[LLMPerformance] LLM调用已取消 run_id=%s, duration=%.2fms, error=%r",
+                run_id,
+                self._elapsed_ms(run_id),
+                error,
+            )
+            self._finish_run(run_id)
+            return
         logger.error(
             "[LLMPerformance] LLM调用异常 run_id=%s, duration=%.2fms, error=%r",
             run_id,
-            self._elapsed_ms(),
+            self._elapsed_ms(run_id),
             error,
             exc_info=error,
         )
+        self._finish_run(run_id)
 
 _CONFIG_AVAILABLE: bool | None = None
 _DB_FAILURE_BACKOFF_SECONDS = 60.0
 _db_unavailable_until = 0.0
+
+_REASONING_COMPAT_CHAT_OPENAI = (
+    "backend.core.models.patched_deepseek_openai:PatchedDeepSeekOpenAI"
+)
+
+
+def _resolve_model_use(model_config: Any) -> str:
+    """Use the streaming/tool-call compatible adapter for ChatOpenAI models."""
+    model_use = str(model_config.use)
+    if model_use.lower() == "langchain_openai:chatopenai":
+        return _REASONING_COMPAT_CHAT_OPENAI
+    return model_use
 
 
 def _check_config_available() -> bool:
@@ -210,10 +265,11 @@ def _create_from_config(name: str | None, thinking_enabled: bool, **kwargs: Any)
     if model_config is None:
         raise ValueError(f"Model {name} not found in config.yaml")
 
-    model_class = resolve_class(model_config.use, BaseChatModel)
+    model_class = resolve_class(_resolve_model_use(model_config), BaseChatModel)
     model_settings = _build_model_settings(model_config, thinking_enabled, kwargs)
+    model_settings.update(kwargs)
 
-    model_instance = model_class(**kwargs, **model_settings)
+    model_instance = model_class(**model_settings)
 
     # 注入性能监控回调
     perf_callback = LLMPerformanceCallback()
@@ -345,12 +401,11 @@ def _create_from_db_config(db_config: dict, thinking_enabled: bool, **kwargs: An
     
     # 借助现有的 ModelConfig 对象承载和验证，利用它的默认值和结构
     model_config_obj = ModelConfig(**db_config)
-    name = model_config_obj.name
-    
-    model_class = resolve_class(model_config_obj.use, BaseChatModel)
+    model_class = resolve_class(_resolve_model_use(model_config_obj), BaseChatModel)
     model_settings = _build_model_settings(model_config_obj, thinking_enabled, kwargs)
+    model_settings.update(kwargs)
 
-    model_instance = model_class(**kwargs, **model_settings)
+    model_instance = model_class(**model_settings)
 
     # 注入性能监控回调
     perf_callback = LLMPerformanceCallback()
@@ -380,12 +435,25 @@ def _ensure_tool_calling_stream_compat(model_settings: dict, *, model_use: str) 
     ChatOpenAI-compatible models, keep normal text streaming but force model
     rounds with bound tools to use a non-streaming request.
     """
-    if "chatopenai" not in str(model_use).lower():
+    normalized_use = str(model_use).lower()
+    if "chatopenai" not in normalized_use and "patcheddeepseekopenai" not in normalized_use:
         return
     model_settings.setdefault("disable_streaming", "tool_calling")
 
 
+def _inject_no_proxy_http_clients(model_settings: dict, *, model_use: str) -> None:
+    """Force OpenAI-compatible model clients to ignore proxy environment vars."""
+    normalized_use = str(model_use).lower()
+    if "chatopenai" not in normalized_use and "patcheddeepseekopenai" not in normalized_use:
+        return
+    if "http_client" not in model_settings:
+        model_settings["http_client"] = httpx.Client(trust_env=False)
+    if "http_async_client" not in model_settings:
+        model_settings["http_async_client"] = httpx.AsyncClient(trust_env=False)
+
+
 def _build_model_settings(model_config_obj: Any, thinking_enabled: bool, kwargs: dict) -> dict[str, Any]:
+    model_use = _resolve_model_use(model_config_obj)
     model_settings = model_config_obj.model_dump(
         exclude_none=True,
         exclude={
@@ -396,9 +464,10 @@ def _build_model_settings(model_config_obj: Any, thinking_enabled: bool, kwargs:
         },
     )
     _apply_thinking_and_profile_settings(
-        model_config_obj, model_settings, thinking_enabled, kwargs, model_use=model_config_obj.use
+        model_config_obj, model_settings, thinking_enabled, kwargs, model_use=model_use
     )
-    _ensure_tool_calling_stream_compat(model_settings, model_use=model_config_obj.use)
+    _ensure_tool_calling_stream_compat(model_settings, model_use=model_use)
+    _inject_no_proxy_http_clients(model_settings, model_use=model_use)
     return model_settings
 
 
@@ -434,6 +503,20 @@ def create_chat_model(
             logger.warning("Config-based model creation failed for '%s': %s, falling back to settings", name, e)
 
     return _create_from_settings(name, **kwargs)
+
+
+async def create_chat_model_async(
+    name: str | None = None,
+    thinking_enabled: bool = False,
+    **kwargs: Any,
+) -> BaseChatModel:
+    """Create a model without blocking an async caller on DB/config I/O."""
+    return await asyncio.to_thread(
+        create_chat_model,
+        name,
+        thinking_enabled,
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------

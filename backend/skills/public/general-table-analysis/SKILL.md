@@ -1,6 +1,7 @@
 ---
 name: general-table-analysis
 description: 通用表格分析能力。用于分析用户上传或系统已有的 Excel/CSV 表格，包括表结构探查、SQL 查询、统计摘要、缺失值分析、分组聚合、排序筛选和可视化图表生成。不限定专业领域。
+domain: "*"
 tools:
   - inspect_excel_data
   - query_excel_data

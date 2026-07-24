@@ -14,7 +14,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from lightrag.utils import compute_mdhash_id
@@ -68,7 +68,7 @@ class MDIngestor:
     async def _get_http_client(self) -> httpx.AsyncClient:
         """获取HTTP客户端"""
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=120.0)
+            self._http_client = httpx.AsyncClient(trust_env=False, timeout=120.0)
         return self._http_client
 
     async def close(self):

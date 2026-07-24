@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final
+from typing import Final, Literal
 
 import yaml
+
+from backend.core.utils.normalization import normalize_string_set
 
 LIGHTWEIGHT_WORKFLOW: Final[str] = "lightweight"
 FULL_WORKFLOW: Final[str] = "full"
@@ -19,6 +21,10 @@ DEEP_RESEARCH_WORKFLOW: Final[str] = "deep_research"
 PLAN_SOLVE_WORKFLOW: Final[str] = "plan_solve"
 MULTI_AGENT_PARALLEL_WORKFLOW: Final[str] = "multi_agent_parallel"
 MULTI_AGENT_ALTERNATING_WORKFLOW: Final[str] = "multi_agent_alternating"
+ExecutionStrategy = Literal["graph", "lightweight", "coordinated"]
+SUPPORTED_EXECUTION_STRATEGIES: Final[frozenset[str]] = frozenset(
+    {"graph", "lightweight", "coordinated"}
+)
 
 
 @dataclass(frozen=True)
@@ -29,18 +35,11 @@ class WorkflowSpec:
     capabilities: set[str] = field(default_factory=set)
     full_capability: bool = False
     subagent_enabled: bool = False
+    execution_strategy: ExecutionStrategy = "graph"
 
 
 def _config_path() -> Path:
     return Path(__file__).resolve().parents[2] / "config" / "workflows" / "registry.yaml"
-
-
-def _str_set(value: Any) -> set[str]:
-    if isinstance(value, str):
-        return {value.strip()} if value.strip() else set()
-    if not isinstance(value, list):
-        return set()
-    return {str(item).strip() for item in value if str(item or "").strip()}
 
 
 def _load_workflow_specs(path: Path | None = None) -> dict[str, WorkflowSpec]:
@@ -60,8 +59,14 @@ def _load_workflow_specs(path: Path | None = None) -> dict[str, WorkflowSpec]:
         provider = str(value.get("provider") or "").strip()
         if not normalized_name or not provider:
             continue
-        aliases = _str_set(value.get("aliases")) | {normalized_name}
-        capabilities = _str_set(value.get("capabilities")) or {normalized_name}
+        aliases = normalize_string_set(value.get("aliases")) | {normalized_name}
+        capabilities = normalize_string_set(value.get("capabilities")) or {normalized_name}
+        execution_strategy = str(value.get("execution_strategy") or "graph").strip().lower()
+        if execution_strategy not in SUPPORTED_EXECUTION_STRATEGIES:
+            raise ValueError(
+                f"Workflow {normalized_name} has invalid execution_strategy: "
+                f"{execution_strategy}"
+            )
         if bool(value.get("full_capability", False)):
             capabilities.add(FULL_WORKFLOW)
         specs[normalized_name] = WorkflowSpec(
@@ -71,6 +76,7 @@ def _load_workflow_specs(path: Path | None = None) -> dict[str, WorkflowSpec]:
             capabilities=capabilities,
             full_capability=bool(value.get("full_capability", False)),
             subagent_enabled=bool(value.get("subagent_enabled", False)),
+            execution_strategy=execution_strategy,  # type: ignore[arg-type]
         )
     if not specs:
         raise ValueError(f"Workflow registry contains no valid workflows: {path}")

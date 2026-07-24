@@ -6,7 +6,6 @@
 v2：传递 query_type、embedding_func 完整支持三维度自适应改进
 """
 
-import asyncio
 import time
 from datetime import date, datetime
 from pathlib import Path
@@ -23,7 +22,7 @@ from backend.rag.content_filter.models import (
 )
 from backend.rag.content_filter.mmr_reranker import VectorMMRReranker
 from backend.rag.content_filter.ppr_filter import PPRFilteredData, PPRGraphFilter
-from backend.rag.content_filter.reranker import rerank_filtered_chunks, call_rerank_api, time_aware_fusion
+from backend.rag.content_filter.reranker import rerank_filtered_chunks, time_aware_fusion
 from backend.rag.keywords.models import QueryType
 
 logger = get_logger(__name__)
@@ -410,6 +409,40 @@ class PerKBContentFilter:
                 relationships=list(raw_data.relationships or []),
                 chunks=list(raw_data.chunks or []),
             )
+            filtered_data.chunks = await self.mmr_rerank(
+                query, filtered_data.chunks, query_type=query_type
+            )
+        elif mode == FilterMode.MMR_TIME_AWARE:
+            # 跳过 PPR 与 Rerank，先做 Time-Aware 时间感知加权，再做 MMR 去重
+            filtered_data = PPRFilteredData(
+                entities=list(raw_data.entities or []),
+                relationships=list(raw_data.relationships or []),
+                chunks=list(raw_data.chunks or []),
+            )
+            if self.config.time_aware.enabled:
+                logger.info(
+                    "[时间感知·MMR_TIME_AWARE] 启用: sigma=%.2f, alpha_base=%.2f, high_boost=%.2f, low_penalty=%.2f, undated_beta=%.2f, created_at_beta=%.2f",
+                    float(self.config.time_aware.sigma),
+                    float(self.config.time_aware.alpha_base),
+                    float(self.config.time_aware.time_high_boost),
+                    float(self.config.time_aware.time_low_penalty),
+                    float(self.config.time_aware.undated_doc_beta),
+                    float(self.config.time_aware.created_at_fallback_beta),
+                )
+                await self._annotate_chunk_time_features(filtered_data.chunks)
+                time_aware_fusion(
+                    query=query,
+                    chunks=filtered_data.chunks,
+                    query_type=query_type,
+                    sigma=float(self.config.time_aware.sigma),
+                    alpha_base=float(self.config.time_aware.alpha_base),
+                    time_high_boost=float(self.config.time_aware.time_high_boost),
+                    time_low_penalty=float(self.config.time_aware.time_low_penalty),
+                )
+                filtered_data.chunks.sort(
+                    key=lambda c: float(c.get("_fused_score", 0.0)),
+                    reverse=True,
+                )
             filtered_data.chunks = await self.mmr_rerank(
                 query, filtered_data.chunks, query_type=query_type
             )

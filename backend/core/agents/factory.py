@@ -63,7 +63,9 @@ def create_agent_graph(
     if middleware is not None and features is not None:
         raise ValueError("Cannot specify both 'middleware' and 'features'.")
     if middleware is not None and extra_middleware:
-        raise ValueError("Cannot use 'extra_middleware' with 'middleware' (full takeover).")
+        raise ValueError(
+            "Cannot use 'extra_middleware' with 'middleware' (full takeover)."
+        )
 
     effective_tools: list[BaseTool] = list(tools or [])
     effective_state = state_schema or ThreadState
@@ -83,9 +85,19 @@ def create_agent_graph(
                 effective_tools.append(t)
                 existing_names.add(t.name)
 
+    # Execution-policy middleware needs the final materialized tools so retry,
+    # concurrency, output and cache annotations apply equally to registry and
+    # feature-injected tools.
+    for middleware_item in effective_middleware:
+        bind_tools = getattr(middleware_item, "bind_tools", None)
+        if callable(bind_tools):
+            bind_tools(effective_tools)
+
     if system_prompt:
-        logger.info(f"[AgentGraph] 创建图 {name}, system_prompt 长度: {len(system_prompt)}")
-    
+        logger.info(
+            f"[AgentGraph] 创建图 {name}, system_prompt 长度: {len(system_prompt)}"
+        )
+
     return create_agent(
         model=model,
         tools=effective_tools or None,
@@ -108,16 +120,26 @@ def _assemble_from_features(
     Middleware order:
       0.   DanglingToolCallMiddleware (always)
       1.   GuardrailMiddleware (guardrail feature)
-      2.   ToolErrorHandlingMiddleware (always)
-      3.   SummarizationMiddleware (summarization feature)
-      4.   ViewImageMiddleware (vision feature)
-      5.   SubagentLimitMiddleware (subagent feature)
-      6.   LoopDetectionMiddleware (always)
-      7.   Extra middlewares inserted before the end of the chain
+      2.   RuntimeBudgetMiddleware (always)
+      3.   ToolErrorHandlingMiddleware (always)
+      4.   SummarizationMiddleware (summarization feature)
+      5.   ViewImageMiddleware (vision feature)
+      6.   SubagentLimitMiddleware (subagent feature)
+      7.   ToolBudgetAvailabilityMiddleware (always)
+      8.   LoopDetectionMiddleware (always)
+      9.   Extra middlewares inserted before the end of the chain
     """
-    from backend.core.agents.middlewares.dangling_tool_call import DanglingToolCallMiddleware
-    from backend.core.agents.middlewares.tool_error_handling import ToolErrorHandlingMiddleware
+    from backend.core.agents.middlewares.dangling_tool_call import (
+        DanglingToolCallMiddleware,
+    )
     from backend.core.agents.middlewares.loop_detection import LoopDetectionMiddleware
+    from backend.core.agents.middlewares.runtime_budget import RuntimeBudgetMiddleware
+    from backend.core.agents.middlewares.tool_budget_availability import (
+        ToolBudgetAvailabilityMiddleware,
+    )
+    from backend.core.agents.middlewares.tool_error_handling import (
+        ToolErrorHandlingMiddleware,
+    )
 
     chain: list[AgentMiddleware] = []
     extra_tools: list[BaseTool] = []
@@ -128,30 +150,48 @@ def _assemble_from_features(
         if isinstance(feat.guardrail, AgentMiddleware):
             chain.append(feat.guardrail)
         else:
-            raise ValueError("guardrail=True requires a custom AgentMiddleware instance")
+            raise ValueError(
+                "guardrail=True requires a custom AgentMiddleware instance"
+            )
 
+    chain.append(RuntimeBudgetMiddleware())
     chain.append(ToolErrorHandlingMiddleware())
 
     if feat.summarization is not False:
         if isinstance(feat.summarization, AgentMiddleware):
             chain.append(feat.summarization)
         else:
-            raise ValueError("summarization=True requires a custom AgentMiddleware instance")
+            raise ValueError(
+                "summarization=True requires a custom AgentMiddleware instance"
+            )
 
     if feat.vision is not False:
         if isinstance(feat.vision, AgentMiddleware):
             chain.append(feat.vision)
         else:
             from backend.core.agents.middlewares.view_image import ViewImageMiddleware
+
             chain.append(ViewImageMiddleware())
 
     if feat.subagent is not False:
         if isinstance(feat.subagent, AgentMiddleware):
             chain.append(feat.subagent)
         else:
-            from backend.core.agents.middlewares.subagent_limit import SubagentLimitMiddleware
+            from backend.core.agents.middlewares.subagent_limit import (
+                SubagentLimitMiddleware,
+            )
+
             chain.append(SubagentLimitMiddleware())
 
+        # ``SubagentLimitMiddleware`` observes oversized delegation bursts; it
+        # does not expose the delegation tool itself. Keep tool injection here so every
+        # graph that enables the feature receives the same bounded ``task``
+        # capability, while child graphs (subagent=False) cannot recurse.
+        from backend.core.tools.task_tool import task_tool
+
+        extra_tools.append(task_tool)
+
+    chain.append(ToolBudgetAvailabilityMiddleware())
     chain.append(LoopDetectionMiddleware())
 
     if feat.clarification is not False:
@@ -187,7 +227,18 @@ def _insert_extra(
             unanchored.append(mw)
 
     for mw in unanchored:
-        chain.append(mw)
+        loop_idx = next(
+            (
+                i
+                for i, item in enumerate(chain)
+                if type(item).__name__ == "LoopDetectionMiddleware"
+            ),
+            None,
+        )
+        if loop_idx is None:
+            chain.append(mw)
+        else:
+            chain.insert(loop_idx, mw)
 
     pending = list(anchored)
     max_rounds = len(pending) + 1
@@ -198,6 +249,29 @@ def _insert_extra(
         for mw, direction, anchor in pending:
             idx = next((i for i, m in enumerate(chain) if isinstance(m, anchor)), None)
             if idx is None:
+                # ContextPruningMiddleware used to anchor before the framework
+                # summarizer.  The runtime now disables that second summarizer,
+                # so retain the ordering contract by placing the middleware
+                # immediately before the loop detector when the optional anchor
+                # is absent.  Other unresolved anchors remain configuration
+                # errors below.
+                if (
+                    direction == "prev"
+                    and getattr(anchor, "__name__", "") == "SummarizationMiddleware"
+                ):
+                    loop_idx = next(
+                        (
+                            i
+                            for i, item in enumerate(chain)
+                            if type(item).__name__ == "LoopDetectionMiddleware"
+                        ),
+                        None,
+                    )
+                    if loop_idx is None:
+                        chain.append(mw)
+                    else:
+                        chain.insert(loop_idx, mw)
+                    continue
                 remaining.append((mw, direction, anchor))
                 continue
             chain.insert(idx + 1 if direction == "next" else idx, mw)

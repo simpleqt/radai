@@ -53,7 +53,7 @@ class LLMClient:
                 self._initialized = False
                 return False
 
-            self._client = httpx.AsyncClient(timeout=300.0)
+            self._client = httpx.AsyncClient(trust_env=False, timeout=300.0)
             self._initialized = True
             logger.info(
                 f"LLM client initialized successfully with model: {self._model}"

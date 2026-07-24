@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 import uuid
 from typing import Any
@@ -123,9 +122,27 @@ def extract_web_search_metadata(raw_output: Any) -> dict[str, Any]:
                 domain = domain[4:]
             if domain and domain not in domains:
                 domains.append(domain)
-            web_results.append({"title": title, "url": url, "domain": domain})
+            # Keep a bounded evidence excerpt in the process event. The
+            # coordinator previously retained only title/URL/domain, so the
+            # branch handoff knew that pages had been retrieved but could not
+            # map the branch's claims back to the page content.
+            raw_excerpt = (
+                item.get("content")
+                or item.get("markdown")
+                or item.get("description")
+                or item.get("snippet")
+                or ""
+            )
+            content_excerpt = " ".join(str(raw_excerpt).split())[:2000]
+            web_result = {"title": title, "url": url, "domain": domain}
+            if content_excerpt:
+                web_result["content_excerpt"] = content_excerpt
+            web_results.append(web_result)
 
     metadata: dict[str, Any] = {}
+    engine = str(data.get("engine") or "").strip().lower()
+    if engine:
+        metadata["engine"] = engine
     if query:
         metadata["query"] = query
     if urls:
@@ -246,7 +263,7 @@ def extract_task_result_metadata(raw_output: Any) -> dict[str, Any]:
 
     text = raw_output.strip()
     marker = "Metadata:"
-    idx = text.find(marker)
+    idx = text.rfind(marker)
     if idx < 0:
         return {}
 
@@ -257,10 +274,7 @@ def extract_task_result_metadata(raw_output: Any) -> dict[str, Any]:
     try:
         parsed = json.loads(payload)
     except Exception:
-        try:
-            parsed, _ = json.JSONDecoder().raw_decode(payload)
-        except Exception:
-            return {}
+        return {}
 
     if not isinstance(parsed, dict):
         return {}
@@ -281,8 +295,24 @@ def make_process_event(
     duration_ms: int | None = None,
     summary: str | None = None,
     metadata: dict[str, Any] | None = None,
+    event_key: str | None = None,
 ) -> dict[str, Any]:
-    event_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{kind}:{title}:{detail}:{tool}"))
+    # `detail` is intentionally concise and can be identical for multiple
+    # concurrent invocations (for example, every web search may report
+    # "5 sources"). Include invocation identity/metadata so the frontend's
+    # idempotency filter does not discard later, valid results.
+    identity = str(event_key or "").strip()
+    if not identity:
+        metadata_identity = json.dumps(
+            metadata or {},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        identity = ":".join(
+            [kind, title, detail, str(tool or ""), str(summary or ""), metadata_identity]
+        )
+    event_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, identity))
     event: dict[str, Any] = {
         "id": event_id,
         "kind": kind,
@@ -425,11 +455,6 @@ def iter_recovered_text_chunks(text: str, max_chars: int = 600):
 
         yield remaining[:split_at]
         remaining = remaining[split_at:]
-
-
-def iter_sse_subchunks(text: str, max_chars: int = 600):
-    """将较长文本切成适合单次 SSE 事件负载的子块（与 recovered 流使用相同的切分策略）。"""
-    yield from iter_recovered_text_chunks(text, max_chars=max_chars)
 
 
 def stringify_message_content(content: Any) -> str:

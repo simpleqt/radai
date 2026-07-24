@@ -112,7 +112,7 @@ def build_system_prompt(
     base_prompt = apply_prompt_template(
         agent_name=AGENT_ROLE_NAME,
         subagent_enabled=subagent_enabled,
-        max_concurrent_subagents=3,
+        max_concurrent_subagents=5,
         available_skills=available_skills,
     )
 

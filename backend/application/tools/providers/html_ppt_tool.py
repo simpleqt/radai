@@ -5,6 +5,7 @@ import logging
 import re
 import time
 import uuid
+from functools import lru_cache
 from html import escape
 from pathlib import Path
 from typing import Annotated, Any
@@ -14,9 +15,13 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 from langgraph.typing import ContextT
 
+from backend.application.tools.runtime_resolution import (
+    resolve_runtime_thread_id as _resolve_runtime_thread_id,
+)
+from backend.application.tools.execution import invoke_sync_with_timeout
 from backend.core.agents.state import ThreadState
 from backend.core.skills.native_skill_tools import normalize_skill_tool_name
-from backend.core.agents.thread_key import parse_internal_thread_key
+from backend.core.thread_key import parse_internal_thread_key
 from backend.storage import get_user_minio_bucket_name, upload_bytes_to_minio_sync
 
 logger = logging.getLogger(__name__)
@@ -43,88 +48,9 @@ def _list_available_themes() -> list[str]:
     return sorted(path.stem for path in THEMES_DIR.glob("*.css"))
 
 
+@lru_cache(maxsize=32)
 def _read_text_file(file_path: Path) -> str:
     return file_path.read_text(encoding="utf-8").strip()
-
-
-def _rewrite_asset_urls(html_content: str) -> str:
-    patterns = [
-        (r'href="(?:\.\./)+assets/', f'href="{ASSETS_URL_PREFIX}/'),
-        (r'src="(?:\.\./)+assets/', f'src="{ASSETS_URL_PREFIX}/'),
-        (r'data-theme-base="(?:\.\./)+assets/', f'data-theme-base="{ASSETS_URL_PREFIX}/'),
-        (r'href="assets/', f'href="{ASSETS_URL_PREFIX}/'),
-        (r'src="assets/', f'src="{ASSETS_URL_PREFIX}/'),
-        (r'data-theme-base="assets/', f'data-theme-base="{ASSETS_URL_PREFIX}/'),
-    ]
-    for pattern, replacement in patterns:
-        html_content = re.sub(pattern, replacement, html_content)
-    return html_content
-
-
-def _inline_template_stylesheet(html_content: str, template_dir: Path) -> str:
-    style_file = template_dir / "style.css"
-    if not style_file.exists():
-        return html_content
-
-    style_text = style_file.read_text(encoding="utf-8").strip()
-    if not style_text:
-        return html_content
-
-    style_block = f"<style data-source=\"template-style\">\n{style_text}\n</style>"
-    html_content, replaced = re.subn(
-        r'<link[^>]+href="\.?/style\.css"[^>]*>',
-        style_block,
-        html_content,
-        count=1,
-    )
-    if replaced:
-        return html_content
-    return html_content.replace("</head>", f"{style_block}\n</head>", 1)
-
-
-def _ensure_theme_link(html_content: str, theme: str) -> str:
-    theme_href = f"{ASSETS_URL_PREFIX}/themes/{theme}.css"
-
-    if 'id="theme-link"' in html_content:
-        return re.sub(
-            r'(<link[^>]+id="theme-link"[^>]+href=")[^"]*(")',
-            rf"\1{theme_href}\2",
-            html_content,
-            count=1,
-        )
-
-    theme_link = f'<link rel="stylesheet" id="theme-link" href="{theme_href}">'
-    base_link_match = re.search(r'<link[^>]+href="[^"]*base\.css"[^>]*>', html_content)
-    if base_link_match:
-        insert_at = base_link_match.end()
-        return html_content[:insert_at] + "\n" + theme_link + html_content[insert_at:]
-    return html_content.replace("</head>", f"{theme_link}\n</head>", 1)
-
-
-def _set_title(html_content: str, title: str) -> str:
-    safe_title = escape(title, quote=False)
-    if re.search(r"<title>.*?</title>", html_content, flags=re.DOTALL):
-        return re.sub(
-            r"<title>.*?</title>",
-            f"<title>{safe_title}</title>",
-            html_content,
-            count=1,
-            flags=re.DOTALL,
-        )
-    return html_content.replace("</head>", f"<title>{safe_title}</title>\n</head>", 1)
-
-
-def _strip_demo_slides(html_content: str) -> str:
-    html_content = re.sub(r"<body[^>]*>", "", html_content, count=1, flags=re.IGNORECASE | re.DOTALL)
-    html_content = re.sub(r"</body>\s*</html>\s*$", "", html_content, count=1, flags=re.IGNORECASE | re.DOTALL)
-    html_content = re.sub(
-        r"<div class=\"deck\">[\s\S]*?</div>\s*(?:<script[^>]*></script>\s*)*$",
-        "",
-        html_content,
-        count=1,
-        flags=re.IGNORECASE,
-    )
-    return html_content.strip()
 
 
 def _safe_html_filename(filename: str | None, title: str) -> str:
@@ -149,21 +75,6 @@ def _clean_tool_text_arg(raw: Any) -> str:
     text = re.sub(r"</?tool_call[^>]*(?:>|$)", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\r\n?", "\n", text)
     return text.strip()
-
-
-def _resolve_runtime_thread_id(runtime: ToolRuntime[ContextT, ThreadState]) -> str | None:
-    """Resolve internal thread_id from runtime context/config."""
-    thread_id = runtime.context.get("thread_id") if runtime.context else None
-    if thread_id:
-        return str(thread_id)
-
-    config = getattr(runtime, "config", None) or {}
-    configurable = config.get("configurable", {}) if isinstance(config, dict) else {}
-    thread_id = configurable.get("thread_id") if isinstance(configurable, dict) else None
-    if thread_id:
-        return str(thread_id)
-
-    return None
 
 
 def _message_to_text(content: Any) -> str:
@@ -576,16 +487,6 @@ def _render_paragraphs(paragraphs: list[str]) -> str:
     return "\n".join(rendered)
 
 
-def _render_bullet_list(bullets: list[str], *, css_class: str = "stack mt-l") -> str:
-    if not bullets:
-        return ""
-    items = "\n".join(
-        f'<li class="card card-accent"><span class="dim">{_render_inline_markdown(item)}</span></li>'
-        for item in bullets
-    )
-    return f'<ul class="{css_class}" style="list-style:none;padding:0;margin:0">{items}</ul>'
-
-
 def _render_slide_html(index: int, total: int, slide: dict[str, Any], deck_title: str) -> str:
     title = escape(str(slide.get("title") or f"Slide {index}"))
     kicker_text = str(slide.get("kicker") or "").strip() or f"{deck_title} · {index:02d}"
@@ -960,12 +861,29 @@ def generate_html_ppt_tool(
 
     logger.info(f"[HTML-PPT] 开始上传到 MinIO...")
     upload_start = time.time()
-    uploaded_object = upload_bytes_to_minio_sync(
-        html_content.encode("utf-8"),
-        object_name,
-        content_type=HTML_MIME_TYPE,
-        bucket_name=get_user_minio_bucket_name(),
-    )
+    try:
+        uploaded_object = invoke_sync_with_timeout(
+            lambda: upload_bytes_to_minio_sync(
+                html_content.encode("utf-8"),
+                object_name,
+                content_type=HTML_MIME_TYPE,
+                bucket_name=get_user_minio_bucket_name(),
+            ),
+            timeout=35,
+            label="html_ppt.upload",
+        )
+    except Exception as exc:
+        logger.exception("[HTML-PPT] 上传 MinIO 异常")
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=f"Error: failed to upload HTML PPT: {exc}",
+                        tool_call_id=tool_call_id,
+                    )
+                ]
+            }
+        )
     upload_duration = (time.time() - upload_start) * 1000
     
     if not uploaded_object:

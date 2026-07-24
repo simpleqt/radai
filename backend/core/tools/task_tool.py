@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import uuid
-from dataclasses import dataclass
+from contextlib import suppress
 from typing import Annotated, Any
 
 from langchain.tools import InjectedToolCallId, ToolRuntime, tool
@@ -14,76 +14,46 @@ from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.config import get_stream_writer
 from langgraph.typing import ContextT
 
-from backend.core.agents import RuntimeFeatures, ThreadState, create_agent_graph
-from backend.core.models import create_chat_model
 from backend.application.agent_executors.stream_utils import (
     extract_chat_model_output_text,
     extract_task_result_metadata,
     stringify_message_content,
     summarize_tool_output,
 )
+from backend.application.agents.runtime_agent_loader import RuntimeAgentLoader
+from backend.application.tools.execution import raise_for_tool_reported_error
 from backend.application.tools.tool_assembly_pipeline import ToolAssemblyPipeline
+from backend.core.agents import (
+    RuntimeFeatures,
+    ThreadState,
+    create_agent_graph,
+)
+from backend.core.agents.context.subagent_adapter import (
+    build_subagent_result,
+    format_subagent_handoff,
+    validate_subagent_result_strict,
+)
+from backend.core.agents.middlewares.runtime_policy import (
+    RuntimePolicyGuardrailProvider,
+)
+from backend.core.agents.middlewares.tool_guardrail import ToolGuardrailMiddleware
+from backend.core.agents.runtime_manager import (
+    AgentCancellationToken,
+    get_agent_runtime_manager,
+)
+from backend.core.models import create_chat_model
+from backend.core.skills.skill_runtime_state import (
+    reset_request_skill_state,
+    set_request_skill_state,
+)
+from backend.core.tools.request_limits import get_subagent_execution_budget
+from backend.domain.agents.runtime_agent import RuntimeAgentSpec
+from backend.domain.tools.runtime_context import ToolRuntimeContext
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class LocalSubagentConfig:
-    name: str
-    system_prompt: str
-    allowed_tools: set[str] | None = None
-    disallowed_tools: set[str] | None = None
-    max_turns: int = 12
-    timeout_seconds: int = 600
-
-
-_SUBAGENT_CONFIGS: dict[str, LocalSubagentConfig] = {
-    "deep-research": LocalSubagentConfig(
-        name="deep-research",
-        system_prompt="""你是深度研究子智能体，负责处理主控智能体拆解出的单个研究维度。
-
-规则：
-- 你的目标是检索证据并输出简明、可信、可汇总的分析结果。
-- 优先使用 `multi_kb_search` 做知识库检索；如证据不足，再使用 `web_search` 补充。
-- 不要调用 `task`，不要再委派子智能体。
-- 不要向用户追问，也不要生成最终总报告工件。
-- 如需要领域方法，请先使用技能工具读取相关 skill。
-
-输出格式：
-1. 子任务结论
-2. 证据摘要（区分 KB / Web）
-3. 局限与风险
-4. 对主控智能体的建议
-5. 参考来源
-""",
-        allowed_tools={
-            "multi_kb_search",
-            "web_search",
-            "read_local_skill_file",
-            "read_skill_reference",
-            "list_available_skills",
-            "chat_file_search",
-        },
-        disallowed_tools={"task", "save_deep_research_report"},
-        max_turns=12,
-        timeout_seconds=600,
-    ),
-    "general-purpose": LocalSubagentConfig(
-        name="general-purpose",
-        system_prompt="""你是通用委派子智能体。你需要在隔离上下文里完成主智能体交给你的任务，并返回清晰结论。
-
-规则：
-- 直接执行任务，不要再向用户澄清。
-- 可以使用当前可用工具完成检索、分析或文件操作。
-- 不要调用 `task`，不要嵌套委派。
-- 最终返回：完成情况、关键发现、相关文件/结果、风险或限制。
-""",
-        allowed_tools=None,
-        disallowed_tools={"task", "present_files"},
-        max_turns=16,
-        timeout_seconds=600,
-    ),
-}
+_RUNTIME_AGENT_LOADER = RuntimeAgentLoader()
 
 
 def _trim_text(value: Any, max_chars: int = 500) -> str:
@@ -93,7 +63,7 @@ def _trim_text(value: Any, max_chars: int = 500) -> str:
 
 def _extract_chunk_text(chunk: Any) -> str:
     if hasattr(chunk, "content"):
-        return stringify_message_content(getattr(chunk, "content"))
+        return stringify_message_content(chunk.content)
     return stringify_message_content(chunk)
 
 
@@ -112,7 +82,11 @@ def _wrap_tool(
     subagent_type: str,
     description: str,
     trace_id: str,
+    invoked_tools: set[str] | None = None,
 ) -> BaseTool:
+    raw_metadata = getattr(tool_item, "metadata", None)
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+
     async def _invoke(**kwargs: Any):
         _emit_task_event(
             writer,
@@ -127,7 +101,11 @@ def _wrap_tool(
             },
         )
         try:
-            result = await tool_item.ainvoke(kwargs)
+            # The child graph's ToolErrorHandlingMiddleware owns timeout,
+            # concurrency, retry, output and cache policy. Calling the service
+            # wrapper here as well would apply retries twice.
+            result = await tool_item.ainvoke(dict(kwargs))
+            raise_for_tool_reported_error(result)
         except Exception as exc:
             _emit_task_event(
                 writer,
@@ -157,6 +135,8 @@ def _wrap_tool(
                 "trace_id": trace_id,
             },
         )
+        if invoked_tools is not None:
+            invoked_tools.add(tool_item.name)
         return result
 
     args_schema = getattr(tool_item, "args_schema", None)
@@ -167,35 +147,60 @@ def _wrap_tool(
     }
     if args_schema is not None:
         kwargs["args_schema"] = args_schema
+    if metadata:
+        kwargs["metadata"] = metadata
     return StructuredTool.from_function(**kwargs)
+
+
+def _tool_metadata_by_name(tools: list[BaseTool]) -> dict[str, dict[str, Any]]:
+    metadata: dict[str, dict[str, Any]] = {}
+    for tool_item in tools:
+        raw_metadata = getattr(tool_item, "metadata", None)
+        if isinstance(raw_metadata, dict):
+            metadata[tool_item.name] = dict(raw_metadata)
+    return metadata
 
 
 def _build_subagent_tools(
     *,
-    subagent_cfg: LocalSubagentConfig,
+    subagent_cfg: RuntimeAgentSpec,
     model_name: str | None,
     use_search: bool,
     kb_ids: list[str],
     selected_skills: set[str] | None,
     thread_id: str | None,
+    domain: str | None,
+    workflow_name: str | None,
+    tool_policy: str | None,
+    tool_runtime_context: ToolRuntimeContext | None,
     writer,
     task_id: str,
     description: str,
     trace_id: str,
+    invoked_tools: set[str] | None = None,
 ) -> list[BaseTool]:
+    if not domain or not tool_policy:
+        raise RuntimeError("subagent tool assembly requires domain and tool_policy runtime context")
     pipeline = ToolAssemblyPipeline(
         model_name=model_name,
         subagent_enabled=False,
-        use_search=use_search,
-        kb_ids=kb_ids,
+        use_search=use_search and subagent_cfg.can_use_network,
+        kb_ids=kb_ids if subagent_cfg.can_read_kb else [],
         selected_skills=selected_skills,
         task_type="deep_research" if subagent_cfg.name == "deep-research" else None,
         thread_id=thread_id,
+        domain=domain,
+        workflow_name=workflow_name,
+        tool_policy=tool_policy,
+        tool_runtime_context=tool_runtime_context,
     )
     tools = pipeline.assemble()
 
     disallowed = set(subagent_cfg.disallowed_tools or set()) | {"task", "present_files"}
     allowed_tools = set(subagent_cfg.allowed_tools) if subagent_cfg.allowed_tools is not None else None
+    required_tools = set(subagent_cfg.required_tools or set())
+    if allowed_tools is not None:
+        allowed_tools |= required_tools
     if (
         allowed_tools is not None
         and subagent_cfg.name == "deep-research"
@@ -217,6 +222,7 @@ def _build_subagent_tools(
                 subagent_type=subagent_cfg.name,
                 description=description,
                 trace_id=trace_id,
+                invoked_tools=invoked_tools,
             )
         )
     return filtered
@@ -224,7 +230,7 @@ def _build_subagent_tools(
 
 async def _run_subagent(
     *,
-    subagent_cfg: LocalSubagentConfig,
+    subagent_cfg: RuntimeAgentSpec,
     description: str,
     prompt: str,
     model_name: str | None,
@@ -233,10 +239,19 @@ async def _run_subagent(
     kb_ids: list[str],
     use_search: bool,
     selected_skills: set[str] | None,
+    domain: str | None,
+    workflow_name: str | None,
+    tool_policy: str | None,
+    tool_runtime_context: ToolRuntimeContext | None,
     task_id: str,
     trace_id: str,
+    runtime_manager_managed: bool = False,
+    cancellation_token: AgentCancellationToken | None = None,
+    context_policy: Any | None = None,
+    checkpointer: Any | None = None,
 ) -> str:
     writer = get_stream_writer()
+    invoked_tools: set[str] = set()
     tools = _build_subagent_tools(
         subagent_cfg=subagent_cfg,
         model_name=model_name,
@@ -244,10 +259,15 @@ async def _run_subagent(
         kb_ids=kb_ids,
         selected_skills=selected_skills,
         thread_id=thread_id,
+        domain=domain,
+        workflow_name=workflow_name,
+        tool_policy=tool_policy,
+        tool_runtime_context=tool_runtime_context,
         writer=writer,
         task_id=task_id,
         description=description,
         trace_id=trace_id,
+        invoked_tools=invoked_tools,
     )
     system_prompt = subagent_cfg.system_prompt
     if selected_skills and "academic-search" in selected_skills:
@@ -255,26 +275,82 @@ async def _run_subagent(
 
 - 已启用学术搜索：文献/论文/引用类检索优先使用 `academic_search`；`web_search` 仅补充时效资讯。
 """
-    model = create_chat_model(name=model_name, thinking_enabled=False)
+    effective_model_name = (
+        subagent_cfg.model
+        if subagent_cfg.model and subagent_cfg.model != "default"
+        else model_name
+    )
+    effective_use_search = use_search and subagent_cfg.can_use_network
+    effective_kb_ids = kb_ids if subagent_cfg.can_read_kb else []
+    model = create_chat_model(name=effective_model_name, thinking_enabled=False)
+    # Delegated agents used to bypass the parent graph's context policy except
+    # for one groundwater-only branch.  Give every child the same evidence
+    # capture, JIT context assembly and history summarization contract.
+    from backend.core.agents.context import ContextPolicy
+    from backend.core.agents.middlewares.context_pruning import ContextPruningMiddleware
+    from backend.core.agents.middlewares.model_turn_limit import (
+        ModelTurnLimitMiddleware,
+    )
+
+    context_policy = context_policy or ContextPolicy.from_env(effective_model_name)
+    extra_middleware = [
+        ContextPruningMiddleware(
+            thread_id=f"{thread_id or task_id}:subagent:{task_id}",
+            model_name=effective_model_name,
+            user_id=(
+                str(tool_runtime_context.user_id or "").strip()
+                if tool_runtime_context is not None
+                else None
+            ),
+            policy=context_policy,
+            checkpointer=checkpointer,
+        ),
+        ModelTurnLimitMiddleware(max_turns),
+    ]
     graph = create_agent_graph(
         model=model,
         tools=tools,
         system_prompt=system_prompt,
-        features=RuntimeFeatures(clarification=False, subagent=False, vision=False),
+        features=RuntimeFeatures(
+            # ContextPruningMiddleware is the child graph's single compaction
+            # owner; do not run a second framework history rewrite.
+            summarization=False,
+            clarification=False,
+            subagent=False,
+            vision=False,
+            guardrail=ToolGuardrailMiddleware(
+                provider=RuntimePolicyGuardrailProvider(
+                    allowed_tools=[tool_item.name for tool_item in tools],
+                    guardrail_policy=tool_policy or "default",
+                    permissions=dict(
+                        tool_runtime_context.permissions
+                        if tool_runtime_context is not None
+                        else {}
+                    ),
+                ),
+                passport=f"subagent:{subagent_cfg.name}:{tool_policy or 'default'}",
+                tool_metadata=_tool_metadata_by_name(tools),
+            ),
+        ),
+        extra_middleware=extra_middleware,
         name=f"subagent-{subagent_cfg.name}",
         state_schema=ThreadState,
+        checkpointer=checkpointer,
     )
 
-    effective_thread_id = thread_id or f"subagent-exec-{task_id}"
+    effective_thread_id = f"{thread_id or 'subagent-exec'}:subagent:{task_id}"
     invoke_config = {
         "configurable": {
             "thread_id": effective_thread_id,
-            "kb_ids": kb_ids,
+            "kb_ids": effective_kb_ids,
             "selected_skills": sorted(selected_skills) if selected_skills else [],
-            "use_search": use_search,
+            "use_search": effective_use_search,
         },
         "metadata": {
-            "model_name": model_name,
+            "model_name": effective_model_name,
+            "runtime_agent": subagent_cfg.name,
+            "runtime_agent_output_schema": subagent_cfg.output_schema,
+            "runtime_agent_required_tools": sorted(subagent_cfg.required_tools),
             "trace_id": trace_id,
             "subagent_type": subagent_cfg.name,
         },
@@ -282,8 +358,10 @@ async def _run_subagent(
         # tool call each count as one step), not user-facing conversation turns.
         # A single "turn" with tool use typically consumes 2-3 steps, so using
         # max_turns directly is far too strict for tool-heavy subagents.
-        # Tool-heavy subagents need a looser LangGraph recursion budget than max_turns.
-        "recursion_limit": max(100, max_turns * 4),
+        # A turn can consume a model and one tool step.  Keep a small fixed
+        # allowance for framework edges, but honour the task contract instead
+        # of turning a 12-turn subagent into a 100-step run.
+        "recursion_limit": max(8, max_turns * 3 + 2),
     }
 
     answer_fragments: list[str] = []
@@ -292,12 +370,16 @@ async def _run_subagent(
 
     async def _consume_events() -> str:
         nonlocal latest_message, message_index
+        if cancellation_token is not None:
+            cancellation_token.raise_if_cancelled()
         async for event in graph.astream_events(
             {"messages": [{"role": "user", "content": prompt}]},
             config=invoke_config,
             version="v2",
             stream_mode=["messages", "custom", "updates", "tasks"],
         ):
+            if cancellation_token is not None:
+                cancellation_token.raise_if_cancelled()
             kind = event.get("event")
             data = event.get("data", {}) or {}
             if kind == "on_chat_model_stream":
@@ -326,7 +408,57 @@ async def _run_subagent(
                 answer_fragments.clear()
         return latest_message or "".join(answer_fragments).strip()
 
-    return await asyncio.wait_for(_consume_events(), timeout=subagent_cfg.timeout_seconds)
+    async def _consume_with_cancellation() -> str:
+        if cancellation_token is None:
+            return await _consume_events()
+        cancellation_token.raise_if_cancelled()
+        owner_task = asyncio.current_task()
+
+        async def cancel_owner_when_signalled() -> None:
+            await cancellation_token.wait()
+            if owner_task is not None and not owner_task.done():
+                owner_task.cancel()
+
+        cancellation_waiter = asyncio.create_task(cancel_owner_when_signalled())
+        try:
+            return await _consume_events()
+        finally:
+            if not cancellation_waiter.done():
+                cancellation_waiter.cancel()
+            with suppress(asyncio.CancelledError):
+                await cancellation_waiter
+
+    async def _consume_and_validate_contract() -> str:
+        answer = await _consume_with_cancellation()
+        missing_required = sorted(set(subagent_cfg.required_tools) - invoked_tools)
+        if missing_required:
+            raise RuntimeError(
+                "subagent required tools were not completed: "
+                + ", ".join(missing_required)
+            )
+        return answer
+
+    # A delegated run gets its own Skill-load state instead of inheriting the
+    # parent's ContextVar.  This makes the child prove it loaded the governing
+    # instructions before any project business tool is allowed.
+    skill_state_tokens = set_request_skill_state(set(selected_skills or set()))
+    try:
+        execution_budget = get_subagent_execution_budget()
+        # AgentRuntimeManager owns the active slot when the task runs inside the
+        # platform streaming runtime.  Keep the semaphore for compatibility
+        # with direct/legacy callers, but never acquire both controls.
+        if runtime_manager_managed or execution_budget is None:
+            return await asyncio.wait_for(
+                _consume_and_validate_contract(),
+                timeout=subagent_cfg.timeout_seconds,
+            )
+        async with execution_budget.semaphore:
+            return await asyncio.wait_for(
+                _consume_and_validate_contract(),
+                timeout=subagent_cfg.timeout_seconds,
+            )
+    finally:
+        reset_request_skill_state(skill_state_tokens)
 
 
 @tool("task", parse_docstring=True)
@@ -343,16 +475,24 @@ async def task_tool(
     Args:
         description: Short task description shown in runtime events.
         prompt: Detailed delegated prompt.
-        subagent_type: Subagent type, such as `deep-research` or `general-purpose`.
+        subagent_type: Runtime agent type, such as `deep-research` or `general-purpose`.
         max_turns: Optional cap for delegated agent turns.
     """
-    subagent_cfg = _SUBAGENT_CONFIGS.get(subagent_type)
-    if subagent_cfg is None:
-        available = ", ".join(sorted(_SUBAGENT_CONFIGS))
+    configurable = runtime.config.get("configurable", {}) if runtime is not None else {}
+    runtime_agent_specs = configurable.get("runtime_agent_specs")
+    subagent_cfg = None
+    if isinstance(runtime_agent_specs, dict):
+        candidate = runtime_agent_specs.get(subagent_type)
+        if isinstance(candidate, RuntimeAgentSpec):
+            subagent_cfg = candidate
+    try:
+        subagent_cfg = subagent_cfg or _RUNTIME_AGENT_LOADER.get(subagent_type)
+    except ValueError:
+        available = ", ".join(_RUNTIME_AGENT_LOADER.available_names())
         return f"Error: Unknown subagent type '{subagent_type}'. Available: {available}"
 
     writer = get_stream_writer()
-    configurable = runtime.config.get("configurable", {}) if runtime is not None else {}
+    task_id = str(tool_call_id or "").strip()
     metadata = runtime.config.get("metadata", {}) if runtime is not None else {}
 
     selected_skills_raw = configurable.get("selected_skills")
@@ -372,59 +512,166 @@ async def task_tool(
     model_name = metadata.get("model_name") if isinstance(metadata.get("model_name"), str) else None
     trace_id = str(metadata.get("trace_id") or uuid.uuid4())[:12]
     normalized_description = description.strip() or f"delegated-{subagent_type}"
-
-    _emit_task_event(
-        writer,
-        {
-            "type": "task_started",
-            "task_id": tool_call_id,
-            "description": normalized_description,
-            "subagent_type": subagent_type,
-            "trace_id": trace_id,
-        },
-    )
+    runtime_permissions = configurable.get("runtime_permissions")
+    if not isinstance(runtime_permissions, dict):
+        runtime_permissions = {}
+    request_metadata = configurable.get("request_metadata")
+    if not isinstance(request_metadata, dict):
+        request_metadata = {}
+    domain_context = configurable.get("domain_context")
+    if not isinstance(domain_context, dict):
+        domain_context = {}
+    domain = str(configurable.get("domain") or "").strip() or None
+    workflow_name = str(configurable.get("workflow_name") or "").strip() or None
+    tool_policy = str(configurable.get("tool_policy") or "").strip() or None
+    context_policy = configurable.get("context_policy")
+    checkpointer = configurable.get("agent_checkpointer")
+    if not domain:
+        raise RuntimeError(
+            "task delegation requires the parent agent's explicit domain"
+        )
+    if tool_policy in {None, "", "default"}:
+        raise RuntimeError(
+            "task delegation requires the parent agent's explicit registered "
+            f"tool_policy for domain '{domain}'"
+        )
+    tool_runtime_context = None
+    if domain and tool_policy and thread_id:
+        tool_runtime_context = ToolRuntimeContext(
+            request_id=str(configurable.get("request_id") or ""),
+            user_id=str(configurable.get("user_id") or ""),
+            agent_code=str(configurable.get("agent_code") or ""),
+            domain=domain,
+            thread_id=thread_id,
+            role=str(runtime_permissions.get("auth_role") or "user").strip().lower() or "user",
+            permissions=dict(runtime_permissions),
+            time_context=str(configurable.get("time_context") or ""),
+            request_metadata=dict(request_metadata),
+            domain_context=dict(domain_context),
+        )
 
     try:
         effective_max_turns = max(1, min(int(max_turns or subagent_cfg.max_turns), subagent_cfg.max_turns))
-        result_text = await _run_subagent(
-            subagent_cfg=subagent_cfg,
-            description=normalized_description,
-            prompt=prompt,
-            model_name=model_name,
-            max_turns=effective_max_turns,
-            thread_id=thread_id,
-            kb_ids=kb_ids,
-            use_search=use_search,
-            selected_skills=selected_skills,
-            task_id=tool_call_id,
-            trace_id=trace_id,
-        )
-        result_text = result_text or "任务已完成，但未返回文本结果。"
-        metadata_payload = {
-            "result_preview": _trim_text(result_text, 500),
-            **extract_task_result_metadata(result_text),
-        }
-        _emit_task_event(
-            writer,
-            {
-                "type": "task_completed",
-                "task_id": tool_call_id,
+        runtime_manager = get_agent_runtime_manager()
+
+        def emit_started() -> None:
+            _emit_task_event(
+                writer,
+                {
+                    "type": "task_started",
+                    "task_id": task_id,
+                    "description": normalized_description,
+                    "subagent_type": subagent_type,
+                    "trace_id": trace_id,
+                },
+            )
+
+        async def run_delegated_agent(
+            cancellation_token: AgentCancellationToken | None,
+        ) -> str:
+            return await _run_subagent(
+                subagent_cfg=subagent_cfg,
+                description=normalized_description,
+                prompt=prompt,
+                model_name=model_name,
+                max_turns=effective_max_turns,
+                thread_id=thread_id,
+                kb_ids=kb_ids,
+                use_search=use_search,
+                selected_skills=selected_skills,
+                domain=domain,
+                workflow_name=workflow_name,
+                tool_policy=tool_policy,
+                tool_runtime_context=tool_runtime_context,
+                task_id=task_id,
+                trace_id=trace_id,
+                runtime_manager_managed=runtime_manager is not None,
+                cancellation_token=cancellation_token,
+                context_policy=context_policy,
+                checkpointer=checkpointer,
+            )
+
+        async def execute_task_lifecycle() -> str:
+            cancellation_token = (
+                await runtime_manager.token_for(task_id)
+                if runtime_manager is not None
+                else None
+            )
+            result_text = await run_delegated_agent(cancellation_token)
+            if cancellation_token is not None:
+                # A provider or nested graph may swallow Task.cancel().  The
+                # tree token is authoritative, so never publish completion
+                # after the manager has accepted an interrupt.
+                cancellation_token.raise_if_cancelled()
+            result_text = result_text or "任务已完成，但未返回文本结果。"
+            handoff = build_subagent_result(
+                role=subagent_type,
+                objective=normalized_description,
+                answer=result_text,
+                task_id=task_id,
+            )
+            # The model/text adapter remains forgiving, but the execution
+            # boundary only publishes a complete, non-coercing V2 contract.
+            validate_subagent_result_strict(handoff)
+            handoff_text = format_subagent_handoff(handoff)
+            metadata_payload = {
+                "result_preview": _trim_text(result_text, 500),
+                "confidence": handoff.get("confidence"),
+                "evidence_refs": handoff.get("evidence_refs", []),
+                "risks": handoff.get("risks", []),
+                **extract_task_result_metadata(result_text),
+            }
+            _emit_task_event(
+                writer,
+                {
+                    "type": "task_completed",
+                    "task_id": task_id,
+                    "description": normalized_description,
+                    "subagent_type": subagent_type,
+                    "trace_id": trace_id,
+                    "result": result_text,
+                    "result_preview": metadata_payload["result_preview"],
+                    **metadata_payload,
+                },
+            )
+            return (
+                f"Task Succeeded.\n{handoff_text}\n\n"
+                f"Metadata: {json.dumps(metadata_payload, ensure_ascii=False)}"
+            )
+
+        if runtime_manager is None:
+            emit_started()
+            return await execute_task_lifecycle()
+        async with runtime_manager.spawn(
+            task_id,
+            metadata={
                 "description": normalized_description,
                 "subagent_type": subagent_type,
                 "trace_id": trace_id,
-                "result": result_text,
-                "result_preview": metadata_payload["result_preview"],
-                **metadata_payload,
+            },
+        ):
+            emit_started()
+            return await execute_task_lifecycle()
+    except asyncio.CancelledError:
+        _emit_task_event(
+            writer,
+            {
+                "type": "task_cancelled",
+                "task_id": task_id,
+                "description": normalized_description,
+                "subagent_type": subagent_type,
+                "trace_id": trace_id,
+                "error": "Subagent execution cancelled",
             },
         )
-        return f"Task Succeeded. Result: {result_text}\n\nMetadata: {json.dumps(metadata_payload, ensure_ascii=False)}"
-    except asyncio.TimeoutError:
+        raise
+    except (asyncio.TimeoutError, TimeoutError):  # noqa: UP041
         error = f"Subagent timed out after {subagent_cfg.timeout_seconds}s"
         _emit_task_event(
             writer,
             {
                 "type": "task_timed_out",
-                "task_id": tool_call_id,
+                "task_id": task_id,
                 "description": normalized_description,
                 "subagent_type": subagent_type,
                 "trace_id": trace_id,
@@ -439,7 +686,7 @@ async def task_tool(
             writer,
             {
                 "type": "task_failed",
-                "task_id": tool_call_id,
+                "task_id": task_id,
                 "description": normalized_description,
                 "subagent_type": subagent_type,
                 "trace_id": trace_id,

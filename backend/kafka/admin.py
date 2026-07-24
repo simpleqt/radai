@@ -20,56 +20,78 @@ logging.basicConfig(level=logging.INFO)
 logger = get_logger(__name__)
 
 
+async def _close_client(client, method_name: str) -> None:
+    """Best-effort Kafka client cleanup that does not mask the original error."""
+    if client is None:
+        return
+    try:
+        await getattr(client, method_name)()
+    except Exception:
+        logger.warning("Failed to close Kafka client", exc_info=True)
+
+
 async def create_topics():
     """创建所有配置的主题"""
     logger.info("Creating Kafka topics...")
 
+    admin_client = None
     try:
         admin_client = AIOKafkaAdminClient(
             bootstrap_servers=settings.kafka_bootstrap_servers,
         )
         await admin_client.start()
 
+        topic_configs = {
+            "max.message.bytes": str(settings.kafka_topic_max_message_bytes),
+        }
         topics = [
             NewTopic(
                 name=settings.kafka_task_topic,
                 num_partitions=settings.kafka_num_partitions,
                 replication_factor=settings.kafka_replication_factor,
+                topic_configs=topic_configs,
             ),
             NewTopic(
                 name=settings.kafka_status_topic,
                 num_partitions=settings.kafka_num_partitions,
                 replication_factor=settings.kafka_replication_factor,
+                topic_configs=topic_configs,
             ),
             NewTopic(
                 name=settings.kafka_result_topic,
                 num_partitions=settings.kafka_num_partitions,
                 replication_factor=settings.kafka_replication_factor,
+                topic_configs=topic_configs,
             ),
             NewTopic(
                 name=settings.kafka_event_topic,
                 num_partitions=3,
                 replication_factor=settings.kafka_replication_factor,
+                topic_configs=topic_configs,
             ),
             NewTopic(
                 name=settings.kafka_retry_topic,
                 num_partitions=3,
                 replication_factor=settings.kafka_replication_factor,
+                topic_configs=topic_configs,
             ),
             NewTopic(
                 name=settings.kafka_dead_letter_topic,
                 num_partitions=1,
                 replication_factor=settings.kafka_replication_factor,
+                topic_configs=topic_configs,
             ),
             NewTopic(
                 name=settings.log_kafka_topic,
                 num_partitions=3,
                 replication_factor=settings.kafka_replication_factor,
+                topic_configs=topic_configs,
             ),
             NewTopic(
                 name=settings.log_kafka_error_topic,
                 num_partitions=1,
                 replication_factor=settings.kafka_replication_factor,
+                topic_configs=topic_configs,
             ),
         ]
 
@@ -81,17 +103,18 @@ async def create_topics():
         except KafkaError as e:
             logger.error(f"Error creating topics: {e}")
 
-        await admin_client.close()
-
     except Exception as e:
         logger.error(f"Failed to create topics: {e}")
         raise
+    finally:
+        await _close_client(admin_client, "close")
 
 
 async def list_topics():
     """列出所有主题"""
     logger.info("Listing Kafka topics...")
 
+    admin_client = None
     try:
         admin_client = AIOKafkaAdminClient(
             bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -101,17 +124,18 @@ async def list_topics():
         topics = await admin_client.list_topics()
         logger.info(f"Available topics: {topics}")
 
-        await admin_client.close()
-
     except Exception as e:
         logger.error(f"Failed to list topics: {e}")
         raise
+    finally:
+        await _close_client(admin_client, "close")
 
 
 async def delete_topics():
     """删除所有配置的主题"""
     logger.warning("Deleting Kafka topics...")
 
+    admin_client = None
     try:
         admin_client = AIOKafkaAdminClient(
             bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -130,31 +154,32 @@ async def delete_topics():
         deleted = await admin_client.delete_topics(topics_to_delete)
         logger.info(f"Topics deleted: {deleted}")
 
-        await admin_client.close()
-
     except Exception as e:
         logger.error(f"Failed to delete topics: {e}")
         raise
+    finally:
+        await _close_client(admin_client, "close")
 
 
 async def test_connection():
     """测试 Kafka 连接"""
     logger.info("Testing Kafka connection...")
 
+    producer = None
     try:
         producer = AIOKafkaProducer(
             bootstrap_servers=settings.kafka_bootstrap_servers,
         )
         await producer.start()
         logger.info(f"Producer connected to {settings.kafka_bootstrap_servers}")
-        await producer.stop()
-
         logger.info("Kafka connection test successful!")
         return True
 
     except Exception as e:
         logger.error(f"Kafka connection test failed: {e}")
         return False
+    finally:
+        await _close_client(producer, "stop")
 
 
 async def test_produce_consume():
@@ -168,6 +193,9 @@ async def test_produce_consume():
         "content": "Test message",
     }
 
+    admin_client = None
+    producer = None
+    consumer = None
     try:
         admin_client = AIOKafkaAdminClient(
             bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -186,8 +214,6 @@ async def test_produce_consume():
         except TopicAlreadyExistsError:
             logger.info(f"Test topic already exists: {test_topic}")
 
-        await admin_client.close()
-
         producer = AIOKafkaProducer(
             bootstrap_servers=settings.kafka_bootstrap_servers,
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
@@ -200,8 +226,6 @@ async def test_produce_consume():
             key="test-key",
         )
         logger.info("Test message sent")
-
-        await producer.stop()
 
         consumer = AIOKafkaConsumer(
             test_topic,
@@ -218,8 +242,6 @@ async def test_produce_consume():
         )
         logger.info(f"Test message received: {received.value}")
 
-        await consumer.stop()
-
         logger.info("Produce and consume test successful!")
         return True
 
@@ -229,12 +251,17 @@ async def test_produce_consume():
     except Exception as e:
         logger.error(f"Produce and consume test failed: {e}")
         return False
+    finally:
+        await _close_client(consumer, "stop")
+        await _close_client(producer, "stop")
+        await _close_client(admin_client, "close")
 
 
 async def describe_topics():
     """描述主题信息"""
     logger.info("Describing Kafka topics...")
 
+    admin_client = None
     try:
         admin_client = AIOKafkaAdminClient(
             bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -263,17 +290,18 @@ async def describe_topics():
                     f"isr={partition.isr}"
                 )
 
-        await admin_client.close()
-
     except Exception as e:
         logger.error(f"Failed to describe topics: {e}")
         raise
+    finally:
+        await _close_client(admin_client, "close")
 
 
 async def describe_consumer_groups():
     """描述消费者组"""
     logger.info("Describing Kafka consumer groups...")
 
+    admin_client = None
     try:
         admin_client = AIOKafkaAdminClient(
             bootstrap_servers=settings.kafka_bootstrap_servers,
@@ -304,11 +332,11 @@ async def describe_consumer_groups():
             except Exception as e:
                 logger.warning(f"Could not describe group {group_id}: {e}")
 
-        await admin_client.close()
-
     except Exception as e:
         logger.error(f"Failed to describe consumer groups: {e}")
         raise
+    finally:
+        await _close_client(admin_client, "close")
 
 
 async def run_integration_test():

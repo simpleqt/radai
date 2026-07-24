@@ -1,6 +1,7 @@
 workflows:
   lightweight:
     provider: backend.application.agent_workflows.factories:create_standard_workflow
+    execution_strategy: lightweight
     aliases:
       - lightweight
     capabilities:
@@ -10,6 +11,7 @@ workflows:
 
   full:
     provider: backend.application.agent_workflows.factories:create_standard_workflow
+    execution_strategy: graph
     aliases:
       - full
     capabilities:
@@ -19,9 +21,11 @@ workflows:
 
   deep_research:
     provider: backend.application.agent_workflows.factories:create_coordinated_workflow
+    execution_strategy: coordinated
     aliases:
       - deep-research
       - deep_research
+      - deepresearch
     capabilities:
       - deep_research
       - plan_solve
@@ -31,9 +35,11 @@ workflows:
 
   plan_solve:
     provider: backend.application.agent_workflows.factories:create_coordinated_workflow
+    execution_strategy: coordinated
     aliases:
       - plan-solve
       - plan_solve
+      - plansolve
     capabilities:
       - plan_solve
       - full
@@ -42,6 +48,7 @@ workflows:
 
   multi_agent_parallel:
     provider: backend.application.agent_workflows.factories:create_coordinated_workflow
+    execution_strategy: coordinated
     aliases:
       - multi-agent-parallel
       - multi_agent_parallel
@@ -53,6 +60,7 @@ workflows:
 
   multi_agent_alternating:
     provider: backend.application.agent_workflows.factories:create_coordinated_workflow
+    execution_strategy: coordinated
     aliases:
       - multi-agent-alternating
       - multi_agent_alternating

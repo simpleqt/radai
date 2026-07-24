@@ -8,7 +8,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from backend.api.dependencies.auth import ApiKeyAuth, verify_api_key
+from backend.api.dependencies.auth import ApiKeyAuth, require_admin
 from backend.config.loggers import get_logger
 from backend.db.connection import get_session
 from backend.db.crud.file_info_crud import FileInfoCRUD
@@ -106,7 +106,7 @@ class DocumentStatusResponse(BaseModel):
 @router.get("/pending", response_model=PendingDocumentsResponse)
 async def list_pending_documents(
     limit: int = Query(default=100, ge=1, le=1000, description="返回最大数量"),
-    auth: ApiKeyAuth = Depends(verify_api_key),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     """
     获取待入库文档列表
@@ -136,7 +136,7 @@ async def list_pending_documents(
 
     except Exception as e:
         logger.exception(f"获取待入库文档列表失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取待入库文档列表失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="获取待入库文档列表失败")
 
 
 @router.get("/list", response_model=DocumentListResponse)
@@ -146,7 +146,7 @@ async def list_documents(
     parse_status: Optional[int] = Query(default=None, description="解析状态过滤(0:未解析,1:已解析)"),
     storage_status: Optional[int] = Query(default=None, description="存储状态过滤(0:未入库,1:已入库)"),
     file_name: Optional[str] = Query(default=None, description="文件名模糊搜索"),
-    auth: ApiKeyAuth = Depends(verify_api_key),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     """
     获取文档列表（支持分页和过滤）
@@ -184,13 +184,13 @@ async def list_documents(
 
     except Exception as e:
         logger.exception(f"获取文档列表失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取文档列表失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="获取文档列表失败")
 
 
 @router.get("/status/{task_id}", response_model=DocumentStatusResponse)
 async def get_document_status(
     task_id: str,
-    auth: ApiKeyAuth = Depends(verify_api_key),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     """
     获取指定文档的状态
@@ -217,13 +217,13 @@ async def get_document_status(
 
     except Exception as e:
         logger.exception(f"获取文档状态失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取文档状态失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="获取文档状态失败")
 
 
 @router.post("/ingest", response_model=DocumentIngestResponse)
 async def ingest_documents(
     request: DocumentIngestRequest,
-    auth: ApiKeyAuth = Depends(verify_api_key),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     """
     执行文档入库
@@ -282,7 +282,7 @@ async def ingest_documents(
 
     except Exception as e:
         logger.exception(f"文档入库失败: {e}")
-        raise HTTPException(status_code=500, detail=f"文档入库失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="文档入库失败")
     finally:
         if processor:
             processor.close()
@@ -292,7 +292,7 @@ async def ingest_documents(
 async def ingest_single_document(
     task_id: str,
     dry_run: bool = Query(default=False, description="预览模式"),
-    auth: ApiKeyAuth = Depends(verify_api_key),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     """
     入库指定文档
@@ -308,20 +308,19 @@ async def ingest_single_document(
 
 @router.get("/stats")
 async def get_ingestion_stats(
-    auth: ApiKeyAuth = Depends(verify_api_key),
+    auth: ApiKeyAuth = Depends(require_admin),
 ):
     """
     获取入库统计信息
     """
     try:
-        pending_count, all_files, total_count = await _run_file_info_crud_in_thread(
-            lambda crud: (
-                len(crud.get_pending_files(limit=10000)),
-                *crud.get_all_files(limit=10000),
-            )
+        counts = await _run_file_info_crud_in_thread(
+            lambda crud: crud.get_statistics()
         )
-        stored_count = sum(1 for f in all_files if f.storage_status == 1)
-        parsed_count = sum(1 for f in all_files if f.parse_status == 1)
+        total_count = counts["total"]
+        stored_count = counts["stored"]
+        parsed_count = counts["parsed"]
+        pending_count = counts["pending"]
 
         return {
             "total_documents": total_count,
@@ -333,4 +332,4 @@ async def get_ingestion_stats(
 
     except Exception as e:
         logger.exception(f"获取统计信息失败: {e}")
-        raise HTTPException(status_code=500, detail=f"获取统计信息失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="获取统计信息失败")

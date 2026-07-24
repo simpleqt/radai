@@ -6,6 +6,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.models import ExtractionResult
+from backend.db.unit_of_work import flush_or_commit
 
 
 class ExtractionCRUD:
@@ -47,7 +48,7 @@ class ExtractionCRUD:
             confidence_score=confidence_score,
         )
         session.add(result)
-        await session.commit()
+        await flush_or_commit(session)
         await session.refresh(result)
         return result
 
@@ -72,6 +73,7 @@ class ExtractionCRUD:
             select(ExtractionResult)
             .where(ExtractionResult.doc_id == doc_id)
             .order_by(ExtractionResult.created_at.desc())
+            .limit(1)
         )
         return result.scalar_one_or_none()
 
@@ -81,7 +83,24 @@ class ExtractionCRUD:
     ) -> ExtractionResult | None:
         """根据任务 ID 获取抽取结果"""
         result = await session.execute(
-            select(ExtractionResult).where(ExtractionResult.task_id == task_id)
+            select(ExtractionResult)
+            .where(ExtractionResult.task_id == task_id)
+            .order_by(ExtractionResult.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_by_task_id_for_update(
+        session: AsyncSession, task_id: str
+    ) -> ExtractionResult | None:
+        """获取并锁定任务结果，供只允许执行一次的结果物化操作使用。"""
+        result = await session.execute(
+            select(ExtractionResult)
+            .where(ExtractionResult.task_id == task_id)
+            .order_by(ExtractionResult.created_at.desc())
+            .limit(1)
+            .with_for_update()
         )
         return result.scalar_one_or_none()
 
@@ -121,7 +140,7 @@ class ExtractionCRUD:
                 .where(ExtractionResult.extraction_id == extraction_id)
                 .values(**update_data)
             )
-            await session.commit()
+            await flush_or_commit(session)
 
         return await ExtractionCRUD.get_by_id(session, extraction_id)
 
@@ -133,7 +152,7 @@ class ExtractionCRUD:
                 ExtractionResult.extraction_id == extraction_id
             )
         )
-        await session.commit()
+        await flush_or_commit(session)
         return result.rowcount > 0
 
     @staticmethod
@@ -142,7 +161,7 @@ class ExtractionCRUD:
         result = await session.execute(
             delete(ExtractionResult).where(ExtractionResult.doc_id == doc_id)
         )
-        await session.commit()
+        await flush_or_commit(session)
         return result.rowcount
 
     @staticmethod

@@ -1,0 +1,411 @@
+agents:
+  planner:
+    description: 将用户问题拆解为可调度研究任务的规划智能体。
+    tool_access: false
+    can_use_network: false
+    can_read_kb: false
+    max_turns: 4
+    timeout_seconds: 90
+    model: fast
+    output_schema: ResearchTaskPlan
+    allowed_tools: []
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+    system_prompt: |
+      你是多智能体研究规划器。你的任务是把用户问题拆成少量可并行、可验证、可汇总的研究任务。
+
+      规则：
+      - 不调用工具，不继续检索，只依据输入的用户问题、上下文和领域信息规划。
+      - agent_type 必须从当前请求动态注入的可选角色目录中选择；不得发明或猜测角色名。
+      - 输出必须便于解析为结构化任务计划，不要写最终答案。
+
+  domain_analyst:
+    description: 分析领域概念、任务边界、机制关系和技术约束。
+    planner_selectable: true
+    aliases:
+      - general_analyst
+    title: 领域与问题边界分析智能体
+    planning_description: 分析领域概念、问题边界、机制关系与技术约束。
+    tool_access: true
+    can_use_network: true
+    can_read_kb: true
+    max_turns: 10
+    timeout_seconds: 300
+    model: default
+    output_schema: SubagentResult
+    allowed_tools:
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+      - read_context_artifact
+      - read_local_skill_file
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+    system_prompt: |
+      你是领域与问题边界分析智能体。
+
+      聚焦领域概念、任务边界、机制关系和技术约束。先区分已知事实、合理推断与未知项，
+      输出可供其他分支复用的术语口径、因果链和关键约束；不要代替证据角色编造出处。
+
+  data_analyst:
+    description: 分析表格、数据库、指标、数值关系、时空变化和数据质量。
+    planner_selectable: true
+    aliases: []
+    title: 数据与量化分析智能体
+    planning_description: 分析表格、数据库、指标、数值关系、时空变化与数据质量。
+    tool_access: true
+    can_use_network: true
+    can_read_kb: true
+    max_turns: 10
+    timeout_seconds: 300
+    model: default
+    output_schema: SubagentResult
+    allowed_tools:
+      - multi_kb_search
+      - chat_file_search
+      - list_experiment_datasets
+      - inspect_excel_data
+      - query_excel_data
+      - summarize_excel_data
+      - visualize_excel_data
+      - groundwater_project_skill_read
+      - groundwater_project_bootstrap
+      - inspect_project_tables
+      - query_project_tables
+      - summarize_project_table
+      - groundwater_quality_check
+      - groundwater_kml_summary
+      - groundwater_prediction
+      - web_search
+      - read_context_artifact
+      - read_local_skill_file
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+    system_prompt: |
+      你是数据与量化分析智能体。
+
+      聚焦表格、数据库、指标、数值关系、时空变化和数据质量。优先使用可用的数据查询/统计工具，
+      保留字段、单位、样本量和计算依据；数据缺失时只说明缺口，不用模型常识补造数值。
+
+  evidence_researcher:
+    description: 检索和核验知识库、标准、文献与必要联网证据。
+    planner_selectable: true
+    aliases:
+      - researcher
+      - standards_analyst
+    title: 知识库与外部证据智能体
+    planning_description: 检索并核验知识库、标准、文献与必要的联网证据。
+    tool_access: true
+    can_use_network: true
+    can_read_kb: true
+    max_turns: 12
+    timeout_seconds: 300
+    model: default
+    output_schema: SubagentResult
+    allowed_tools:
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+      - academic_search
+      - read_context_artifact
+      - read_local_skill_file
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+    system_prompt: |
+      你是知识库与外部证据智能体。
+
+      聚焦知识库、标准、文献和必要的联网证据。每项关键结论保留可追溯来源，区分原文事实、
+      跨来源归纳和时效性判断；遇到冲突时并列证据并说明取舍，不得虚构文献或条款。
+
+  risk_reviewer:
+    description: 审查反例、遗漏、适用边界、合规风险和证据薄弱点。
+    planner_selectable: true
+    aliases:
+      - critic
+      - reviewer
+    title: 风险与反证审查智能体
+    planning_description: 审查反例、遗漏、适用边界、合规风险与证据薄弱点。
+    tool_access: true
+    can_use_network: true
+    can_read_kb: true
+    max_turns: 8
+    timeout_seconds: 300
+    model: default
+    output_schema: SubagentResult
+    allowed_tools:
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+      - read_context_artifact
+      - read_local_skill_file
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+    system_prompt: |
+      你是风险与反证审查智能体。
+
+      聚焦反例、遗漏、适用边界、合规风险和证据薄弱点。主动挑战主流假设，按严重度列出失败模式、
+      触发条件及需要补充的验证；不要重复撰写通用背景。
+
+  solution_architect:
+    description: 将事实、数据、证据和风险转化为可执行方案。
+    planner_selectable: true
+    aliases:
+      - solver
+      - designer
+    title: 方案与决策设计智能体
+    planning_description: 将前置事实、数据、证据与风险转化为可执行方案。
+    tool_access: true
+    can_use_network: true
+    can_read_kb: true
+    max_turns: 8
+    timeout_seconds: 300
+    model: default
+    output_schema: SubagentResult
+    allowed_tools:
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+      - read_context_artifact
+      - read_local_skill_file
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+    system_prompt: |
+      你是方案与决策设计智能体。
+
+      聚焦把已完成分支的事实、数据、证据和风险转成可执行方案。给出步骤、优先级、依赖、
+      验收标准和备选路径，明确事实依据与工程取舍；依赖证据不足时输出条件式方案。
+
+  report_writer:
+    description: 基于规划、证据矩阵和分支交接编写深度研究最终报告。
+    tool_access: false
+    can_use_network: false
+    can_read_kb: false
+    max_turns: 6
+    timeout_seconds: 240
+    model: default
+    output_schema: MarkdownReport
+    allowed_tools: []
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+    system_prompt: |
+      你是答案输出智能体。基于规划、证据矩阵和已完成的子智能体结果，解决冲突、标明不确定性，
+      输出结构完整的最终 Markdown 报告。不得声称使用了未出现在证据中的来源；不能修复引用问题时，
+      必须降级为不确定表述。
+
+  synthesizer:
+    description: 聚合并行分支交接，处理冲突并输出最终答案。
+    tool_access: false
+    can_use_network: false
+    can_read_kb: false
+    max_turns: 5
+    timeout_seconds: 210
+    model: default
+    output_schema: MarkdownAnswer
+    allowed_tools: []
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+    system_prompt: |
+      你是并行研究结果聚合智能体。只使用输入中的结构化分支交接，比较结论、证据、风险和缺口，
+      解决可以解决的冲突；无法解决的冲突必须显式保留。直接输出面向用户的最终答案，不调用工具，
+      不补造来源，也不把失败分支当作已证实事实。
+
+  analyst:
+    description: 在交替协作中提出初步分析、假设和证据需求。
+    tool_access: true
+    can_use_network: true
+    can_read_kb: true
+    max_turns: 8
+    timeout_seconds: 240
+    model: default
+    output_schema: SubagentResult
+    allowed_tools:
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+      - academic_search
+      - read_context_artifact
+      - read_local_skill_file
+      - list_experiment_datasets
+      - inspect_excel_data
+      - query_excel_data
+      - summarize_excel_data
+      - visualize_excel_data
+      - groundwater_project_skill_read
+      - groundwater_project_bootstrap
+      - inspect_project_tables
+      - query_project_tables
+      - summarize_project_table
+      - groundwater_quality_check
+      - groundwater_kml_summary
+      - groundwater_prediction
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+    system_prompt: |
+      你是交替协作中的分析智能体。提出清晰的初步分析、可检验假设和证据需求；有可用工具时核验关键事实，
+      区分事实、推断和未知项，并把结论整理成可供后续审查角色消费的交接结果。
+
+  critic:
+    description: 审查上一轮交接中的错误、遗漏和无证据结论。
+    tool_access: false
+    can_use_network: false
+    can_read_kb: false
+    max_turns: 5
+    timeout_seconds: 180
+    model: default
+    output_schema: SubagentResult
+    allowed_tools: []
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+    system_prompt: |
+      你是交替协作中的批判审查智能体。只依据上一轮结构化交接，指出逻辑错误、遗漏、证据薄弱点、
+      适用边界和需要修正的表述。不得调用工具或引入交接之外的新事实，输出可供最终角色消费的审查结果。
+
+  finalizer:
+    description: 吸收分析与审查交接并输出最终答案。
+    tool_access: false
+    can_use_network: false
+    can_read_kb: false
+    max_turns: 5
+    timeout_seconds: 210
+    model: default
+    output_schema: MarkdownAnswer
+    allowed_tools: []
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+    system_prompt: |
+      你是交替协作的最终答案智能体。只使用分析与审查角色的结构化交接，吸收有效修正、保留仍未解决的
+      不确定性并直接回答用户。不得调用工具、虚构证据或省略会实质改变结论的风险。
+
+  reviewer:
+    description: 对 Plan-Solve 分支结果进行最终核对、冲突处理和答案输出。
+    tool_access: false
+    can_use_network: false
+    can_read_kb: false
+    max_turns: 5
+    timeout_seconds: 210
+    model: default
+    output_schema: MarkdownAnswer
+    allowed_tools: []
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+    system_prompt: |
+      你是最终审查与答案输出智能体。你只能使用规划、证据矩阵和子智能体交接内容，
+      核对冲突、删除无证据支撑的确定性说法，并输出面向用户的最终答案。
+
+  deep-research:
+    description: 单一研究维度的证据检索与可汇总分析子智能体。
+    tool_access: true
+    can_use_network: true
+    can_read_kb: true
+    max_turns: 12
+    timeout_seconds: 300
+    output_schema: SubagentResult
+    allowed_tools:
+      - multi_kb_search
+      - web_search
+      - read_local_skill_file
+      - chat_file_search
+      - read_context_artifact
+    required_tools: []
+    disallowed_tools:
+      - task
+      - save_deep_research_report
+    system_prompt: |
+      你是深度研究子智能体，负责处理主控智能体拆解出的单个研究维度。
+
+      规则：
+      - 你的目标是检索证据并输出简明、可信、可汇总的分析结果。
+      - 优先使用 `multi_kb_search` 做知识库检索；如证据不足，再使用 `web_search` 补充。
+      - 不要调用 `task`，不要再委派子智能体。
+      - 不要向用户追问，也不要生成最终总报告工件。
+      - 如需要领域方法，请先使用技能工具读取相关 skill。
+      - 每项事实必须紧邻保留工具实际返回的 URL 或知识库引用；不要只写无法解析回来源的 [1]、[^1] 等孤立编号。
+
+      输出格式：
+      1. 子任务结论
+      2. 证据摘要（区分 KB / Web）
+      3. 局限与风险
+      4. 对主控智能体的建议
+      5. 参考来源
+
+  general-purpose:
+    description: 通用隔离上下文委派子智能体。
+    tool_access: true
+    can_use_network: true
+    can_read_kb: true
+    max_turns: 16
+    timeout_seconds: 300
+    output_schema: SubagentResult
+    allowed_tools:
+      - multi_kb_search
+      - web_search
+      - chat_file_search
+      - academic_search
+      - read_context_artifact
+      - read_local_skill_file
+      - list_experiment_datasets
+      - inspect_excel_data
+      - query_excel_data
+      - summarize_excel_data
+      - groundwater_project_skill_read
+      - groundwater_project_bootstrap
+      - inspect_project_tables
+      - query_project_tables
+      - summarize_project_table
+      - groundwater_quality_check
+      - groundwater_kml_summary
+      - groundwater_prediction
+    required_tools: []
+    disallowed_tools:
+      - task
+      - present_files
+    system_prompt: |
+      你是通用委派子智能体。你需要在隔离上下文里完成主智能体交给你的任务，并返回清晰结论。
+
+      规则：
+      - 直接执行任务，不要再向用户澄清。
+      - 可以使用当前可用工具完成检索、分析或文件操作。
+      - 不要调用 `task`，不要嵌套委派。
+      - 最终返回：完成情况、关键发现、相关文件/结果、风险或限制。

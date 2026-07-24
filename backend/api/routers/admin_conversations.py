@@ -4,13 +4,12 @@
 所有接口均要求管理员权限 (role=admin)。
 """
 
-import re
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.dependencies.auth import ApiKeyAuth, require_admin
@@ -18,8 +17,11 @@ from backend.config.loggers import get_logger
 from backend.core.config import build_internal_thread_key, get_paths
 from backend.core.thread_key import parse_internal_thread_key
 from backend.application.checkpointing.checkpointer import get_checkpointer_from_request
+from backend.application.blocking import run_blocking
+from backend.application.conversations.message_serializer import serialize_checkpoint_messages
 from backend.db.connection import get_async_session
 from backend.db.models import Conversation, User
+from backend.services.admin_audit import write_admin_audit
 
 logger = get_logger(__name__)
 
@@ -75,64 +77,6 @@ class ConversationStatsResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-_IMAGE_TOKEN_RE = re.compile(r"\[IMAGE:\d+\]")
-
-
-def _serialize_messages(messages: list[Any]) -> list[AdminMessageItem]:
-    """将 LangChain 消息列表序列化为 JSON 友好的格式（复用 conversations.py 逻辑）。"""
-    result: list[AdminMessageItem] = []
-    for m in messages:
-        role = "user"
-        if hasattr(m, "type"):
-            role = m.type
-        elif isinstance(m, dict):
-            role = m.get("type", "user")
-
-        content = ""
-        if hasattr(m, "content"):
-            content = m.content
-        elif isinstance(m, dict):
-            content = m.get("content", "")
-
-        # 清理 AI 消息中未被替换的 [IMAGE:xxx] token
-        if isinstance(content, str) and role in ("ai", "assistant") and _IMAGE_TOKEN_RE.search(content):
-            content = _IMAGE_TOKEN_RE.sub("", content)
-
-        metadata: dict = {}
-        if hasattr(m, "additional_kwargs"):
-            metadata = m.additional_kwargs
-        elif isinstance(m, dict) and "additional_kwargs" in m:
-            metadata = m["additional_kwargs"]
-        elif isinstance(m, dict) and "metadata" in m:
-            metadata = m["metadata"]
-
-        # 过滤自动摘要生成的 JIT 历史压缩消息
-        if metadata and metadata.get("lc_source") == "summarization":
-            continue
-
-        if isinstance(content, str) and (
-            "Here is a summary of the conversation to date:" in content
-            or content.startswith("[State Elevation:")
-            or content.startswith("[Context Isolation:")
-            or content.startswith("[System Notification:")
-        ):
-            continue
-
-        result.append(
-            AdminMessageItem(
-                role=role,
-                content=content if isinstance(content, str) else str(content),
-                metadata=metadata,
-                id=getattr(m, "id", None),
-            )
-        )
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -143,17 +87,21 @@ async def get_conversation_stats(
     _admin: ApiKeyAuth = Depends(require_admin),
 ):
     """获取会话统计信息"""
-    total = await session.scalar(select(func.count()).select_from(Conversation)) or 0
-    active = await session.scalar(
-        select(func.count()).select_from(Conversation).where(Conversation.is_deleted == False)
-    ) or 0
+    stats = (
+        await session.execute(
+            select(
+                func.count(Conversation.id),
+                func.sum(case((Conversation.is_deleted.is_(False), 1), else_=0)),
+                func.count(func.distinct(Conversation.user_id)),
+                func.max(Conversation.updated_at),
+            )
+        )
+    ).one()
+    total = int(stats[0] or 0)
+    active = int(stats[1] or 0)
     deleted = total - active
-    unique_users = await session.scalar(
-        select(func.count(func.distinct(Conversation.user_id)))
-    ) or 0
-    latest = await session.scalar(
-        select(func.max(Conversation.updated_at))
-    )
+    unique_users = int(stats[2] or 0)
+    latest = stats[3]
 
     return ConversationStatsResponse(
         total_conversations=total,
@@ -267,7 +215,15 @@ async def get_user_conversation_messages(
         if checkpoint:
             channel_values = checkpoint.get("channel_values", {})
             raw_messages = channel_values.get("messages", [])
-            messages = _serialize_messages(raw_messages)
+            registered_images = (conv.metadata_ or {}).get("registered_images") or {}
+            messages = [
+                AdminMessageItem(**item)
+                for item in serialize_checkpoint_messages(
+                    raw_messages,
+                    registered_images=registered_images,
+                    coerce_content_to_str=True,
+                )
+            ]
     except Exception as e:
         logger.error(f"[Admin] 读取 checkpointer 失败: thread={internal_thread_id}, error={e}")
 
@@ -280,7 +236,7 @@ async def delete_user_conversation(
     thread_id: str,
     request: Request,
     session: AsyncSession = Depends(get_async_session),
-    _admin: ApiKeyAuth = Depends(require_admin),
+    admin: ApiKeyAuth = Depends(require_admin),
 ):
     """删除任意用户的会话（逻辑删除 + 清理 checkpointer + 清理沙箱目录）"""
     result = await session.execute(
@@ -293,48 +249,77 @@ async def delete_user_conversation(
     if not conv:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    # 逻辑删除
     conv.is_deleted = True
+    await write_admin_audit(
+        session,
+        request,
+        admin,
+        action="conversation.delete",
+        target_type="conversation",
+        target_id=thread_id,
+        detail={"user_id": user_id, "title": conv.title},
+    )
     await session.commit()
 
     internal_thread_id = build_internal_thread_key(user_id, thread_id)
+    cleanup_errors: list[str] = []
+    try:
+        from backend.application.agent_tasks import agent_task_registry
 
-    # 清理 checkpointer
+        runtime_metadata = dict((conv.metadata_ or {}).get("agent_runtime") or {})
+        agent_code = str(runtime_metadata.get("agent_code") or "ne").strip() or "ne"
+        active_task = await agent_task_registry.active_for_thread(
+            user_id=user_id,
+            agent_code=agent_code,
+            thread_id=thread_id,
+        )
+        if active_task is not None:
+            await agent_task_registry.cancel(active_task)
+    except Exception as exc:
+        logger.exception("[Admin] 停止会话后台任务失败: thread=%s", internal_thread_id)
+        cleanup_errors.append(f"background_task: {type(exc).__name__}")
+
     try:
         checkpointer = get_checkpointer_from_request(request)
-        if hasattr(checkpointer, "conn"):
-            cursor = await checkpointer.conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-            rows = await cursor.fetchall()
-            existing_tables = {str(r[0]) for r in rows if r and r[0]}
+        await checkpointer.adelete_thread(internal_thread_id)
+    except Exception as exc:
+        logger.exception("[Admin] 清理 checkpointer 失败: thread=%s", internal_thread_id)
+        cleanup_errors.append(f"checkpointer: {type(exc).__name__}")
 
-            for table_name in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
-                if table_name not in existing_tables:
-                    logger.debug("[Admin] checkpointer 表不存在，跳过: %s", table_name)
-                    continue
-                await checkpointer.conn.execute(
-                    f"DELETE FROM {table_name} WHERE thread_id = ?",
-                    (internal_thread_id,),
-                )
-            await checkpointer.conn.commit()
-            logger.info("[Admin] 已清理 checkpointer 数据: thread=%s", internal_thread_id)
-    except Exception as e:
-        logger.warning(f"[Admin] 清理 checkpointer 失败: {e}")
-
-    # 清理 MinIO 附件
     try:
         from backend.core.storage.scoped_storage import ScopedStorage
-        storage = ScopedStorage(user_id=user_id, thread_id=thread_id)
-        storage.delete_all_files()
-    except Exception as e:
-        logger.warning(f"[Admin] 清理 MinIO 线程附件失败: {e}")
 
-    # 清理沙箱线程目录
+        storage = ScopedStorage(user_id=user_id, thread_id=thread_id)
+        await run_blocking(storage.delete_all_files, timeout_seconds=30)
+    except Exception as exc:
+        logger.exception("[Admin] 清理 MinIO 线程附件失败: thread=%s", internal_thread_id)
+        cleanup_errors.append(f"storage: {type(exc).__name__}")
+
     try:
-        get_paths().delete_thread_dir(internal_thread_id)
-    except Exception as e:
-        logger.warning(f"[Admin] 清理沙箱线程目录失败: {e}")
+        await run_blocking(
+            get_paths().delete_thread_dir,
+            internal_thread_id,
+            timeout_seconds=10,
+        )
+    except Exception as exc:
+        logger.exception("[Admin] 清理沙箱线程目录失败: thread=%s", internal_thread_id)
+        cleanup_errors.append(f"sandbox: {type(exc).__name__}")
+
+    if cleanup_errors:
+        conv.is_deleted = False
+        metadata = dict(conv.metadata_ or {})
+        metadata["deletion_cleanup_error"] = {
+            "components": cleanup_errors,
+            "updated_at": datetime.now().isoformat(),
+        }
+        conv.metadata_ = metadata
+        await session.commit()
+        raise HTTPException(status_code=503, detail="会话清理未完成，请稍后重试")
+
+    metadata = dict(conv.metadata_ or {})
+    metadata.pop("deletion_cleanup_error", None)
+    conv.metadata_ = metadata
+    await session.commit()
 
     return {
         "success": True,
@@ -392,4 +377,4 @@ async def list_checkpointer_threads(
         return {"items": items, "total": total, "limit": limit, "offset": offset}
     except Exception as e:
         logger.error(f"[Admin] 查询 checkpointer threads 失败: {e}")
-        raise HTTPException(status_code=500, detail=f"查询 checkpointer 失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="查询 checkpointer 失败")

@@ -16,14 +16,10 @@ def _create_langsmith_tracer(config) -> Any:
 
 
 def _create_langfuse_handler(config) -> Any:
-    from langfuse import Langfuse
     from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 
-    Langfuse(
-        secret_key=config.secret_key,
-        public_key=config.public_key,
-        host=config.host,
-    )
+    # Credentials/base URL already come from the LANGFUSE_* environment used
+    # to build this config. The handler owns/reuses its SDK client lifecycle.
     return LangfuseCallbackHandler(public_key=config.public_key)
 
 

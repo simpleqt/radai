@@ -1,6 +1,7 @@
 ---
 name: excel-experiment-analysis
 description: 专用于实验数据分析的技能。当用户需要分析 Excel/CSV 格式的实验数据时使用，包括：查看服务器上预构建的实验数据集（生物炭降解性能、羟基自由基反应速率等）、探查数据结构、SQL 查询、统计分析、科研可视化图表生成。支持用户上传自定义数据文件。
+domain: "*"
 tools:
   - list_experiment_datasets
   - inspect_excel_data

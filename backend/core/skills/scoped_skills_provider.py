@@ -1,13 +1,50 @@
 from __future__ import annotations
 
 import logging
+import os
+import threading
+import time
+import weakref
 from pathlib import Path
 from typing import Any
 
-from backend.core.skills.loader import get_skills_root_path, load_skills
+from backend.core.skills.loader import (
+    get_managed_skills_root_path,
+    get_skills_root_path,
+    load_skills,
+)
 from backend.core.skills.types import Skill
 
 logger = logging.getLogger(__name__)
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    try:
+        return max(1.0, float(os.getenv(name, str(default)) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+_PROVIDER_INSTANCES: weakref.WeakSet[ScopedSkillsProvider] = weakref.WeakSet()
+_PROVIDER_LOCK = threading.RLock()
+_MAX_SKILL_CONTENT_CHARS = max(
+    1_000, int(os.getenv("AGENT_MAX_SKILL_CONTENT_CHARS", "60000"))
+)
+_MAX_REFERENCE_CONTENT_CHARS = max(
+    1_000, int(os.getenv("AGENT_MAX_SKILL_REFERENCE_CHARS", "50000"))
+)
+_SKILL_CACHE_TTL_SECONDS = _positive_float_env(
+    "AGENT_SKILL_CACHE_TTL_SECONDS",
+    30.0,
+)
+
+
+def invalidate_all_skill_caches() -> None:
+    """Invalidate every live provider in this process after a catalog change."""
+    with _PROVIDER_LOCK:
+        providers = list(_PROVIDER_INSTANCES)
+    for provider in providers:
+        provider.invalidate_cache()
 
 
 class ScopedSkillsProvider:
@@ -18,22 +55,52 @@ class ScopedSkillsProvider:
         skills_base_path: Path | None = None,
         container_path: str = "/mnt/skills",
         user_id: str | None = None,
+        authorized_skill_names: set[str] | None = None,
     ):
         self._skills_base_path = skills_base_path or get_skills_root_path()
         self._container_path = container_path
         self._user_id = str(user_id or "").strip() or None
+        self._authorized_skill_names = (
+            {str(name).strip() for name in authorized_skill_names if str(name).strip()}
+            if authorized_skill_names is not None
+            else None
+        )
         self._skills_cache: list[Skill] | None = None
+        self._skills_cache_loaded_at = 0.0
+        self._cache_lock = threading.RLock()
+        with _PROVIDER_LOCK:
+            _PROVIDER_INSTANCES.add(self)
+
+    def invalidate_cache(self) -> None:
+        with self._cache_lock:
+            self._skills_cache = None
+            self._skills_cache_loaded_at = 0.0
 
     def _load_all_skills(self) -> list[Skill]:
         """加载所有 Skills（带缓存）。"""
-        if self._skills_cache is None:
-            self._skills_cache = load_skills(skills_path=self._skills_base_path)
-            logger.info(
-                "[ScopedSkillsProvider] 已加载 Skills 总数=%d, 根目录=%s",
-                len(self._skills_cache),
-                self._skills_base_path,
+        with self._cache_lock:
+            cache_expired = (
+                self._skills_cache is not None
+                and time.monotonic() - self._skills_cache_loaded_at
+                >= _SKILL_CACHE_TTL_SECONDS
             )
-        return self._skills_cache
+            if self._skills_cache is None or cache_expired:
+                by_name = {
+                    skill.name: skill
+                    for skill in load_skills(skills_path=self._skills_base_path)
+                }
+                managed_root = get_managed_skills_root_path()
+                if managed_root != self._skills_base_path and managed_root.exists():
+                    for skill in load_skills(skills_path=managed_root):
+                        by_name[skill.name] = skill
+                self._skills_cache = sorted(by_name.values(), key=lambda item: item.name)
+                self._skills_cache_loaded_at = time.monotonic()
+                logger.info(
+                    "[ScopedSkillsProvider] 已加载 Skills 总数=%d, 根目录=%s",
+                    len(self._skills_cache),
+                    self._skills_base_path,
+                )
+            return list(self._skills_cache)
 
     def get_available_skills_for_user(
         self,
@@ -44,19 +111,26 @@ class ScopedSkillsProvider:
         effective_user_id = str(user_id or self._user_id or "").strip() or None
         all_skills = self._load_all_skills()
 
-        enabled_skills = [
-            skill
-            for skill in all_skills
-            if skill.enabled
-            and (
-                skill.category == "public"
-                or (
-                    skill.category == "custom"
-                    and effective_user_id is not None
-                    and skill.owner_id == effective_user_id
+        if self._authorized_skill_names is not None:
+            enabled_skills = [
+                skill
+                for skill in all_skills
+                if skill.enabled and skill.name in self._authorized_skill_names
+            ]
+        else:
+            enabled_skills = [
+                skill
+                for skill in all_skills
+                if skill.enabled
+                and (
+                    skill.category == "public"
+                    or (
+                        skill.category == "custom"
+                        and effective_user_id is not None
+                        and skill.owner_id == effective_user_id
+                    )
                 )
-            )
-        ]
+            ]
 
         if selected_skills is not None:
             enabled_skills = [skill for skill in enabled_skills if skill.name in selected_skills]
@@ -108,6 +182,24 @@ You have access to skills that provide optimized workflows for specific tasks. E
 
 </skill_system>"""
 
+    @staticmethod
+    def validate_skill_selection(skills: list[Skill]) -> None:
+        """Validate dependency/conflict declarations before agent assembly."""
+        selected = {skill.name for skill in skills}
+        missing: dict[str, list[str]] = {}
+        conflicts: dict[str, list[str]] = {}
+        for skill in skills:
+            unresolved = sorted(set(skill.dependencies) - selected)
+            if unresolved:
+                missing[skill.name] = unresolved
+            active_conflicts = sorted(set(skill.conflicts) & selected)
+            if active_conflicts:
+                conflicts[skill.name] = active_conflicts
+        if missing:
+            raise ValueError(f"Skill dependencies are not selected: {missing}")
+        if conflicts:
+            raise ValueError(f"Conflicting Skills selected: {conflicts}")
+
     def read_skill_content(self, skill_name: str) -> str:
         """读取指定 Skill 的 SKILL.md 内容。"""
         skills = self.get_available_skills_for_user(selected_skills={skill_name})
@@ -116,7 +208,7 @@ You have access to skills that provide optimized workflows for specific tasks. E
 
         skill = skills[0]
         logger.info("[ScopedSkillsProvider] Read skill content: %s", skill_name)
-        return skill.skill_file.read_text(encoding="utf-8")
+        return self._read_bounded(skill.skill_file, _MAX_SKILL_CONTENT_CHARS)
 
     def read_skill_reference(self, skill_name: str, reference_path: str) -> str:
         """读取 Skill 目录下的参考文件。"""
@@ -155,7 +247,10 @@ You have access to skills that provide optimized workflows for specific tasks. E
                     skill_name,
                     reference_path,
                 )
-                index_content = index_file.read_text(encoding="utf-8")
+                index_content = self._read_bounded(
+                    index_file,
+                    _MAX_REFERENCE_CONTENT_CHARS,
+                )
                 return (
                     f"Reference file not found: {reference_path}.\n"
                     "Load references one at a time. Catalog:\n\n"
@@ -196,7 +291,21 @@ You have access to skills that provide optimized workflows for specific tasks. E
             skill_name,
             reference_path,
         )
-        return ref_file.read_text(encoding="utf-8")
+        return self._read_bounded(ref_file, _MAX_REFERENCE_CONTENT_CHARS)
+
+    @staticmethod
+    def _read_bounded(path: Path, max_chars: int) -> str:
+        size = path.stat().st_size
+        if size > max_chars * 4:
+            raise ValueError(
+                f"Skill resource exceeds the {max_chars} character safety limit: {path.name}"
+            )
+        content = path.read_text(encoding="utf-8")
+        if len(content) > max_chars:
+            raise ValueError(
+                f"Skill resource exceeds the {max_chars} character safety limit: {path.name}"
+            )
+        return content
 
     def get_skill_info(self, skill_name: str) -> dict[str, Any] | None:
         """获取 Skill 元信息。"""

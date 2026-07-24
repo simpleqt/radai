@@ -18,10 +18,19 @@ from pymilvus import Collection, connections, utility
 
 from backend.config.loggers import get_logger
 from backend.config.settings import settings
+from backend.core.utils.env import positive_float_from_env
 from backend.rag.keywords.bm25_index import BM25Index
 from backend.rag.keywords.models import EntityData, KeywordIndexStats
 
 logger = get_logger(__name__)
+
+
+_MILVUS_KEYWORD_LOAD_TIMEOUT_SECONDS = positive_float_from_env(
+    "MILVUS_KEYWORD_LOAD_TIMEOUT_SECONDS", 15.0
+)
+_MILVUS_KEYWORD_SEARCH_TIMEOUT_SECONDS = positive_float_from_env(
+    "MILVUS_KEYWORD_SEARCH_TIMEOUT_SECONDS", 15.0
+)
 
 
 def _sanitize_collection_component(value: str, fallback_prefix: str) -> str:
@@ -54,6 +63,12 @@ def get_entity_collection_name(kb_code: str) -> str:
     """获取实体 Collection 名称"""
     base = _sanitize_collection_component(kb_code, fallback_prefix="kb")
     return f"{base}_entities"
+
+
+def get_self_ingestion_entity_collection_name(kb_code: str) -> str:
+    """获取 self-ingestion v2 实体 Collection 名称"""
+    base = _sanitize_collection_component(kb_code, fallback_prefix="kb")
+    return f"{base}_entities_v2"
 
 
 def get_redis_key_prefix(kb_code: str) -> str:
@@ -144,6 +159,9 @@ class PerKBKeywordIndex:
             
             if not self.entity_names:
                 await self._load_from_milvus()
+            
+            if not self.entity_names:
+                await self._load_from_self_ingestion_entities_v2()
             
             if not self.entity_names:
                 await self._load_from_nebula()
@@ -268,10 +286,22 @@ class PerKBKeywordIndex:
                 names: List[str] = []
                 metadata: Dict[str, Dict] = {}
                 seen_names: set[str] = set()
+                existing_fields = {field.name for field in collection.schema.fields}
+                output_fields = [
+                    field
+                    for field in ("entity_name", "entity_type", "description", "source_id", "file_path")
+                    if field in existing_fields
+                ]
+                if "entity_name" not in output_fields:
+                    logger.warning(
+                        "[Milvus] Collection %s 缺少 entity_name 字段，跳过加载",
+                        collection_name,
+                    )
+                    return [], {}
 
                 iterator = collection.query_iterator(
                     expr="",
-                    output_fields=["entity_name", "entity_type", "description", "source_id", "file_path"],
+                    output_fields=output_fields,
                     batch_size=10000,
                 )
 
@@ -325,6 +355,110 @@ class PerKBKeywordIndex:
             
         except Exception as e:
             logger.warning(f"[Milvus] 加载失败: kb={self.kb_code}, error={e}")
+
+    async def _load_from_self_ingestion_entities_v2(self) -> None:
+        """从 self-ingestion v2 的实体向量库加载关键词实体。"""
+        try:
+            def _load_sync() -> tuple[List[str], Dict[str, Dict]]:
+                self._connect_milvus()
+
+                collection_name = get_self_ingestion_entity_collection_name(self.kb_code)
+                if not utility.has_collection(collection_name, using=self._milvus_conn_alias):
+                    return [], {}
+
+                collection = Collection(collection_name, using=self._milvus_conn_alias)
+                collection.load()
+
+                existing_fields = {field.name for field in collection.schema.fields}
+                output_fields = [
+                    field
+                    for field in (
+                        "entity_name",
+                        "entity_type",
+                        "description",
+                        "source_id",
+                        "file_path",
+                        "doc_ids",
+                        "chunk_ids",
+                    )
+                    if field in existing_fields
+                ]
+                if "entity_name" not in output_fields:
+                    logger.warning(
+                        "[Milvus v2] Collection %s 缺少 entity_name 字段，跳过加载",
+                        collection_name,
+                    )
+                    return [], {}
+
+                expr_parts = []
+                if "kb_id" in existing_fields and self.kb_id:
+                    expr_parts.append(f'kb_id == "{self.kb_id}"')
+                if "is_visible" in existing_fields:
+                    expr_parts.append("is_visible == true")
+                if "status" in existing_fields:
+                    expr_parts.append('status != "deleted"')
+                expr = " && ".join(expr_parts)
+
+                names: List[str] = []
+                metadata: Dict[str, Dict] = {}
+                seen_names: set[str] = set()
+                iterator = collection.query_iterator(
+                    expr=expr,
+                    output_fields=output_fields,
+                    batch_size=10000,
+                )
+
+                try:
+                    while True:
+                        results = iterator.next()
+                        if not results:
+                            break
+
+                        for item in results:
+                            entity_name = item.get("entity_name", "")
+                            if entity_name and entity_name not in seen_names:
+                                seen_names.add(entity_name)
+                                names.append(entity_name)
+                                metadata[entity_name] = {
+                                    "entity_type": item.get("entity_type", "term") or "term",
+                                    "description": item.get("description", "") or "",
+                                    "source_id": item.get("source_id", "") or item.get("chunk_ids", ""),
+                                    "file_path": item.get("file_path", "") or item.get("doc_ids", ""),
+                                }
+                finally:
+                    iterator.close()
+
+                return names, metadata
+
+            names, metadata = await asyncio.to_thread(_load_sync)
+            if not names:
+                logger.info(
+                    "[Milvus v2] Collection %s 不存在或无数据",
+                    get_self_ingestion_entity_collection_name(self.kb_code),
+                )
+                return
+
+            seen = set(self.entity_names)
+            for entity_name in names:
+                if entity_name not in seen:
+                    self.entity_names.append(entity_name)
+                    self.entity_metadata[entity_name] = metadata.get(entity_name, {})
+                    seen.add(entity_name)
+
+            self.entity_count = len(self.entity_names)
+            self.last_accessed = datetime.now()
+            logger.info(f"[Milvus v2] 加载知识库 {self.kb_code}: {len(names)} 个实体")
+
+            if self.entity_names and not self.bm25_index:
+                self.bm25_index = BM25Index()
+                self.bm25_index.build(self.entity_names)
+
+            if self.entity_names:
+                await self._save_to_redis()
+                logger.info("[Redis] 已保存从 Milvus v2 加载的数据")
+
+        except Exception as e:
+            logger.warning(f"[Milvus v2] 加载失败: kb={self.kb_code}, error={e}")
     
     async def _load_from_nebula(self) -> None:
         """从 NebulaGraph 加载实体数据"""
@@ -459,7 +593,7 @@ class PerKBKeywordIndex:
 
                 collection = Collection(collection_name, using=self._milvus_conn_alias)
                 try:
-                    collection.load()
+                    collection.load(timeout=_MILVUS_KEYWORD_LOAD_TIMEOUT_SECONDS)
                 except Exception as load_error:
                     error_msg = str(load_error)
                     if "can't change the index" in error_msg or "invalid parameter" in error_msg:
@@ -475,6 +609,7 @@ class PerKBKeywordIndex:
                     param=search_params,
                     limit=top_k,
                     output_fields=["entity_name"],
+                    timeout=_MILVUS_KEYWORD_SEARCH_TIMEOUT_SECONDS,
                 )
 
                 entities: List[Tuple[str, float]] = []
@@ -512,7 +647,11 @@ class PerKBKeywordIndex:
             return []
         
         try:
-            results = self.bm25_index.search(query, top_k=top_k)
+            results = await asyncio.to_thread(
+                self.bm25_index.search,
+                query,
+                top_k=top_k,
+            )
             
             entities = []
             for doc_idx, score in results:
@@ -706,7 +845,7 @@ class PerKBKeywordIndex:
                     
                     try:
                         if embedding_api_base and embedding_api_key:
-                            async with httpx.AsyncClient(timeout=120.0) as client:
+                            async with httpx.AsyncClient(trust_env=False, timeout=120.0) as client:
                                 response = await client.post(
                                     f"{embedding_api_base}/embeddings",
                                     headers={"Authorization": f"Bearer {embedding_api_key}"},

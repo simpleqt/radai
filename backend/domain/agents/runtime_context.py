@@ -6,6 +6,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.domain.agents.profile import AgentProfile
+from backend.domain.agents.runtime_agent import RuntimeAgentSpec
+from backend.domain.agents.runtime_bindings import AgentRuntimeBindings
+from backend.domain.agents.runtime_budget import AgentRuntimeBudget
 
 
 @dataclass(frozen=True)
@@ -27,3 +30,9 @@ class AgentRuntimeContext:
     time_context: str = ""
     request_metadata: dict[str, Any] = field(default_factory=dict)
     domain_context: dict[str, Any] = field(default_factory=dict)
+    runtime_budget: AgentRuntimeBudget | None = None
+    run_id: str = ""
+    trace_enabled: bool = False
+    agent_specs: dict[str, RuntimeAgentSpec] = field(default_factory=dict)
+    context_policy: Any | None = None
+    agent_bindings: AgentRuntimeBindings | None = None

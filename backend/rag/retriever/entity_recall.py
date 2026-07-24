@@ -7,12 +7,13 @@ Path-A（实体向量召回）+ Path-B（BM25 召回）+ RRF 融合
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from backend.config.loggers import get_logger
+from backend.core.utils.math import cosine_similarity
 from backend.rag.keywords.models import QueryType
 from backend.rag.retriever.config import (
     DirectRetrieverConfig,
@@ -21,14 +22,6 @@ from backend.rag.retriever.config import (
 )
 
 logger = get_logger(__name__)
-
-
-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    norm_a = float(np.linalg.norm(a))
-    norm_b = float(np.linalg.norm(b))
-    if norm_a <= 0 or norm_b <= 0:
-        return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -156,7 +149,7 @@ class EntityRecaller:
                 picked_emb = name_to_embedding.get(picked.name)
                 if picked_emb is None:
                     continue
-                max_sim = max(max_sim, _cosine_similarity(cand_emb, picked_emb))
+                max_sim = max(max_sim, cosine_similarity(cand_emb, picked_emb))
             return cfg.seed_mmr_lambda * max_sim
 
         while remaining:

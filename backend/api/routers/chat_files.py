@@ -8,28 +8,46 @@ DELETE /api/v2/chat-files/{file_id}  - 删除文件
 
 from __future__ import annotations
 
-import base64
-import hashlib
+import asyncio
 import hmac
+import ipaddress
+import socket
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import quote, urlparse
 from typing import List, Optional
+from urllib.parse import quote, urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.routers.auth import get_current_user
+from backend.api.upload_utils import UploadTooLargeError, read_upload_with_limit
 from backend.config.loggers import get_logger
-from backend.config.settings import settings
-from backend.db.connection import get_async_session, get_session_factory
-from backend.db.models import User, UserFile, SessionFile
-from backend.storage import _get_minio_client, get_user_minio_bucket_name, upload_bytes_to_minio
+from backend.db.connection import get_async_session
+from backend.db.models import SessionFile, User, UserFile
+from backend.services.chat_file_metadata import (
+    CHAT_FILE_IMAGE_URL_TTL_SECONDS,
+)
+from backend.services.chat_file_metadata import (
+    build_chat_image_signature as _build_chat_image_signature,
+)
+from backend.services.user_file_service import (
+    ALLOWED_UPLOAD_EXTENSIONS,
+    UserFileParseError,
+    cleanup_uploaded_minio_objects,
+    prepare_uploaded_user_file,
+)
+from backend.storage import (
+    _get_minio_client,
+    get_user_minio_bucket_name,
+    upload_bytes_to_minio,
+)
+from backend.storage.streaming import iter_minio_response
 
 logger = get_logger(__name__)
 
@@ -40,17 +58,9 @@ MAX_FILE_SIZE = 50 * 1024 * 1024
 
 # 每次上传最多文件数
 MAX_FILES_PER_REQUEST = 10
-CHAT_FILE_IMAGE_URL_TTL_SECONDS = 7 * 24 * 60 * 60
-
-ALLOWED_EXTENSIONS: set[str] = {
-    # 图片
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
-    # 纯文本
-    ".txt", ".md", ".csv", ".json", ".py", ".html", ".xml",
-    ".log", ".yaml", ".yml", ".toml", ".rst",
-    # 富文档
-    ".pdf", ".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls",
-}
+MAX_REMOTE_IMAGE_SIZE = 20 * 1024 * 1024
+MAX_REMOTE_IMAGES_PER_FILE = 20
+ALLOWED_EXTENSIONS = ALLOWED_UPLOAD_EXTENSIONS
 
 
 # ── 响应模型 ─────────────────────────────────────────────
@@ -83,68 +93,6 @@ class ChatFileListItem(BaseModel):
     strategy: str
     content_length: int = 0
     table_analysis_enabled: bool = False
-
-
-# Helper to convert DB model to old dictionary metadata format
-def _db_row_to_meta(row: UserFile) -> dict:
-    meta = {
-        "file_id": row.file_id,
-        "thread_id": row.thread_id,
-        "user_id": row.owner_user_id,
-        "file_name": row.display_name,
-        "file_size": row.size_bytes or 0,
-        "mime_type": row.mime_type,
-    }
-    m_json = row.metadata_ or {}
-    meta["file_category"] = m_json.get("file_category", "short_doc")
-    meta["strategy"] = m_json.get("strategy", "context")
-    meta["content"] = m_json.get("content", "")
-    meta["content_length"] = m_json.get("content_length", 0)
-    meta["storage_bucket"] = row.storage_bucket
-    meta["storage_object"] = row.storage_object
-    meta["local_abs_path"] = row.local_abs_path
-    if "table_analysis" in m_json:
-        meta["table_analysis"] = m_json["table_analysis"]
-    if "image_base64" in m_json:
-        meta["image_base64"] = m_json["image_base64"]
-    if "image_urls" in m_json:
-        refreshed_urls: list[dict] = []
-        for item in m_json["image_urls"] or []:
-            current = dict(item)
-            image_name = str(current.get("name") or "").strip()
-            if image_name:
-                existing_url = str(current.get("url") or "").strip()
-                parsed = urlparse(existing_url)
-                if parsed.scheme and parsed.netloc:
-                    base_url = f"{parsed.scheme}://{parsed.netloc}"
-                    expires_at = int(time.time()) + CHAT_FILE_IMAGE_URL_TTL_SECONDS
-                    sig = _build_chat_image_signature(
-                        file_id=row.file_id,
-                        image_name=image_name,
-                        owner_user_id=row.owner_user_id,
-                        thread_id=row.thread_id,
-                        expires_at=expires_at,
-                    )
-                    current["url"] = (
-                        f"{base_url}/api/v2/chat-files/{quote(row.file_id)}/images/{quote(image_name, safe='')}"
-                        f"?exp={expires_at}&sig={sig}"
-                    )
-            refreshed_urls.append(current)
-        meta["image_urls"] = refreshed_urls
-    return meta
-
-
-def _build_chat_image_signature(
-    *,
-    file_id: str,
-    image_name: str,
-    owner_user_id: str,
-    thread_id: str,
-    expires_at: int,
-) -> str:
-    secret = (settings.minio_secret_key or "").encode("utf-8")
-    payload = "\n".join([file_id, image_name, owner_user_id, thread_id, str(expires_at)]).encode("utf-8")
-    return hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
 
 def _build_chat_file_image_url(
@@ -202,20 +150,34 @@ async def _materialize_remote_image_urls(
     thread_id: str,
     file_id: str,
     bucket_name: str,
+    record_uploaded_object,
 ) -> list[dict]:
     if not image_urls:
         return []
 
     materialized: list[dict] = []
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        for idx, item in enumerate(image_urls, start=1):
+    async with httpx.AsyncClient(trust_env=False, timeout=60.0, follow_redirects=False) as client:
+        for idx, item in enumerate(image_urls[:MAX_REMOTE_IMAGES_PER_FILE], start=1):
             raw_url = str(item.get("url") or "").strip()
-            if not raw_url.startswith(("http://", "https://")):
+            if not await _is_public_remote_url(raw_url):
                 continue
             try:
-                response = await client.get(raw_url)
-                response.raise_for_status()
-                content = response.content
+                async with client.stream("GET", raw_url) as response:
+                    response.raise_for_status()
+                    content_type_header = str(response.headers.get("content-type") or "")
+                    if content_type_header and not content_type_header.lower().startswith("image/"):
+                        raise ValueError("远程资源不是图片")
+                    declared_size = int(response.headers.get("content-length") or 0)
+                    if declared_size > MAX_REMOTE_IMAGE_SIZE:
+                        raise ValueError("远程图片超过大小限制")
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes(256 * 1024):
+                        total += len(chunk)
+                        if total > MAX_REMOTE_IMAGE_SIZE:
+                            raise ValueError("远程图片超过大小限制")
+                        chunks.append(chunk)
+                    content = b"".join(chunks)
                 if not content:
                     continue
                 parsed = urlparse(raw_url)
@@ -223,20 +185,23 @@ async def _materialize_remote_image_urls(
                 image_name = Path(
                     str(item.get("name") or guessed_name or f"remote_image_{idx}.png")
                 ).name or f"remote_image_{idx}.png"
-                content_type = str(
-                    item.get("content_type")
-                    or response.headers.get("content-type")
-                    or "image/png"
+                content_type = content_type_header or str(
+                    item.get("content_type") or "image/png"
                 )
+                if not content_type.lower().startswith("image/"):
+                    raise ValueError("远程资源不是图片")
                 storage_object = (
                     f"users/{owner_user_id}/threads/{thread_id}/chat-files/{file_id}/images/{image_name}"
                 )
-                await upload_bytes_to_minio(
+                record_uploaded_object(storage_object)
+                uploaded = await upload_bytes_to_minio(
                     content=content,
                     object_name=storage_object,
                     content_type=content_type,
                     bucket_name=bucket_name,
                 )
+                if not uploaded:
+                    raise RuntimeError("远程图片上传对象存储失败")
                 materialized.append({
                     "url": _build_chat_file_image_url(
                         request,
@@ -261,6 +226,32 @@ async def _materialize_remote_image_urls(
     return materialized
 
 
+async def _is_public_remote_url(raw_url: str) -> bool:
+    """Reject local/private targets before MinerU image materialization."""
+    try:
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        if parsed.username or parsed.password:
+            return False
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            parsed.hostname,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+    except (OSError, ValueError):
+        return False
+    for info in infos:
+        try:
+            address = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if not address.is_global:
+            return False
+    return bool(infos)
+
+
 # ── 端点实现 ─────────────────────────────────────────────
 
 @router.post("/upload", response_model=dict)
@@ -279,11 +270,6 @@ async def upload_chat_files(
     - 短文档（≤5000字）→ 直接注入上下文（strategy=context）
     - 长文档（>5000字）→ 建立会话级索引（strategy=indexed）
     """
-    from backend.services.chat_file_parser import (
-        ChatFileParser,
-        clean_surrogates,
-        replace_local_images_with_urls,
-    )
     from backend.services.chat_file_index import get_index_manager
 
     if len(files) > MAX_FILES_PER_REQUEST:
@@ -292,7 +278,6 @@ async def upload_chat_files(
             detail=f"单次最多上传 {MAX_FILES_PER_REQUEST} 个文件",
         )
 
-    parser = ChatFileParser()
     index_manager = get_index_manager()
     results: List[ChatFileUploadResult] = []
     effective_parse_mode = str(parse_mode or "auto").strip().lower()
@@ -318,40 +303,89 @@ async def upload_chat_files(
             )
             continue
 
-        data = await upload_file.read()
-        file_size = len(data)
-
-        if file_size > MAX_FILE_SIZE:
+        try:
+            data = await read_upload_with_limit(upload_file, MAX_FILE_SIZE)
+        except UploadTooLargeError:
             results.append(
                 ChatFileUploadResult(
                     file_id=str(uuid.uuid4()),
                     file_name=filename,
-                    file_size=file_size,
+                    file_size=MAX_FILE_SIZE + 1,
                     file_category="failed",
                     parse_status="failed",
                     strategy="none",
-                    message=f"文件过大: {file_size / 1024 / 1024:.1f}MB，上限 50MB",
+                    message="文件过大，上限 50MB",
                     error="文件大小超过限制",
                 )
             )
             continue
-
-        file_id = f"uf_{uuid.uuid4().hex}"
         mime_type = upload_file.content_type
 
-        try:
-            parse_result = await parser.parse(
-                data,
-                filename,
-                mime_type,
-                parse_mode=effective_parse_mode,
-            )
-        except Exception as e:
-            logger.exception("[ChatFiles] 解析异常: %s", e)
-            parse_result = None
+        async def _index_long_doc(
+            file_id: str,
+            parse_result,
+            file_name: str = filename,
+        ) -> None:
+            if parse_result.category != "long_doc" or not parse_result.content:
+                return
+            try:
+                index = index_manager.get_or_create(thread_id, user_id=user.user_id)
+                chunk_count = await asyncio.to_thread(
+                    index.add_document,
+                    file_id=file_id,
+                    content=parse_result.content,
+                    file_name=file_name,
+                )
+                logger.info(
+                    "[ChatFiles] 索引构建完成: file_id=%s, chunks=%d",
+                    file_id,
+                    chunk_count,
+                )
+            except Exception as e:
+                logger.error("[ChatFiles] 索引构建失败: %s", e)
 
-        if parse_result is None or parse_result.category == "failed":
-            error_msg = (parse_result.error if parse_result else "解析服务异常")
+        async def _load_remote_images(
+            file_id: str,
+            bucket_name: str,
+            parse_result,
+            record_uploaded_object,
+        ) -> list[dict]:
+            return await _materialize_remote_image_urls(
+                request,
+                image_urls=parse_result.image_urls,
+                owner_user_id=user.user_id,
+                thread_id=thread_id,
+                file_id=file_id,
+                bucket_name=bucket_name,
+                record_uploaded_object=record_uploaded_object,
+            )
+
+        try:
+            stored_file = await prepare_uploaded_user_file(
+                session=session,
+                owner_user_id=user.user_id,
+                data=data,
+                filename=filename,
+                mime_type=mime_type,
+                storage_scope="chat",
+                thread_id=thread_id,
+                parse_mode=effective_parse_mode,
+                image_url_builder=lambda file_id, image_name: _build_chat_file_image_url(
+                    request,
+                    file_id,
+                    image_name,
+                    owner_user_id=user.user_id,
+                    thread_id=thread_id,
+                ),
+                on_parsed=_index_long_doc,
+                extra_image_url_loader=_load_remote_images,
+                replace_content_image_urls=True,
+                include_parse_metadata=True,
+            )
+        except UserFileParseError as exc:
+            file_size = len(data)
+            file_id = f"uf_{uuid.uuid4().hex}"
+            error_msg = exc.message or "解析服务异常"
             results.append(
                 ChatFileUploadResult(
                     file_id=file_id,
@@ -366,178 +400,54 @@ async def upload_chat_files(
             )
             continue
 
-        # 确定策略
-        strategy_map = {
-            "multimodal": "vision",
-            "short_doc": "context",
-            "long_doc": "indexed",
-        }
-        strategy = strategy_map.get(parse_result.category, "none")
-
-        # 长文档：建立索引
-        if parse_result.category == "long_doc" and parse_result.content:
+        try:
+            # Binding SessionFile record
+            db_session_file = SessionFile(
+                session_id=thread_id,
+                user_id=user.user_id,
+                file_id=stored_file.file_id,
+                attached_from="upload",
+            )
+            session.add(db_session_file)
+            await session.commit()
+        except BaseException:
             try:
-                index = index_manager.get_or_create(thread_id)
-                chunk_count = index.add_document(
-                    file_id=file_id,
-                    content=parse_result.content,
-                    file_name=filename,
+                await session.rollback()
+            except Exception as rollback_exc:
+                logger.exception(
+                    "[ChatFiles] 数据库回滚失败: file_id=%s error=%s",
+                    stored_file.file_id,
+                    rollback_exc,
                 )
-                logger.info(
-                    "[ChatFiles] 索引构建完成: file_id=%s, chunks=%d",
-                    file_id,
-                    chunk_count,
-                )
-            except Exception as e:
-                logger.error("[ChatFiles] 索引构建失败: %s", e)
-
-        # Upload file to MinIO
-        bucket_name = get_user_minio_bucket_name()
-        storage_object = f"users/{user.user_id}/threads/{thread_id}/chat-files/{file_id}/{filename}"
-        await upload_bytes_to_minio(
-            content=data,
-            object_name=storage_object,
-            content_type=mime_type or "application/octet-stream",
-            bucket_name=bucket_name,
-        )
-
-        # 上传提取的图片到 MinIO 并收集 URL
-        image_urls: list[dict] = []
-        if parse_result.images:
-            from backend.services.chat_file_parser import compress_image_if_needed
-            for img in parse_result.images:
-                img = compress_image_if_needed(img)
-                img_object = f"users/{user.user_id}/threads/{thread_id}/chat-files/{file_id}/images/{img.name}"
-                await upload_bytes_to_minio(
-                    content=img.data,
-                    object_name=img_object,
-                    content_type=img.content_type,
-                    bucket_name=bucket_name,
-                )
-                image_urls.append({
-                    "url": _build_chat_file_image_url(
-                        request,
-                        file_id,
-                        img.name,
-                        owner_user_id=user.user_id,
-                        thread_id=thread_id,
-                    ),
-                    "name": img.name,
-                    "caption": img.caption,
-                    "content_type": img.content_type,
-                    "storage_object": img_object,
-                })
-            logger.info(
-                "[ChatFiles] 上传图片到 MinIO: file_id=%s, 图片数=%d",
-                file_id, len(image_urls),
+            await cleanup_uploaded_minio_objects(
+                stored_file.storage_bucket,
+                stored_file.uploaded_object_keys,
             )
-        if getattr(parse_result, "image_urls", None):
-            image_urls.extend(
-                await _materialize_remote_image_urls(
-                    request,
-                    image_urls=parse_result.image_urls,
-                    owner_user_id=user.user_id,
-                    thread_id=thread_id,
-                    file_id=file_id,
-                    bucket_name=bucket_name,
-                )
-            )
-
-        image_url_map: dict[str, str] = {}
-        for img_info in image_urls:
-            url = img_info.get("url")
-            if not url:
-                continue
-            for key in {
-                img_info.get("name", ""),
-                Path(img_info.get("name", "")).name,
-            }:
-                if key:
-                    image_url_map.setdefault(key, url)
-
-        # 保存文件元信息到数据库
-        # 多模态文件额外存储 base64 数据供构建多模态消息使用
-        metadata_payload = {
-            "file_category": parse_result.category,
-            "strategy": strategy,
-            "content": parse_result.content,
-            "content_length": parse_result.content_length,
-            "parse_mode": effective_parse_mode,
-            "parse_method": parse_result.method,
-        }
-        from backend.services.table_analysis_files import build_table_analysis_metadata
-
-        table_analysis_meta = build_table_analysis_metadata(
-            file_id=file_id,
-            file_name=filename,
-            mime_type=parse_result.mime_type or mime_type,
-            storage_bucket=bucket_name,
-            storage_object=storage_object,
-        )
-        if table_analysis_meta:
-            metadata_payload["table_analysis"] = table_analysis_meta
-        if metadata_payload.get("content") and image_url_map:
-            metadata_payload["content"] = replace_local_images_with_urls(
-                metadata_payload["content"],
-                image_url_map,
-            )
-        if parse_result.category == "multimodal":
-            metadata_payload["image_base64"] = base64.b64encode(data).decode("utf-8")
-        if image_urls:
-            metadata_payload["image_urls"] = image_urls
-
-        metadata_payload = clean_surrogates(metadata_payload)
-
-        db_file = UserFile(
-            file_id=file_id,
-            owner_user_id=user.user_id,
-            thread_id=thread_id,
-            source_type="minio",
-            storage_bucket=bucket_name,
-            storage_object=storage_object,
-            display_name=filename,
-            mime_type=parse_result.mime_type or mime_type,
-            size_bytes=file_size,
-            status="active",
-            metadata_=metadata_payload,
-        )
-        session.add(db_file)
-
-        # Binding SessionFile record
-        db_session_file = SessionFile(
-            session_id=thread_id,
-            user_id=user.user_id,
-            file_id=file_id,
-            attached_from="upload",
-        )
-        session.add(db_session_file)
-
-        # Commit changes
-        await session.commit()
+            raise
 
         # 构建 message
         msg_map = {
             "multimodal": "图片已就绪，将直接发送给模型 analysis",
-            "short_doc": f"文档已解析（{parse_result.content_length} 字），将直接注入对话上下文",
-            "long_doc": f"文档已解析（{parse_result.content_length} 字），已建立检索索引",
+            "short_doc": f"文档已解析（{stored_file.content_length} 字），将直接注入对话上下文",
+            "long_doc": f"文档已解析（{stored_file.content_length} 字），已建立检索索引",
         }
-        message = msg_map.get(parse_result.category, "文件已处理")
+        message = msg_map.get(stored_file.category, "文件已处理")
 
         results.append(
             ChatFileUploadResult(
-                file_id=file_id,
+                file_id=stored_file.file_id,
                 file_name=filename,
-                file_size=file_size,
-                file_category=parse_result.category,
+                file_size=stored_file.size_bytes,
+                file_category=stored_file.category,
                 parse_status="completed",
-                content_length=parse_result.content_length,
-                strategy=strategy,
+                content_length=stored_file.content_length,
+                strategy=stored_file.strategy,
                 message=message,
-                mime_type=parse_result.mime_type or mime_type,
-                table_analysis_enabled=bool(table_analysis_meta),
+                mime_type=stored_file.mime_type,
+                table_analysis_enabled=stored_file.table_analysis_enabled,
                 content_preview=(
-                    (parse_result.content or "")[:200]
-                    if parse_result.category == "short_doc"
+                    (stored_file.content or "")[:200]
+                    if stored_file.category == "short_doc"
                     else None
                 ),
             )
@@ -560,11 +470,13 @@ async def upload_chat_files(
 @router.get("/{thread_id}", response_model=dict)
 async def list_chat_files(
     thread_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
     """列出会话中已上传的文件"""
-    stmt = (
+    base_stmt = (
         select(UserFile)
         .join(SessionFile, SessionFile.file_id == UserFile.file_id)
         .where(
@@ -572,8 +484,16 @@ async def list_chat_files(
             SessionFile.user_id == user.user_id,
             UserFile.status == "active"
         )
-        .order_by(SessionFile.created_at.desc())
     )
+    total = int(
+        (
+            await session.execute(
+                select(func.count()).select_from(base_stmt.subquery())
+            )
+        ).scalar_one()
+        or 0
+    )
+    stmt = base_stmt.order_by(SessionFile.created_at.desc()).offset(skip).limit(limit)
     result = await session.execute(stmt)
     user_files = result.scalars().all()
 
@@ -591,7 +511,7 @@ async def list_chat_files(
                 table_analysis_enabled=bool((m_json.get("table_analysis") or {}).get("enabled")),
             ).model_dump()
         )
-    return {"items": items, "count": len(items)}
+    return {"items": items, "count": len(items), "total": total}
 
 
 @router.delete("/{file_id}", response_model=dict)
@@ -622,9 +542,12 @@ async def delete_chat_file(
     if user_file:
         m_json = user_file.metadata_ or {}
         if m_json.get("file_category") == "long_doc" and session_file.session_id:
-            index = get_index_manager().get(session_file.session_id)
+            index = await get_index_manager().get_async(
+                session_file.session_id,
+                user_id=user.user_id,
+            )
             if index:
-                index.remove_document(file_id)
+                await asyncio.to_thread(index.remove_document, file_id)
 
     # Delete the binding
     await session.delete(session_file)
@@ -675,70 +598,24 @@ async def get_chat_file_image(
     client = _get_minio_client()
     bucket = row.storage_bucket or get_user_minio_bucket_name()
     response = None
-    last_exc: Exception | None = None
     for object_name in candidate_objects:
         if not object_name:
             continue
         try:
-            response = client.get_object(bucket, object_name)
+            response = await asyncio.to_thread(client.get_object, bucket, object_name)
             break
-        except Exception as exc:
-            last_exc = exc
+        except Exception:
             response = None
     if response is None:
-        raise HTTPException(status_code=404, detail=f"图片对象不存在: {last_exc}")
+        raise HTTPException(status_code=404, detail="图片对象不存在")
 
     media_type = target.get("content_type") or "image/png"
 
-    def iterator():
-        try:
-            for chunk in response.stream(64 * 1024):
-                yield chunk
-        finally:
-            response.close()
-            response.release_conn()
-
     return StreamingResponse(
-        iterator(),
+        iter_minio_response(response),
         media_type=media_type,
         headers={
             "Cache-Control": "public, max-age=86400",
             "Content-Disposition": f'inline; filename="{image_name}"',
         },
     )
-
-
-# ── 内部工具函数（供 agent.py 使用） ─────────────────────
-
-def get_file_meta(file_id: str) -> Optional[dict]:
-    """获取文件元信息"""
-    from backend.db.models import UserFile
-    from sqlalchemy import select
-
-    factory = get_session_factory()
-    with factory() as session:
-        stmt = select(UserFile).where(UserFile.file_id == file_id, UserFile.status == "active")
-        row = session.execute(stmt).scalars().first()
-        if not row:
-            return None
-        return _db_row_to_meta(row)
-
-
-def get_files_by_thread(thread_id: str, user_id: str) -> list[dict]:
-    """获取会话下所有文件元信息"""
-    from backend.db.models import SessionFile, UserFile
-    from sqlalchemy import select
-
-    factory = get_session_factory()
-    with factory() as session:
-        stmt = (
-            select(UserFile)
-            .join(SessionFile, SessionFile.file_id == UserFile.file_id)
-            .where(
-                SessionFile.session_id == thread_id,
-                SessionFile.user_id == user_id,
-                UserFile.status == "active"
-            )
-        )
-        rows = session.execute(stmt).scalars().all()
-        return [_db_row_to_meta(row) for row in rows]

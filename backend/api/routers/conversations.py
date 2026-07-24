@@ -8,6 +8,11 @@ from backend.db.connection import get_async_session
 from backend.db.models import Conversation, User
 from backend.api.routers.auth import get_current_user
 from backend.application.agent_service import AgentService
+from backend.application.blocking import run_blocking
+from backend.application.checkpointing.guest_fallback import (
+    aget_checkpoint_with_fallback,
+)
+from backend.application.conversations.message_serializer import serialize_checkpoint_messages
 from backend.config.loggers import get_logger
 from backend.application.checkpointing.checkpointer import get_checkpointer_from_request
 from backend.core.config import build_internal_thread_key, get_paths
@@ -15,6 +20,7 @@ from backend.domain.agents.request import AgentRequest
 from langgraph.types import Overwrite
 
 router = APIRouter(prefix="/conversations", tags=["对话管理"])
+shared_router = APIRouter(prefix="/conversations", tags=["对话管理"])
 logger = get_logger(__name__)
 
 
@@ -39,25 +45,41 @@ class RollbackRequest(BaseModel):
 async def list_conversations(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    include_metadata: bool = Query(
+        True,
+        description="是否返回会话元数据；侧边栏列表可关闭以减少查询数据量",
+    ),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
     """获取当前用户的会话列表"""
+    # The sidebar only needs summary columns.  When it opts out, avoid loading
+    # the metadata JSON: it can contain runtime state and image registrations
+    # and made the first history-page request unnecessarily expensive.
+    columns = [
+        Conversation.id,
+        Conversation.thread_id,
+        Conversation.title,
+        Conversation.created_at,
+        Conversation.updated_at,
+    ]
+    if include_metadata:
+        columns.append(Conversation.metadata_)
     result = await session.execute(
-        select(Conversation)
+        select(*columns)
         .where(Conversation.user_id == user.user_id, Conversation.is_deleted == False)
-        .order_by(Conversation.updated_at.desc())
+        .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
         .offset(offset)
         .limit(limit)
     )
-    conversations = result.scalars().all()
+    conversations = result.all()
     
     return [
         ConversationResponse(
             id=c.id,
             thread_id=c.thread_id,
             title=c.title,
-            metadata=c.metadata_,
+            metadata=c.metadata_ if include_metadata else None,
             created_at=c.created_at.isoformat() if c.created_at else "",
             updated_at=c.updated_at.isoformat() if c.updated_at else "",
         )
@@ -65,7 +87,7 @@ async def list_conversations(
     ]
 
 
-@router.patch("/{thread_id}")
+@shared_router.patch("/{thread_id}")
 async def rename_conversation(
     thread_id: str,
     request: RenameRequest,
@@ -97,7 +119,7 @@ async def rename_conversation(
     return {"success": True}
 
 
-@router.delete("/{thread_id}")
+@shared_router.delete("/{thread_id}")
 async def delete_conversation(
     thread_id: str,
     request: Request,
@@ -115,53 +137,93 @@ async def delete_conversation(
     if not conv:
         return {"success": True}
 
+    internal_thread_id = build_internal_thread_key(user.user_id, thread_id)
     conv.is_deleted = True
     await session.commit()
 
-    internal_thread_id = build_internal_thread_key(user.user_id, thread_id)
+    cleanup_errors: list[str] = []
+    try:
+        from backend.application.agent_tasks import agent_task_registry
+
+        runtime_metadata = dict((conv.metadata_ or {}).get("agent_runtime") or {})
+        agent_code = str(runtime_metadata.get("agent_code") or "ne").strip() or "ne"
+        active_task = await agent_task_registry.active_for_thread(
+            user_id=user.user_id,
+            agent_code=agent_code,
+            thread_id=thread_id,
+        )
+        if active_task is not None:
+            await agent_task_registry.cancel(active_task)
+    except Exception as exc:
+        logger.exception("停止会话后台任务失败: thread=%s", internal_thread_id)
+        cleanup_errors.append(f"background_task: {type(exc).__name__}")
 
     try:
         checkpointer = get_checkpointer_from_request(request)
-        if hasattr(checkpointer, "conn"):
-            existing_tables: set[str] = set()
-            cursor = await checkpointer.conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
-            rows = await cursor.fetchall()
-            existing_tables = {str(r[0]) for r in rows if r and r[0]}
-
-            for table_name in ("checkpoints", "checkpoint_blobs", "checkpoint_writes"):
-                if table_name not in existing_tables:
-                    logger.debug("checkpointer 表不存在，跳过清理: %s", table_name)
-                    continue
-                await checkpointer.conn.execute(
-                    f"DELETE FROM {table_name} WHERE thread_id = ?",
-                    (internal_thread_id,),
-                )
-
-            await checkpointer.conn.commit()
-    except Exception as e:
-        logger.warning(f"清理 checkpointer 失败: {e}")
+        await checkpointer.adelete_thread(internal_thread_id)
+    except Exception as exc:
+        logger.exception("清理 checkpointer 失败: thread=%s", internal_thread_id)
+        cleanup_errors.append(f"checkpointer: {type(exc).__name__}")
 
     try:
         from backend.core.storage.scoped_storage import ScopedStorage
+
         storage = ScopedStorage(user_id=user.user_id, thread_id=thread_id)
-        storage.delete_all_files()
-    except Exception as e:
-        logger.warning(f"清理 MinIO 线程附件失败: {e}")
+        await run_blocking(storage.delete_all_files, timeout_seconds=30)
+    except Exception as exc:
+        logger.exception("清理 MinIO 线程附件失败: thread=%s", internal_thread_id)
+        cleanup_errors.append(f"storage: {type(exc).__name__}")
 
     try:
-        get_paths().delete_thread_dir(internal_thread_id)
-    except Exception as e:
-        logger.warning(f"清理沙箱线程目录失败: {e}")
+        await run_blocking(
+            get_paths().delete_thread_dir,
+            internal_thread_id,
+            timeout_seconds=10,
+        )
+    except Exception as exc:
+        logger.exception("清理沙箱线程目录失败: thread=%s", internal_thread_id)
+        cleanup_errors.append(f"sandbox: {type(exc).__name__}")
+
+    if cleanup_errors:
+        conv.is_deleted = False
+        metadata = dict(conv.metadata_ or {})
+        metadata["deletion_cleanup_error"] = {
+            "components": cleanup_errors,
+            "updated_at": datetime.now().isoformat(),
+        }
+        conv.metadata_ = metadata
+        await session.commit()
+        raise HTTPException(status_code=503, detail="会话清理未完成，请稍后重试")
+
+    metadata = dict(conv.metadata_ or {})
+    metadata.pop("deletion_cleanup_error", None)
+    conv.metadata_ = metadata
+    await session.commit()
 
     return {"success": True}
 
 
-@router.get("/{thread_id}/messages")
+def _last_question_fallback_message(conv: Conversation, thread_id: str) -> list[dict[str, Any]]:
+    runtime_metadata = dict((conv.metadata_ or {}).get("agent_runtime") or {})
+    last_question = str(runtime_metadata.get("last_question") or "").strip()
+    if not last_question:
+        return []
+    return [
+        {
+            "role": "human",
+            "content": last_question,
+            "metadata": {"source": "conversation_metadata"},
+            "id": f"conversation:{thread_id}:last-question",
+        }
+    ]
+
+
+@shared_router.get("/{thread_id}/messages")
 async def get_conversation_messages(
     thread_id: str,
     request: Request,
+    offset: int = Query(0, ge=0, description="从最新消息向前跳过的数量"),
+    limit: int = Query(100, ge=1, le=500, description="最多返回的消息数"),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
@@ -180,81 +242,37 @@ async def get_conversation_messages(
     internal_thread_id = build_internal_thread_key(user.user_id, thread_id)
 
     try:
-        checkpointer = get_checkpointer_from_request(request)
-        config = {"configurable": {"thread_id": internal_thread_id}}
-        checkpoint = await checkpointer.aget(config)
-        if not checkpoint and internal_thread_id != thread_id:
-            legacy_config = {"configurable": {"thread_id": thread_id}}
-            checkpoint = await checkpointer.aget(legacy_config)
-            if checkpoint:
-                logger.info(
-                    "使用旧外部 thread_id 读取会话历史: user_id=%s thread_id=%s",
-                    user.user_id,
-                    thread_id,
-                )
-        
+        checkpoint = await aget_checkpoint_with_fallback(request, internal_thread_id)
         if not checkpoint:
-            return []
+            return _last_question_fallback_message(conv, thread_id)
         
         channel_values = checkpoint.get("channel_values", {})
         messages = channel_values.get("messages", [])
+        end = max(0, len(messages) - offset)
+        start = max(0, end - limit)
+        messages = messages[start:end]
         
-        # Convert LangChain messages to a JSON-serializable format
-        import re as _re
-        _IMAGE_TOKEN_RE = _re.compile(r"\[IMAGE:\d+\]")
+        registered_images = (conv.metadata_ or {}).get("registered_images") or {}
+        serialized_messages = serialize_checkpoint_messages(
+            messages,
+            registered_images=registered_images,
+        )
 
-        serialized_messages = []
-        for m in messages:
-            # Basic mapping
-            role = "user"
-            if hasattr(m, "type"):
-                role = m.type
-            elif isinstance(m, dict):
-                role = m.get("type", "user")
-
-            content = ""
-            if hasattr(m, "content"):
-                content = m.content
-            elif isinstance(m, dict):
-                content = m.get("content", "")
-
-            # 清理 AI 消息中未被替换的 [IMAGE:xxx] token，防止前端渲染为
-            # 损坏的代理 URL（这些 token 是因为 _resolve_history_image_tokens
-            # 超时/失败后残留在 checkpoint 里的）
-            if isinstance(content, str) and role in ("ai", "assistant") and _IMAGE_TOKEN_RE.search(content):
-                content = _IMAGE_TOKEN_RE.sub("", content)
-
-            metadata = {}
-            if hasattr(m, "additional_kwargs"):
-                metadata = m.additional_kwargs
-            elif isinstance(m, dict) and "additional_kwargs" in m:
-                metadata = m["additional_kwargs"]
-            elif isinstance(m, dict) and "metadata" in m:
-                metadata = m["metadata"]
-
-            # 过滤自动摘要生成的 JIT 历史压缩消息，避免向前端输出
-            if metadata and metadata.get("lc_source") == "summarization":
-                continue
-
-            if isinstance(content, str) and (
-                "Here is a summary of the conversation to date:" in content or
-                content.startswith("[State Elevation:") or
-                content.startswith("[Context Isolation:") or
-                content.startswith("[System Notification:")
-            ):
-                continue
-
-            serialized_messages.append({
-                "role": role,
-                "content": content,
-                "metadata": metadata,
-                "id": getattr(m, "id", None)
-            })
+        # 工具调用在首个模型轮次异常中断时，checkpoint 可能只保留工具消息。
+        # 会话表在请求开始时已可靠保存用户问题，恢复时用它补齐，避免刷新后
+        # 出现历史标题存在但对话正文为空的情况。
+        has_user_message = any(
+            str(item.get("role") or "").lower() in {"user", "human"}
+            and bool(str(item.get("content") or "").strip())
+            for item in serialized_messages
+        )
+        if not has_user_message:
+            serialized_messages[:0] = _last_question_fallback_message(conv, thread_id)
         
         return serialized_messages
     except Exception as e:
-        logger.error(f"Failed to fetch messages for {internal_thread_id}: {e}")
-        return []
+        logger.exception("Failed to fetch messages for %s", internal_thread_id)
+        raise HTTPException(status_code=503, detail="会话历史暂不可用") from e
 
 
 def _is_user_message(message: Any) -> bool:
@@ -288,7 +306,7 @@ def _trim_messages_by_user_turns(messages: list[Any], keep_user_turns: int) -> l
     return trimmed
 
 
-@router.post("/{thread_id}/rollback")
+@shared_router.post("/{thread_id}/rollback")
 async def rollback_conversation(
     thread_id: str,
     payload: RollbackRequest,
@@ -309,17 +327,27 @@ async def rollback_conversation(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     internal_thread_id = build_internal_thread_key(user.user_id, thread_id)
+    conversation_metadata = dict(conv.metadata_ or {})
+    runtime_metadata = dict(conversation_metadata.get("agent_runtime") or {})
+    agent_code = str(runtime_metadata.get("agent_code") or "ne").strip() or "ne"
+    workflow_name = str(runtime_metadata.get("workflow_name") or "full").strip() or "full"
+    request_metadata = runtime_metadata.get("request_metadata")
+    if not isinstance(request_metadata, dict):
+        request_metadata = {}
 
     try:
         checkpointer = get_checkpointer_from_request(request)
-        agent = AgentService(checkpointer=checkpointer).build_executor(
+        agent = await AgentService(checkpointer=checkpointer).build_executor_async(
             AgentRequest(
                 question="",
-                agent_code="ne",
+                agent_code=agent_code,
                 user_id=user.user_id,
                 conversation_id=thread_id,
-                requested_workflow="full",
-                metadata={"source": "conversation.rollback"},
+                requested_workflow=workflow_name,
+                metadata={
+                    **request_metadata,
+                    "source": "conversation.rollback",
+                },
             )
         )
         config = {"configurable": {"thread_id": internal_thread_id}}
@@ -370,4 +398,4 @@ async def rollback_conversation(
         }
     except Exception as e:
         logger.exception("回退会话失败: %s", e)
-        raise HTTPException(status_code=500, detail=f"回退会话失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="回退会话失败")
