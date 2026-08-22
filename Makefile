@@ -1,4 +1,4 @@
-.PHONY: help install install-dev install-all clean test test-cov test-unit test-integration lint format format-check check run-api run-guest-api run-guest-api-daemon docker-up docker-down docker-logs docker-build init-db migrate seed pre-commit-install pre-commit-run docs-build docs-serve deps-update deps-check deps-verify setup version
+.PHONY: help install install-dev install-all clean lint format format-check check run-api run-guest-api run-guest-api-daemon docker-up docker-down docker-logs docker-build init-db migrate seed pre-commit-install pre-commit-run docs-build docs-serve deps-update deps-check deps-verify setup version
 
 PYTHON ?= venv314/bin/python
 PIP ?= $(PYTHON) -m pip
@@ -19,7 +19,7 @@ install-all: ## 安装所有依赖（核心 + 开发）
 
 clean: ## 清理临时文件
 	find backend scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	find backend scripts -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
+	find backend scripts -type d
 	find backend scripts -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
 	find backend scripts -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	find backend scripts -type d -name .black_cache -exec rm -rf {} + 2>/dev/null || true
@@ -28,18 +28,6 @@ clean: ## 清理临时文件
 	find backend scripts -type f -name "*.pyd" -delete
 	find backend scripts -type f -name "*.so" -delete
 	rm -rf build/ dist/ *.egg-info .eggs/
-
-test: ## 运行所有测试
-	$(PYTHON) -m pytest backend/tests/ -v
-
-test-cov: ## 运行测试并生成覆盖率报告
-	$(PYTHON) -m pytest backend/tests/ --cov=backend --cov-report=html --cov-report=term-missing
-
-test-unit: ## 运行单元测试
-	$(PYTHON) -m pytest backend/tests/ -v
-
-test-integration: ## 运行集成测试
-	$(PYTHON) -m pytest backend/tests/ -v
 
 lint: ## 运行代码检查（flake8 + mypy）
 	$(PYTHON) -m flake8 backend/

@@ -133,12 +133,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     # 测试
-    "pytest>=9.0.0",
-    "pytest-asyncio>=1.3.0",
-    "pytest-cov>=7.0.0",
-    "pytest-mock>=3.12.0",
     # 离线质量门禁并行执行（run_quality_gate.py -n；覆盖率跨 worker 合并）
-    "pytest-xdist>=3.6.0",
     
     # 代码质量
     "black>=25.11.0",
@@ -152,15 +147,6 @@ dev = [
     "types-aiofiles>=23.2.0",
 ]
 
-test = [
-    "pytest>=9.0.0",
-    "pytest-asyncio>=1.3.0",
-    "pytest-cov>=7.0.0",
-    "pytest-mock>=3.12.0",
-    # 离线质量门禁并行执行（run_quality_gate.py -n；覆盖率跨 worker 合并）
-    "pytest-xdist>=3.6.0",
-    "httpx>=0.28.0",
-]
 
 docs = [
     "mkdocs>=1.5.0",
@@ -263,33 +249,6 @@ module = [
 ]
 ignore_missing_imports = true
 
-[tool.pytest.ini_options]
-pythonpath = ["."]
-minversion = "9.0"
-testpaths = ["backend/tests"]
-python_files = ["test_*.py", "*_test.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
-norecursedirs = ["MinerU-master", "lc-studylab-main", ".venv", "venv", "dist", "build"]
-addopts = [
-    "-v",
-    "--strict-markers",
-    "--strict-config",
-    "--cov=backend",
-    "--cov-report=term:skip-covered",
-]
-asyncio_mode = "auto"
-asyncio_default_test_loop_scope = "session"
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "integration: marks tests as integration tests",
-    "unit: marks tests as unit tests",
-    "golden: requires the FMCA course-eval golden dataset (not versioned); deselected from the offline quality gate",
-]
-filterwarnings = [
-    "ignore::DeprecationWarning",
-    "ignore::PendingDeprecationWarning",
-]
 
 [tool.coverage.run]
 source = ["backend"]

@@ -167,3 +167,5 @@ skill_packages/
 # 本地 Codex/Agent 工具目录，禁止上传
 .agents/
 .codex/
+backend/application/data/
+omnigraph/data/
