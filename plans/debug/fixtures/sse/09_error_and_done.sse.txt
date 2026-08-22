@@ -1,4 +1,0 @@
-data: {"type": "error", "content": "内部错误"}
-
-data: [DONE]
-

@@ -123,6 +123,163 @@ class RagSettings(DomainSettings):
     self_graph_retrieval_profile: Literal[
         "legacy", "seed_only", "routed", "filtered", "optimized", "pathrag"
     ] = "optimized"
+    # Production self retrieval uses HanLP-tokenized Redis BM25 to seed graph
+    # entities.  Chunk-level Milvus retrieval remains enabled independently.
+    # The 53-question groundwater ablation on 2026-08-04 selected a 16-token
+    # keyword budget (composite 0.7584 / retrieval 0.8075 / 0.962s) over the
+    # unlimited budget (0.7565 / 0.7835 / 1.578s).
+    self_seed_weight_mode: Literal["vector", "bm25", "hybrid"] = "bm25"
+    self_seed_vector_ratio: float = 0.0
+    self_seed_keyword_limit: int | None = 16
+    # Fusion v2 (2026-08-12 path-composition baseline): score-aware RRF with a
+    # keyword admission gate, an entity-weight demotion (entity exclusive gold
+    # was 0 across all datasets) and a vector floor applied before hydration
+    # truncation so strong dense hits can no longer be crowded out of the
+    # candidate cut by rank-only fusion.  Default ON since 2026-08-13: the
+    # five-dataset acceptance had v2 winning two sets (+1.3/+2.1 composite),
+    # tying two and trailing one 10-question set within judge noise, while
+    # recovering MRR (nehard 0.248->0.321); the 39-question crossdoc set has
+    # v2 +1.7 over v1, and the now-default query decomposition was validated
+    # exclusively on v2 (the unmeasured qd+v1 combination retrieves 71 vs 75
+    # head gold because v1 lacks the pre-hydration vector floor).
+    self_fusion_v2_enabled: bool = True
+    self_fusion_keyword_min_norm: float = 0.25
+    # Multi-evidence retrieval (Phase 2): two-hop typed graph expansion kept
+    # out of rank fusion, one protected partner-evidence injection slot
+    # (cosine noise filter + lexical-led ranking), bounded evidence-chain
+    # promotion for the remaining budget and a per-document diversity cap in
+    # the final top-k.  The 2026-08-12 cross-document diagnosis found 36% of
+    # gold chunks were never recalled (one-hop expansion cannot reach the
+    # second edge of a cross-document path).  Improves evidence hit/coverage
+    # on cross-document questions at extra graph latency; composite parity —
+    # keep opt-in per KB.
+    self_multi_evidence_enabled: bool = False
+    # Bilateral query decomposition (P2, 2026-08-13): explicitly two-sided
+    # questions ("在一项研究中…;另一项研究中…") retrieve each side with its
+    # own dense vector and the final head guarantees one best hit per side.
+    # The 39-question crossdoc baseline measured all-gold-docs hit at only
+    # 0.49-0.54 while any-doc hit was 0.95+ — one averaged query vector
+    # cannot surface the weaker side's document.  Default ON since
+    # 2026-08-13: across 213 evaluated questions only genuinely two-sided
+    # ones trigger (36/39 crossdoc, 2 statement-style multi-aspect — both
+    # neutral-or-better), sub-question pairs are blocked by the
+    # question-mark rule, untriggered queries pay one regex, and triggered
+    # warm latency matches the non-decomposed baseline (420ms).
+    self_query_decomposition_enabled: bool = True
+    # Graph novel-frontier rescoring (2026-08-21): the uncorroborated graph
+    # frontier is ranked by edge weight (= evidence-count popularity, hub-
+    # biased) and its admitted chunks never survive fusion (measured 0
+    # exclusive slots — pure co-signing).  With this flag the frontier is
+    # re-ranked by query-side cosine computed from stored Milvus chunk
+    # vectors (one filtered search, no extra embedding call), and the best
+    # candidate above the similarity floor gets a protected tail slot
+    # (victim = weakest single-core-path head entry).  REFUTED on the
+    # journal-KB hard sets (2026-08-21, 58 questions): the 1-hop
+    # uncorroborated frontier contains zero gold chunks — gold sits at 2-3
+    # typed hops — and query cosine ranks same-topic neighbours above gold,
+    # so injections displaced 17%-gold tail slots with 0%-gold picks.  Keep
+    # off; useful only with a frontier drawn from multi-hop chain-critical
+    # edges and a stronger prior than query cosine.
+    self_graph_novel_rescore_enabled: bool = False
+    self_graph_novel_rescore_pool: int = 32
+    self_graph_novel_similarity_floor: float = 0.55
+    self_graph_novel_inject_slots: int = 1
+    # PPR evidence discovery (2026-08-21, deep-retrieval channel): typed
+    # 3-hop subgraph PPR with verbatim-linked entities as personalization
+    # (3.0) over BM25 seeds (0.1), uniform edge weights (the edge weight =
+    # evidence-count semantics measurably exclude gold), chunk score = min
+    # of endpoint PageRank, top pool judged by the full-text LLM evidence
+    # judge, best pick swapped into one protected tail slot.  Journal-KB
+    # 58-question accounting: blind 1-hop frontier 0% gold -> tuned PPR pool
+    # 39.7% gold-bearing, judge precision@1 17.2% vs 17% displaced-tail
+    # gold — first configuration to cross the injection break-even line.
+    # Costs one Nebula subgraph fetch + one judge LLM call per request.
+    # Production wiring: the per-request deep-retrieval toggle composes
+    # this channel with the boundary judge (96-q five-arm, 2026-08-21:
+    # judge-only +0.004, PPR-only +0.0085, combined +0.0230 super-additive,
+    # residual unsaturated questions +0.05+, latency ~1.7s -> ~8.5s).  This
+    # global default stays off so normal requests are untouched.
+    self_ppr_evidence_enabled: bool = False
+    self_ppr_evidence_pool: int = 20
+    self_ppr_linked_weight: float = 3.0
+    self_ppr_seed_weight: float = 0.1
+    self_ppr_damping: float = 0.85
+    self_ppr_edge_limit: int = 20000
+    self_ppr_judge_max_picks: int = 1
+    # Link-count gate attempt (2026-08-21), refuted by experiment: the
+    # offline "0-anchor hurts" population was an artifact of seed-restricted
+    # linking — production ``_link_query_entities`` matches the full entity
+    # catalog verbatim and links >=1 entity on 96/96 eval questions, so the
+    # min_linked=1 gate barely fires (46 -> 45 injections) and 1-linked
+    # questions actually gain the most (+0.038 vs +0.007 for 2+).  Linked
+    # count is not a usable gate feature; the default keeps a zero-anchor
+    # guard only as a cheap safety net for queries that link nothing at
+    # all (PPR would then personalize on weak BM25 seeds alone).
+    self_ppr_min_linked: int = 1
+    # P3 (2026-08-13): stored relation evidence is citation-frequency ranked
+    # by the normalizer and capped here (0 = unlimited).  Retrieval probes
+    # showed same-edge sibling evidence chunks indistinguishable at query
+    # time; ranking must happen at ingestion where citation counts exist.
+    # Takes effect for newly ingested/re-ingested documents only.
+    self_relation_evidence_max_chunks: int = 8
+    # Query-entity linking (2026-08-13): entity-ANN candidates whose catalog
+    # name appears verbatim in the question are force-ranked to the front of
+    # the graph seed frontier.  The three-hop chain probe showed gold chain
+    # entities never entering the BM25-derived seeds (0/16) even when the
+    # question spells their names, leaving every graph mechanism walking
+    # from the wrong start.  Default off until the ablation verdict lands.
+    self_entity_linking_enabled: bool = False
+    # Full-text LLM boundary judge (deep retrieval, 2026-08-13): a local
+    # chat model reads 1200-char full candidate content and reorders head
+    # positions keep_head..top_k+band_extra by evidence-ness.  Excerpt-level
+    # variants (320 chars) measured no gain; full text cracked the
+    # fused-order wall (two-hop head 78->82, three-hop 28->32, RAGAS
+    # composite 0.674->0.706) at ~+1.7s retrieval latency.  Opt-in per
+    # deployment; empty model name falls back to the default chat model.
+    self_boundary_judge_enabled: bool = False
+    self_boundary_judge_model: str = "qwen3.6-35b"
+    self_boundary_judge_keep_head: int = 4
+    # 2026-08-13 pool ablation: with the judge active, widening the
+    # hydration pool to 36 and letting the band cover it converts
+    # hydration-cut gold into head gold (two-hop 79->82, three-hop 33->35);
+    # pool 48 / band 38 regresses (judge drowns in same-topic neighbours).
+    # Expansion without the judge stays flat, so the wider pool applies
+    # only while the judge runs.
+    self_boundary_judge_band_extra: int = 26
+    self_boundary_judge_excerpt_chars: int = 1200
+    # Only the first few judged passages can reach the head, so an
+    # unbounded evidence list pushes the real decision back onto fused
+    # order.  Asking for at most N forces the judge to choose: two-hop
+    # head gold 87/88/89 -> 92/90 and three-hop 77/77 -> 78/78, while a
+    # cap of 4 is too tight (87) and 8 no better than 6 (91).
+    self_boundary_judge_max_picks: int = 6
+    self_boundary_judge_pool_limit: int = 36
+    # Synthetic-query side index (doc2query, 2026-08-13 P7).  The
+    # hypothesis probe on vocabulary-mismatch gold (absent from dense
+    # top-200 under every query vector) showed separate synthetic-query
+    # vectors rescue 9/24 while concatenating them into the chunk text
+    # rescues 0/24.  Retrieval reads the side collection only when enabled
+    # AND the KB's synq collection exists.
+    self_synth_query_enabled: bool = False
+    # Generate the questions during ingestion so a new document is
+    # searchable through path-F without an offline backfill.  Runs as a
+    # best-effort commit side stage; existing corpora still need
+    # backfill_synth_queries.py once.
+    self_synth_query_ingest_enabled: bool = False
+    self_synth_query_model: str = "qwen3.6-35b"
+    self_synth_query_count: int = 5
+    self_synth_query_search_limit: int = 12
+    # Side hits form their own fusion channel (path-F) instead of joining
+    # the dense channel: folding them into path-C either re-ranked it
+    # (three-hop head gold 35->29) or spent its pool budget (two-hop
+    # 91->84).  The RRF weight bounds how many slots path-F may win.
+    self_synth_query_rrf_weight: float = 0.5
+    # Restricting path-F to chunks no other channel recalled erases its
+    # benefit (two-hop head gold 88->83, outside the +-1 noise band of that
+    # set): most of the gain is a better ORDER for already-recalled chunks,
+    # because a synthetic question matches the user's question
+    # symmetrically while a raw chunk does not.
+    self_synth_query_exclusive_only: bool = False
     # PathRAG uses generic clause-level entity recall followed by bounded,
     # evidence-grounded paths between retrieved seed entities.  All limits are
     # independent of query wording so the profile remains suitable for a real
@@ -187,8 +344,13 @@ class RagSettings(DomainSettings):
     self_ingestion_commit_mysql_retry_base_delay: float = 1.0
     self_ingestion_embed_entities_during_ingest: bool = True
     self_redis_bm25_pipe_batch: int = 2000
+    self_redis_bm25_cjk_max_ngram: int = 2
+    self_redis_bm25_max_unique_tokens_per_chunk: int = 512
+    self_redis_bm25_store_chunk_corpus: bool = False
     milvus_visibility_batch_size: int = 200
     milvus_insert_batch_size: int = 100
+    milvus_rpc_timeout_seconds: float = 30.0
+    milvus_force_flush: bool = False
     self_vision_model: str | None = None
     self_multimodal_block_type_weights: str = (
         '{"text": 1.0, "image": 1.2, "table": 1.3, "formula": 1.1}'
@@ -246,7 +408,7 @@ class StorageSettings(DomainSettings):
     redis_db: int | None = 0
     knowledge_graph_cache_ttl_seconds: int = 600
 
-    nebula_host: str = ""
+    nebula_host: str = "202.115.138.101"
     nebula_graph_port: int = 9669
     nebula_user: str = "root"
     nebula_password: str = ""

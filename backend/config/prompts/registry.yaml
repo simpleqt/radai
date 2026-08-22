@@ -24,3 +24,22 @@ prompt_profiles:
       - fmca
       - fundamental-mechanics-course
       - mechanics
+
+  audit:
+    provider: backend.application.agents.prompt_templates.audit:build_system_prompt
+    aliases:
+      - audit
+      - university-audit
+      - university-internal-audit
+
+  course_eval:
+    provider: backend.application.agents.prompt_templates.course_eval:build_system_prompt
+    aliases:
+      - course_eval
+      - course-outcome-evaluation
+
+  landslide:
+    provider: backend.application.agents.prompt_templates.landslide:build_system_prompt
+    aliases:
+      - landslide
+      - remote-sensing-landslide

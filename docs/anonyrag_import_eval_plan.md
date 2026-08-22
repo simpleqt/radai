@@ -1,7 +1,8 @@
 # AnonyRAG数据集导入与召回评估方案
 
-> **状态**：📋 **规划文档** — `backend/eval/anonyrag/` 目录当前**未实现**，请勿按本文直接运行命令。  
+> **状态**：📋 **规划文档** — `backend/eval/anonyrag/` 目录当前**未实现**，请勿按本文直接运行命令。
 > 现行评测请使用 [eval_framework.md](./eval_framework.md)（HotpotQA / Paper KB / GraphRAG-Bench）。
+> 若要把 AnonyRAG 真正接入当前仓库，应优先复用 `POST /api/v1/uploads/batch` + `/api/v1/uploads/ingest` 或 `PendingIngestUseCase`，并按 KB 的 `ingestion_backend` 进入 legacy LightRAG 或 self_ingestion；本文示例里的 `backend/eval/anonyrag/import_anonyrag_dataset.py`、直接 `rag.lightrag.ainsert()` 仍是草案。
 
 ## 一、数据集结构分析
 
@@ -816,17 +817,17 @@ if __name__ == "__main__":
 
 ```bash
 # 1. 激活环境
-source <project_venv>/bin/activate
+source /home/inspur/myenv/langchian_project/venv314/bin/activate
 
 # 2. 导入数据集到知识库
 python backend/eval/anonyrag/import_anonyrag_dataset.py \
-    --kb-id <kb_id_ne> \
+    --kb-id c056bf59-6091-45ed-98cb-e2e860580a69 \
     --data-dir eval/datasets \
     --output-dir eval/anonyrag/test_data
 
 # 3. 执行评估
 python backend/eval/anonyrag/anonyrag_evaluator.py \
-    --kb-id <kb_id_ne> \
+    --kb-id c056bf59-6091-45ed-98cb-e2e860580a69 \
     --test-data eval/anonyrag/test_data \
     --output eval/anonyrag/results/eval_results.json \
     --sample 100

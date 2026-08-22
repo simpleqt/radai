@@ -5,11 +5,13 @@ from __future__ import annotations
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from backend.core.utils.client_ip import resolve_client_ip
+
 SMS_RATE_LIMIT_MESSAGE = "验证码发送过于频繁，请稍后再试"
 
 
 def client_ip(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+    return resolve_client_ip(request)
 
 
 def sms_rate_limited_response(retry_after: int) -> JSONResponse:

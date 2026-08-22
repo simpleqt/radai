@@ -6,6 +6,7 @@ Project-local thread state schema (pure data types, no I/O).
 from __future__ import annotations
 
 import operator
+import os
 from typing import Annotated
 
 from langchain.agents import AgentState
@@ -17,6 +18,7 @@ from backend.core.agents.context.types import (
     ContextPack,
     EvidenceRecord,
 )
+from backend.core.agents.context.objects import ContextObject, ProjectionReceipt
 
 
 class ThreadDataState(TypedDict):
@@ -33,54 +35,12 @@ class RuntimeTurnState(TypedDict):
     runtime_model_turns: NotRequired[Annotated[int, operator.add]]
 
 
-class ViewedImageData(TypedDict):
-    base64: str
-    mime_type: str
-
-
-MAX_VIEWED_IMAGES = 20
-MAX_VIEWED_IMAGE_BASE64_CHARS = 2_000_000
-
-
-def _bounded_viewed_images(
-    images: dict[str, ViewedImageData] | None,
-) -> dict[str, ViewedImageData]:
-    bounded: dict[str, ViewedImageData] = {}
-    for image_id, image in (images or {}).items():
-        if not isinstance(image, dict):
-            continue
-        encoded = image.get("base64")
-        if not isinstance(encoded, str) or len(encoded) > MAX_VIEWED_IMAGE_BASE64_CHARS:
-            continue
-        key = str(image_id)
-        bounded.pop(key, None)
-        bounded[key] = image
-    return dict(list(bounded.items())[-MAX_VIEWED_IMAGES:])
-
-
 def merge_artifacts(existing: list[str] | None, new: list[str] | None) -> list[str]:
     if existing is None:
         return new or []
     if new is None:
         return existing
     return list(dict.fromkeys(existing + new))
-
-
-def merge_viewed_images(
-    existing: dict[str, ViewedImageData] | None,
-    new: dict[str, ViewedImageData] | None,
-) -> dict[str, ViewedImageData]:
-    if existing is None:
-        return _bounded_viewed_images(new)
-    if new is None:
-        return _bounded_viewed_images(existing)
-    if len(new) == 0:
-        return {}
-    merged = _bounded_viewed_images(existing)
-    for image_id, image in _bounded_viewed_images(new).items():
-        merged.pop(image_id, None)
-        merged[image_id] = image
-    return dict(list(merged.items())[-MAX_VIEWED_IMAGES:])
 
 
 def merge_loaded_skills(
@@ -219,13 +179,91 @@ def merge_compaction_history(
     return [*anonymous, *by_window.values()][-20:]
 
 
+def context_object_ref_cap() -> int:
+    """Read the bounded state-reference cap (default keeps current behavior)."""
+
+    try:
+        return max(10, min(int(os.getenv("CONTEXT_OBJECT_REF_CAP", "200")), 1000))
+    except (TypeError, ValueError):
+        return 200
+
+
+def converge_context_object_refs(
+    refs: list[ContextObject] | None,
+    *,
+    cap: int | None = None,
+) -> list[ContextObject]:
+    """Deduplicate and converge a context-object ref list under the cap.
+
+    Used by both the state reducer (on write) and the JIT reader (on load), so
+    oversized legacy checkpoints converge with the same ``last_seen_at``
+    eviction rule instead of a raw tail slice.
+    """
+
+    limit = int(cap) if cap is not None else context_object_ref_cap()
+    by_oid: dict[str, ContextObject] = {}
+    for obj in refs or []:
+        if not isinstance(obj, dict):
+            continue
+        oid = str(obj.get("oid") or "")
+        if not oid:
+            continue
+        by_oid.pop(oid, None)
+        by_oid[oid] = obj
+    ordered = sorted(
+        by_oid.values(),
+        key=lambda obj: (
+            float((obj.get("origin") or {}).get("last_seen_at") or 0.0),
+            str((obj.get("origin") or {}).get("turn_id") or ""),
+            str(obj.get("oid") or ""),
+        ),
+    )
+    return ordered[-max(1, limit):]
+
+
+def merge_context_objects(
+    existing: list[ContextObject] | None,
+    new: list[ContextObject] | None,
+) -> list[ContextObject]:
+    """Keep small object refs by content-addressed oid, evicting oldest.
+
+    The cap is configurable through ``CONTEXT_OBJECT_REF_CAP`` (default 200).
+    Eviction order prefers ``origin.last_seen_at`` (capture time written by
+    segmenters) and falls back to write order for refs without it, so a
+    deterministic LRU ordering replaces pure insertion-order truncation.
+    """
+
+    return converge_context_object_refs([*(existing or []), *(new or [])])
+
+
+def merge_projection_receipts(
+    existing: list[ProjectionReceipt] | None,
+    new: list[ProjectionReceipt] | None,
+) -> list[ProjectionReceipt]:
+    merged = [*(existing or []), *(new or [])]
+    by_key: dict[str, ProjectionReceipt] = {}
+    for receipt in merged:
+        key = ":".join(
+            [
+                str(receipt.get("oid") or ""),
+                str(receipt.get("handle") or ""),
+                str(receipt.get("turn_id") or ""),
+            ]
+        )
+        # Assignment does not refresh an existing dict key's insertion order;
+        # without the pop a frequently refreshed receipt kept its old slot and
+        # could be evicted by the tail cap despite being the most recent.
+        by_key.pop(key, None)
+        by_key[key] = receipt
+    return list(by_key.values())[-200:]
+
+
 class ThreadState(AgentState, RuntimeTurnState):
     thread_data: NotRequired[ThreadDataState | None]
     title: NotRequired[str | None]
     artifacts: Annotated[list[str], merge_artifacts]
     todos: NotRequired[list | None]
     uploaded_files: NotRequired[list[dict] | None]
-    viewed_images: Annotated[dict[str, ViewedImageData], merge_viewed_images]
     research_workflow: NotRequired[dict | None]
     clarification: NotRequired[dict | None]
     loaded_skills: Annotated[dict[str, str], merge_loaded_skills]
@@ -235,6 +273,12 @@ class ThreadState(AgentState, RuntimeTurnState):
     project_skill: Annotated[str | None, merge_project_skill]
     context_items: Annotated[list[ContextItem], merge_context_items]
     context_records: Annotated[list[EvidenceRecord], merge_context_records]
+    context_objects: Annotated[list[ContextObject], merge_context_objects]
+    projection_receipts: Annotated[
+        list[ProjectionReceipt],
+        merge_projection_receipts,
+    ]
+    context_accounting: NotRequired[dict | None]
     context_pack: NotRequired[ContextPack | None]
     context_budget: NotRequired[ContextBudgetState | None]
     context_pack_trace_index: NotRequired[int]

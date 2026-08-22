@@ -10,6 +10,9 @@ from typing import Any
 
 from sqlalchemy import select
 
+from backend.application.conversations.local_catalog import (
+    get_local_conversation_catalog,
+)
 from backend.db.connection import get_async_session_factory
 from backend.db.models import Conversation
 
@@ -39,6 +42,19 @@ class ConversationMemoryStore:
         if not user_id or not thread_id:
             return None
         try:
+            local_catalog = get_local_conversation_catalog()
+            if local_catalog is not None:
+                conversation = await local_catalog.get(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    include_deleted=False,
+                )
+                if conversation is None:
+                    return None
+                memory = dict((conversation.metadata_ or {}).get(MEMORY_KEY) or {})
+                if not memory:
+                    return None
+                return {**default_agent_memory(), **memory}
             session_factory = get_async_session_factory()
             async with session_factory() as session:
                 result = await asyncio.wait_for(
@@ -66,16 +82,49 @@ class ConversationMemoryStore:
             )
             return None
 
-    async def save(
+    async def merge_from_summary(
         self,
         *,
         user_id: str | None,
         thread_id: str | None,
-        memory: dict[str, Any],
+        summary: str,
+        message_count: int,
+        message_id: str | None = None,
     ) -> bool:
+        """Merge one compaction summary into ``agent_memory`` atomically.
+
+        The read-merge-write runs inside the catalog row transaction (or the
+        MySQL row lock), so concurrent writers cannot base their merge on the
+        same stale snapshot and drop each other's structured entries — the
+        load-then-save shape did exactly that across requests.
+        """
+
         if not user_id or not thread_id:
             return False
+
+        def _merged(previous_value: Any) -> dict[str, Any]:
+            previous: dict[str, Any] | None = None
+            if isinstance(previous_value, dict) and previous_value:
+                previous = {**default_agent_memory(), **previous_value}
+            merged = build_memory_from_summary(
+                summary=summary,
+                message_count=message_count,
+                message_id=message_id,
+                previous=previous,
+            )
+            merged["version"] = 1
+            merged["updated_at"] = datetime.now().isoformat()
+            return merged
+
         try:
+            local_catalog = get_local_conversation_catalog()
+            if local_catalog is not None:
+                return await local_catalog.merge_metadata_value_with(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    key=MEMORY_KEY,
+                    merge=_merged,
+                )
             session_factory = get_async_session_factory()
             async with session_factory() as session:
                 result = await asyncio.wait_for(
@@ -93,9 +142,58 @@ class ConversationMemoryStore:
                 if conversation is None:
                     return False
                 metadata = dict(conversation.metadata_ or {})
-                merged = {**default_agent_memory(), **dict(memory or {})}
-                merged["version"] = 1
-                merged["updated_at"] = datetime.now().isoformat()
+                metadata[MEMORY_KEY] = _merged(metadata.get(MEMORY_KEY))
+                conversation.metadata_ = metadata
+                conversation.updated_at = datetime.now()
+                await session.commit()
+                return True
+        except Exception:
+            logger.warning(
+                "[ConversationMemoryStore] merge failed: user_id=%s thread_id=%s",
+                user_id,
+                thread_id,
+                exc_info=True,
+            )
+            return False
+
+    async def save(
+        self,
+        *,
+        user_id: str | None,
+        thread_id: str | None,
+        memory: dict[str, Any],
+    ) -> bool:
+        if not user_id or not thread_id:
+            return False
+        try:
+            merged = {**default_agent_memory(), **dict(memory or {})}
+            merged["version"] = 1
+            merged["updated_at"] = datetime.now().isoformat()
+            local_catalog = get_local_conversation_catalog()
+            if local_catalog is not None:
+                return await local_catalog.merge_metadata_value(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    key=MEMORY_KEY,
+                    value=merged,
+                )
+            session_factory = get_async_session_factory()
+            async with session_factory() as session:
+                result = await asyncio.wait_for(
+                    session.execute(
+                        select(Conversation)
+                        .where(
+                            Conversation.user_id == user_id,
+                            Conversation.thread_id == thread_id,
+                        )
+                        .with_for_update()
+                    ),
+                    timeout=10.0,
+                )
+                conversation = result.scalar_one_or_none()
+                if conversation is None:
+                    return False
+                metadata = dict(conversation.metadata_ or {})
                 metadata[MEMORY_KEY] = merged
                 conversation.metadata_ = metadata
                 conversation.updated_at = datetime.now()
@@ -139,6 +237,9 @@ def validate_memory_summary(*, source_text: str, summary: str) -> bool:
     return True
 
 
+_MEMORY_SUMMARY_MAX_CHARS = 8000
+
+
 def build_memory_from_summary(
     *,
     summary: str,
@@ -146,8 +247,15 @@ def build_memory_from_summary(
     message_id: str | None = None,
     previous: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from backend.core.agents.context.summary import generate_summary
+
     memory = {**default_agent_memory(), **dict(previous or {})}
-    memory["summary"] = str(summary or "").strip()
+    # Compaction summaries grow with the conversation; an unbounded value
+    # bloats Conversation.metadata_ on every save and slows each load.
+    memory["summary"] = generate_summary(
+        str(summary or "").strip(),
+        max_chars=_MEMORY_SUMMARY_MAX_CHARS,
+    )
     extracted = _extract_structured_memory(summary)
     for key, values in extracted.items():
         memory[key] = _merge_unique_memory_values(memory.get(key), values)

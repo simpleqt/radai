@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +60,7 @@ class ProfiledGraphBuildConfig:
     max_concurrent_subagents: int
     checkpointer: BaseCheckpointSaver | None
     guardrail_policy: str = "default"
+    deep_retrieval: bool = False
     prompt_profile: str | None = None
     deep_research_task_type: str = "deep_research"
     tool_runtime_context: Any | None = None
@@ -78,6 +80,7 @@ class ProfiledGraphBuildResult:
     model_name: str | None
     tools: list[Any]
     compaction_checkpoints: Any | None = None
+    context_pruning_middleware: Any | None = None
 
 
 class ProfiledGraphBuilder:
@@ -114,10 +117,12 @@ class ProfiledGraphBuilder:
         from backend.core.models import create_chat_model
 
         cfg = self._config
+        build_started = time.perf_counter()
         model = create_chat_model(
             name=cfg.model_name,
             thinking_enabled=cfg.thinking_enabled,
         )
+        model_seconds = time.perf_counter() - build_started
         effective_model_name = cfg.model_name
         if effective_model_name is None:
             default_name = get_default_model_name()
@@ -130,7 +135,9 @@ class ProfiledGraphBuilder:
 
         logger.info("[%s] 创建模型: %s", cfg.label, type(model).__name__)
 
+        tools_started = time.perf_counter()
         tools = self._assemble_tools(model_name=effective_model_name)
+        tools_seconds = time.perf_counter() - tools_started
         logger.info("[%s] 工具列表: %s", cfg.label, [tool.name for tool in tools])
 
         feature_tool_names = {"task"} if cfg.subagent_enabled else set()
@@ -159,17 +166,26 @@ class ProfiledGraphBuilder:
             # owner. Keeping the framework summarizer in the chain would
             # rewrite the same window a second time and invalidate cache keys.
             summarization=False,
-            vision=True,
             subagent=subagent_feature,
             clarification=False,
             guardrail=guardrail_mw,
         )
 
         context_pruning = ContextPruningMiddleware(
-            keep_latest_n=1,
             thread_id=cfg.thread_id,
             model_name=effective_model_name,
             user_id=str(getattr(cfg.tool_runtime_context, "user_id", "") or "") or None,
+            # Install the capability ledger under the execution-scope key so
+            # parallel coordination units of one request never overwrite each
+            # other's registry entry; scoped tools look it up by the same key.
+            request_id=(
+                str(
+                    getattr(cfg.tool_runtime_context, "context_scope_id", "")
+                    or getattr(cfg.tool_runtime_context, "request_id", "")
+                    or ""
+                )
+                or None
+            ),
             policy=context_policy,
             checkpointer=cfg.checkpointer,
         )
@@ -239,22 +255,40 @@ class ProfiledGraphBuilder:
             *[tool.name for tool in tools],
             *feature_tool_names,
         }
+        prompt_started = time.perf_counter()
+        system_prompt = self._build_system_prompt()
+        prompt_seconds = time.perf_counter() - prompt_started
+        graph_started = time.perf_counter()
         graph = create_agent_graph(
             model=model,
             tools=tools,
-            system_prompt=self._build_system_prompt(),
+            system_prompt=system_prompt,
             features=features,
             extra_middleware=extra_middleware,
             checkpointer=cfg.checkpointer,
             name=cfg.graph_name,
             state_schema=ThreadState,
         )
-        logger.info("[%s] 图构建完成: %s", cfg.label, graph.name)
+        graph_seconds = time.perf_counter() - graph_started
+        # 每请求全量重建执行器是已知成本;分段耗时为「装配缓存/编译图缓存」
+        # 的决策提供数据,total 含未单列的中间件装配等杂项。
+        logger.info(
+            "[%s] 图构建完成: %s (耗时ms model=%.1f tools=%.1f prompt=%.1f "
+            "graph=%.1f total=%.1f)",
+            cfg.label,
+            graph.name,
+            model_seconds * 1000,
+            tools_seconds * 1000,
+            prompt_seconds * 1000,
+            graph_seconds * 1000,
+            (time.perf_counter() - build_started) * 1000,
+        )
         return ProfiledGraphBuildResult(
             graph=graph,
             model_name=effective_model_name,
             tools=tools,
             compaction_checkpoints=context_pruning.compaction_checkpoints,
+            context_pruning_middleware=context_pruning,
         )
 
     def _build_system_prompt(
@@ -349,11 +383,13 @@ class ProfiledGraphBuilder:
             else ""
         )
         artifact_rule = (
+            "context_read 只接受【证据台账】列出的 sid（句柄为兼容旧调用的可选参数）；"
             "read_context_artifact 只接受系统明确提供的 artifact://context/... 引用；"
             "网页 URL、知识库引用、source_id 和猜测路径都不是 artifact 引用，必须直接作为证据使用，"
-            "不得传给该工具。\n"
+            "不得传给该工具；context_read 失败时禁止重新发起知识库检索。\n"
             if effective_allowed_tools is None
             or "read_context_artifact" in effective_allowed_tools
+            or "context_read" in effective_allowed_tools
             else ""
         )
         role_contract = (
@@ -397,6 +433,7 @@ class ProfiledGraphBuilder:
             model_name=model_name,
             subagent_enabled=cfg.subagent_enabled,
             use_search=cfg.use_search,
+            deep_retrieval=cfg.deep_retrieval,
             kb_ids=list(cfg.kb_ids),
             selected_skills=cfg.selected_skills,
             skills_provider=cfg.skills_provider,

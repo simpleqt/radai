@@ -1,0 +1,33 @@
+[Unit]
+Description=Document Agent Production University Audit Frontend (5177)
+After=network-online.target doc-agent-prod-agent-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/inspur/myenv/runtime/doc-agent-production
+Environment=VITE_API_PROXY_TARGET=http://127.0.0.1:8082
+Environment=VITE_KNOWLEDGE_API_PROXY_TARGET=http://127.0.0.1:8086
+ExecStartPre=/home/inspur/myenv/runtime/doc-agent-production/bin/run-frontend-5177.sh --check
+ExecStart=/home/inspur/myenv/runtime/doc-agent-production/bin/run-frontend-5177.sh
+Restart=always
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=30s
+LimitNOFILE=65536
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictRealtime=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=doc-agent-prod-frontend-5177
+
+[Install]
+WantedBy=doc-agent-production.target

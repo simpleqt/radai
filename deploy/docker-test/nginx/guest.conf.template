@@ -1,0 +1,33 @@
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+    client_max_body_size 256m;
+    set $guest_upstream http://guest-api:8083;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options SAMEORIGIN always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+    location = /healthz {
+        access_log off;
+        default_type application/json;
+        return 200 '{"status":"alive","service":"radai-guest-frontend"}';
+    }
+
+    location ~ ^/(?:@fs|@id|__vite_ping)(?:/|$) {
+        return 403;
+    }
+
+    location /api/ {
+        proxy_pass $guest_upstream$request_uri;
+        include /opt/radai-nginx/proxy-common.conf.template;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

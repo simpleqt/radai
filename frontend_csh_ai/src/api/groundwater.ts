@@ -9,6 +9,7 @@ export interface GroundwaterProject {
   record_counts: Record<string, number>;
   read_only: boolean;
   authorized_user_count?: number;
+  coordinate_system?: string;
 }
 
 export interface GroundwaterUser {

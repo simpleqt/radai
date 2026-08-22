@@ -17,7 +17,7 @@ models:
     use: langchain_openai:ChatOpenAI
     model: MiniMax-M2.7
     api_key: $AI_GATEWAY_API_KEY
-    base_url: $AI_GATEWAY_BASE_URL
+    base_url: https://aigateway.cdut.edu.cn/v1
     request_timeout: 600.0
     max_retries: 2
     max_tokens: 16384
@@ -35,7 +35,7 @@ models:
     use: backend.core.models.patched_deepseek_openai:PatchedDeepSeekOpenAI
     model: deepseek-v4-flash
     api_key: $AI_GATEWAY_API_KEY
-    base_url: $AI_GATEWAY_BASE_URL
+    base_url: https://aigateway.cdut.edu.cn/v1
     request_timeout: 600.0
     max_retries: 2
     max_tokens: 16384
@@ -48,7 +48,7 @@ models:
     use: langchain_openai:ChatOpenAI
     model: glm-5.1
     api_key: $AI_GATEWAY_API_KEY
-    base_url: $AI_GATEWAY_BASE_URL
+    base_url: https://aigateway.cdut.edu.cn/v1
     request_timeout: 600.0
     max_retries: 2
     max_tokens: 16384
@@ -98,7 +98,7 @@ models:
     use: langchain_openai:ChatOpenAI
     model: qwen3.5-35b
     api_key: $QWEN35_API_KEY
-    base_url: $QWEN35_API_BASE
+    base_url: http://202.115.138.32:8011/v1
     request_timeout: 600.0
     max_retries: 2
     max_tokens: 16384

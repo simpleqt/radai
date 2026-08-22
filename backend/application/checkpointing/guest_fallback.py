@@ -7,12 +7,52 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from collections import OrderedDict
+from collections.abc import Iterable
 from typing import Any
 
 from fastapi import Request
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from backend.application.checkpointing.checkpointer import get_checkpointer_from_request
+
+# "Thread has messages" is monotone while the thread remains listable: the
+# checkpoint GC always retains the latest checkpoint, and full checkpoint
+# deletion happens only together with the conversation soft-delete that
+# removes the thread from the candidate list upstream. A positive result can
+# therefore be cached process-locally, which spares the history pagination
+# from re-parsing one full checkpoint blob (~90KB in production) per known
+# conversation on every page load.
+_KNOWN_MESSAGE_THREADS: OrderedDict[str, None] = OrderedDict()
+_KNOWN_MESSAGE_THREADS_LOCK = threading.Lock()
+_KNOWN_MESSAGE_THREADS_MAX = 50_000
+
+
+def _cached_message_threads(thread_ids: Iterable[str]) -> set[str]:
+    with _KNOWN_MESSAGE_THREADS_LOCK:
+        hits: set[str] = set()
+        for thread_id in thread_ids:
+            if thread_id in _KNOWN_MESSAGE_THREADS:
+                _KNOWN_MESSAGE_THREADS.move_to_end(thread_id)
+                hits.add(thread_id)
+        return hits
+
+
+def _remember_message_threads(thread_ids: Iterable[str]) -> None:
+    with _KNOWN_MESSAGE_THREADS_LOCK:
+        for thread_id in thread_ids:
+            _KNOWN_MESSAGE_THREADS[thread_id] = None
+            _KNOWN_MESSAGE_THREADS.move_to_end(thread_id)
+        while len(_KNOWN_MESSAGE_THREADS) > _KNOWN_MESSAGE_THREADS_MAX:
+            _KNOWN_MESSAGE_THREADS.popitem(last=False)
+
+
+def reset_known_message_threads() -> None:
+    """Clear the monotone cache (tests and controlled restarts only)."""
+
+    with _KNOWN_MESSAGE_THREADS_LOCK:
+        _KNOWN_MESSAGE_THREADS.clear()
 
 
 def _checkpoint_messages(checkpoint: dict[str, Any] | None) -> list[Any]:
@@ -50,8 +90,13 @@ async def has_checkpoint_messages(
     request: Request,
     internal_thread_id: str,
 ) -> bool:
+    if _cached_message_threads([internal_thread_id]):
+        return True
     checkpoint = await aget_checkpoint_with_fallback(request, internal_thread_id)
-    return len(_checkpoint_messages(checkpoint)) > 0
+    has_messages = len(_checkpoint_messages(checkpoint)) > 0
+    if has_messages:
+        _remember_message_threads([internal_thread_id])
+    return has_messages
 
 
 async def _bulk_thread_ids_with_messages(
@@ -115,10 +160,22 @@ async def get_thread_ids_with_checkpoint_messages(
     if not internal_thread_ids:
         return set()
 
+    visible = _cached_message_threads(internal_thread_ids)
+    pending = [
+        thread_id
+        for thread_id in internal_thread_ids
+        if thread_id not in visible
+    ]
+    if not pending:
+        return visible
+
     primary = get_checkpointer_from_request(request)
-    visible = await _bulk_thread_ids_with_messages(primary, internal_thread_ids)
-    remaining = [thread_id for thread_id in internal_thread_ids if thread_id not in visible]
+    visible.update(await _bulk_thread_ids_with_messages(primary, pending))
+    remaining = [thread_id for thread_id in pending if thread_id not in visible]
     fallback = get_fallback_checkpointer(request)
     if fallback is not None and remaining:
         visible.update(await _bulk_thread_ids_with_messages(fallback, remaining))
+    _remember_message_threads(
+        thread_id for thread_id in pending if thread_id in visible
+    )
     return visible

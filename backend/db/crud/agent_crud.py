@@ -36,20 +36,16 @@ async def get_runtime_agent_kb_ids(
     session: "AsyncSession",
     profile_code: str,
 ) -> list[str]:
-    """Resolve bindings from MySQL, preferring the current profile key."""
+    """Resolve runtime bindings from MySQL, preferring the current profile key."""
     from backend.domain.agents.bindings import agent_binding_codes
-    from backend.db.models.agent import Agent, AgentKnowledgeBase
+    from backend.db.models.agent import AgentKnowledgeBase
 
     agent_codes = agent_binding_codes(profile_code)
     if not agent_codes:
         return []
     result = await session.execute(
         select(AgentKnowledgeBase.agent_code, AgentKnowledgeBase.kb_id)
-        .join(Agent, Agent.agent_code == AgentKnowledgeBase.agent_code)
-        .where(
-            AgentKnowledgeBase.agent_code.in_(agent_codes),
-            Agent.is_active.is_(True),
-        )
+        .where(AgentKnowledgeBase.agent_code.in_(agent_codes))
         .order_by(AgentKnowledgeBase.sort_order, AgentKnowledgeBase.id)
     )
     grouped: dict[str, list[str]] = {}
@@ -77,21 +73,6 @@ async def list_agents(session: "AsyncSession", active_only: bool = False):
         stmt = stmt.where(Agent.is_active == True)  # noqa: E712
     result = await session.execute(stmt)
     return result.scalars().all()
-
-
-async def list_agent_bindings(session: "AsyncSession", agent_code: str):
-    """返回指定智能体的所有绑定记录（按 sort_order 升序）。"""
-    from backend.db.models.agent import AgentKnowledgeBase
-    from backend.db.models.knowledge_base import KnowledgeBase
-
-    stmt = (
-        select(AgentKnowledgeBase, KnowledgeBase.kb_name)
-        .join(KnowledgeBase, AgentKnowledgeBase.kb_id == KnowledgeBase.kb_id)
-        .where(AgentKnowledgeBase.agent_code == agent_code)
-        .order_by(AgentKnowledgeBase.sort_order, AgentKnowledgeBase.id)
-    )
-    result = await session.execute(stmt)
-    return result.all()
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +116,16 @@ async def add_kb_binding(
     kb_id: str,
     sort_order: int = 0,
 ):
-    """为智能体添加知识库绑定（已存在则忽略）。"""
-    from backend.db.models.agent import AgentKnowledgeBase
+    """为智能体添加知识库绑定（已存在则更新排序）。"""
+    from backend.db.models.agent import Agent, AgentKnowledgeBase
 
+    # Serialize binding mutations for one agent so concurrent requests cannot
+    # both pass the existence check and race on the unique constraint.
+    await session.execute(
+        select(Agent.agent_code)
+        .where(Agent.agent_code == agent_code)
+        .with_for_update()
+    )
     result = await session.execute(
         select(AgentKnowledgeBase).where(
             AgentKnowledgeBase.agent_code == agent_code,

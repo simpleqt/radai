@@ -225,44 +225,6 @@ class TimedRotatingFileHandlerWithArchive(logging.handlers.TimedRotatingFileHand
                 pass
 
 
-class ModuleFileHandler(logging.FileHandler):
-    """
-    模块文件处理器
-
-    根据日志记录器的名称，将日志写入到对应的模块日志文件
-    """
-
-    MODULE_MAPPING = {
-        "backend.api": "api.log",
-        "backend.worker": "worker.log",
-        "backend.kafka": "kafka.log",
-        "backend.workflows": "workflow.log",
-        "backend.db": "db.log",
-        "backend.storage": "storage.log",
-        "backend.integrations": "integration.log",
-    }
-
-    def __init__(self, logger_name: str, log_dir: str, **kwargs):
-        self.logger_name = logger_name
-        self.log_dir = log_dir
-
-        # 根据日志记录器名称确定日志文件
-        log_filename = self._get_log_filename(logger_name)
-        log_path = Path(log_dir) / log_filename
-
-        # 创建日志目录
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        super().__init__(log_path, **kwargs)
-
-    def _get_log_filename(self, logger_name: str) -> str:
-        """根据日志记录器名称获取日志文件名"""
-        for module_prefix, filename in self.MODULE_MAPPING.items():
-            if logger_name.startswith(module_prefix):
-                return filename
-        return "app.log"
-
-
 def _is_backend_kafka_on_path(path: str) -> bool:
     """判断 sys.path 条目是否会将 backend/kafka 暴露为顶层 kafka 包。"""
     import os
@@ -374,6 +336,16 @@ class KafkaLogHandler(logging.Handler):
         # 重连退避状态
         self._reconnect_delay = self._RECONNECT_INIT_DELAY
         self._next_reconnect_at: float = 0.0  # 允许立即初次连接
+
+        # kafka-python 的导入会临时改写 sys.path / sys.modules(解决 backend/
+        # 对 `kafka` 包名的遮蔽)。这必须在创建 sender 线程之前、于当前(主)
+        # 线程同步完成:setup_logging 尾部立即产生日志,sender 线程 0.5s 内就会
+        # 触发导入,与启动导入高峰并发改 sys.path 会造成 ImportError 崩溃或
+        # 错误模块缓存。导入失败不阻断日志初始化(sender 线程按退避重试)。
+        try:
+            _import_kafka_python()
+        except Exception as exc:
+            print(f"[KafkaLogHandler] kafka-python 预导入失败(将在后台重试): {exc}")
 
         # Producer initialization may block on DNS/broker discovery.  Keep it
         # entirely in the sender thread so importing or starting the API never

@@ -53,7 +53,8 @@ class OCRProvider:
         self._providers: dict[str, ProviderInfo] = {}
         self._instances: dict[str, BaseOCR] = {}
         self._default_provider: str | None = None
-        self._lock = threading.Lock()
+        # 可重入:get_provider 在持锁状态下走 create_provider 的写入路径。
+        self._lock = threading.RLock()
         self._initialized = True
 
         self._register_builtin_providers()
@@ -176,10 +177,14 @@ class OCRProvider:
         if provider_name is None:
             raise ValueError("No default provider set")
 
-        if provider_name not in self._instances:
+        # get-or-create 全程持锁(RLock,可重入进 create_provider):存在性检查
+        # 在锁外时,并发首调会各建一个实例,后写者覆盖前者,前者懒建的
+        # aiohttp session 永不关闭而泄漏。
+        with self._lock:
+            existing = self._instances.get(provider_name)
+            if existing is not None:
+                return existing
             return self.create_provider(provider_name)
-
-        return self._instances[provider_name]
 
     def set_default_provider(self, provider_name: str) -> None:
         """设置默认提供者

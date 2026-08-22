@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from typing import Any
 
 from backend.application.agent_errors import public_agent_error
@@ -25,6 +26,7 @@ from backend.core.agents.runtime_manager import (
 )
 from backend.core.tools.request_limits import (
     reset_request_tool_budget,
+    reset_web_search_no_progress_streak,
     reset_tool_budgets,
     reset_turn_kb_context_budget,
     set_request_tool_budget,
@@ -358,6 +360,7 @@ class CoordinationRuntimeLifecycle(CoordinationComponent):
         tool_budgets = self._coordinated_retrieval_budgets(context)
         budget_token = set_tool_budgets(tool_budgets)
         request_budget_token = set_request_tool_budget(tool_budgets)
+        reset_web_search_no_progress_streak()
         try:
             if self.name in {"plan_solve", "deep_research"}:
                 streamed_process_events = True
@@ -365,13 +368,28 @@ class CoordinationRuntimeLifecycle(CoordinationComponent):
                     asyncio.Queue(maxsize=self._runtime_budget.event_queue_maxsize)
                 )
                 outcome: dict[str, Any] = {}
+                dropped_events = 0
+
+                async def enqueue_event(
+                    item: tuple[str, dict[str, Any]],
+                ) -> None:
+                    # 过程事件是可丢弃的观测数据,结果经 outcome 传递。阻塞
+                    # put 会把慢 SSE 消费者的背压传导进分支协程:队列满时所有
+                    # 分支卡在终态事件的 record() 上,研究截止屏障随即把"已算
+                    # 完但发不出事件"的分支整支取消、证据全部丢弃。满队列直接
+                    # 丢事件,绝不阻塞分支结果状态机。
+                    nonlocal dropped_events
+                    try:
+                        event_queue.put_nowait(item)
+                    except asyncio.QueueFull:
+                        dropped_events += 1
 
                 async def execute_plan_solve() -> None:
                     try:
                         execution = self._run_plan_solve(
                             request,
                             context,
-                            event_sink=event_queue.put,
+                            event_sink=enqueue_event,
                         )
                         if self.name == "deep_research":
                             # Deep research owns independent research/writer
@@ -392,23 +410,65 @@ class CoordinationRuntimeLifecycle(CoordinationComponent):
                     except Exception as exc:  # noqa: BLE001
                         outcome["error"] = exc
                     finally:
-                        current = asyncio.current_task()
-                        if not task_is_cancelling(current):
-                            await event_queue.put(None)
+                        # 哨兵只是快路径:被取消(如租约续期失败取消 owner)或
+                        # 队列满投不进时,由消费者对 execution_task 的双等待
+                        # 兜底,不再有消费者悬挂在 get() 上的窗口。
+                        with suppress(asyncio.QueueFull):
+                            event_queue.put_nowait(None)
 
                 execution_task = asyncio.create_task(execute_plan_solve())
                 try:
                     while True:
-                        queued_event = await event_queue.get()
-                        if queued_event is None:
-                            break
-                        event_type, payload = queued_event
-                        sequence += 1
-                        yield recorded_event(sequence, event_type, payload)
-                    await execution_task
+                        get_task = asyncio.create_task(event_queue.get())
+                        done, _pending = await asyncio.wait(
+                            {get_task, execution_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if get_task in done:
+                            queued_event = get_task.result()
+                            if queued_event is None:
+                                break
+                            event_type, payload = queued_event
+                            sequence += 1
+                            yield recorded_event(sequence, event_type, payload)
+                            continue
+                        # 执行任务先结束(含被内部取消、未投出哨兵):排空剩余
+                        # 事件后退出循环,消费者不再无限期悬挂。
+                        get_task.cancel()
+                        await asyncio.gather(get_task, return_exceptions=True)
+                        while True:
+                            try:
+                                queued_event = event_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                            if queued_event is None:
+                                break
+                            event_type, payload = queued_event
+                            sequence += 1
+                            yield recorded_event(sequence, event_type, payload)
+                        break
+                    try:
+                        await execution_task
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        if current is not None and task_is_cancelling(current):
+                            raise
+                        # 执行任务被内部取消(资源租约续期失败等)而本生成器
+                        # 自身未被取消:转成普通错误走统一的 error/done 事件
+                        # 路径,而不是向上冒充本请求被取消。
+                        raise RuntimeError(
+                            "协调执行任务被内部取消（资源租约或运行时回收）"
+                        ) from None
                 finally:
                     if not execution_task.done():
                         await _cancel_task_bounded(execution_task)
+                if dropped_events:
+                    logger.warning(
+                        "[%s] 事件队列背压:已丢弃 %d 条过程事件(慢消费者);"
+                        "分支结果与证据不受影响",
+                        self.name,
+                        dropped_events,
+                    )
                 if "error" in outcome:
                     raise outcome["error"]
                 results, research_tasks = outcome["value"]

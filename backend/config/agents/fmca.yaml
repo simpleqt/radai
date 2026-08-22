@@ -3,10 +3,24 @@ name: 基础力学课程智能体
 domain: fundamental-mechanics-course
 description: 面向基础力学课程的概念讲解、公式推导、例题分析与学习答疑智能体
 default_model: null
-default_kb_ids: []
+default_kb_ids:
+  - 857d4163-911a-40ab-ac7f-ce9ab8fe8746
 default_skills:
   - general-table-analysis
-default_workflow: lightweight
+  - html-ppt
+stream_timeout_policy:
+  stream_idle_timeout_seconds: 180
+  model_round_idle_timeout_seconds: 180
+  heartbeat_interval_seconds: 30
+  incomplete_round_retry_max: 2
+  normal_stream_total_timeout_seconds: 600
+  deep_research_stream_timeout_seconds: 1800
+  deep_research_idle_timeout_seconds: 600
+  deep_research_finalize_idle_timeout_seconds: 300
+  deep_research_finalize_grace_seconds: 300
+  deep_research_task_stall_grace_seconds: 300
+  recursion_limit: null
+default_workflow: full
 allowed_workflows:
   - lightweight
   - full
@@ -16,6 +30,6 @@ allowed_workflows:
   - multi_agent_alternating
 prompt_profile: fmca
 tool_policy: fmca_default
-kb_policy: disabled
+kb_policy: bound_or_selected
 guardrail_policy: default
 ui_profile: fmca

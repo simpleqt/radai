@@ -11,6 +11,7 @@ from backend.core.agents.context.ledger import (
     make_evidence_record,
     parse_multikb_text_evidence,
 )
+from backend.core.agents.context.objects import ContextObject, ProjectionReceipt
 from backend.core.agents.context.result_sink import ResultSink
 from backend.core.agents.context.summary import generate_summary
 from backend.core.agents.context.types import EvidenceRecord
@@ -23,6 +24,8 @@ class CapturedContext:
     loaded_skills: dict[str, str] = field(default_factory=dict)
     context_records: list[EvidenceRecord] = field(default_factory=list)
     project_bootstrap: dict[str, Any] | None = None
+    context_objects: list[ContextObject] = field(default_factory=list)
+    projection_receipts: list[ProjectionReceipt] = field(default_factory=list)
 
 
 class ContextCaptureHandler(Protocol):
@@ -432,7 +435,7 @@ class ContextArtifactReadCaptureHandler:
     """
 
     def can_handle(self, tool_name: str, content: str) -> bool:
-        return tool_name == "read_context_artifact" and bool(content)
+        return tool_name in {"read_context_artifact", "context_read"} and bool(content)
 
     def capture(
         self,

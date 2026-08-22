@@ -1,29 +1,17 @@
-"""Application retrieval use cases."""
+"""Agent-side retrieval query-text utilities.
 
-from backend.application.retrieval.query_service import (
-    delete_rag_document,
-    execute_internal_multi_kb_search,
-    get_default_kb_id,
-    get_direct_retriever,
-    get_rag_health,
-    insert_content_list,
-    insert_docx_document,
-    list_chat_models,
-    process_multimodal_document,
-    reset_rag_runtime,
-    retrieve_context,
+The retrieval runtime lives in the omnigraph knowledge service; radai keeps
+only the pure query-resolution helpers used by streaming/lightweight executors.
+"""
+
+from backend.application.retrieval.query_resolution import (
+    compose_retrieval_query,
+    effective_tool_query,
+    latest_user_message_text,
 )
 
 __all__ = [
-    "delete_rag_document",
-    "execute_internal_multi_kb_search",
-    "get_default_kb_id",
-    "get_direct_retriever",
-    "get_rag_health",
-    "insert_content_list",
-    "insert_docx_document",
-    "list_chat_models",
-    "process_multimodal_document",
-    "reset_rag_runtime",
-    "retrieve_context",
+    "compose_retrieval_query",
+    "effective_tool_query",
+    "latest_user_message_text",
 ]

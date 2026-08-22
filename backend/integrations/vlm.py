@@ -5,6 +5,8 @@ VLM (Vision Language Model) 客户端
 
 import asyncio
 import base64
+import threading
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -27,38 +29,44 @@ class VLMClient:
         self._api_key = None
         self._api_base = None
         self._model = None
+        # 懒初始化竞态保护:两个协程并发首调时,后者会覆盖前者刚创建的
+        # AsyncClient 且旧实例永不关闭(连接泄漏)。
+        self._init_lock = asyncio.Lock()
 
     async def initialize(self) -> bool:
         """
-        初始化VLM客户端
+        初始化VLM客户端(可重入,已初始化时直接返回成功)
 
         Returns:
             是否初始化成功
         """
-        try:
-            from backend.config.settings import settings
+        async with self._init_lock:
+            if self._initialized:
+                return True
+            try:
+                from backend.config.settings import settings
 
-            self._api_key = settings.vlm_api_key
-            self._api_base = settings.vlm_api_base
-            self._model = settings.vlm_model or "glm-4.6v"
+                self._api_key = settings.vlm_api_key
+                self._api_base = settings.vlm_api_base
+                self._model = settings.vlm_model or "glm-4.6v"
 
-            if not self._api_key:
-                logger.warning(
-                    "VLM API key not configured, VLM features will be disabled"
+                if not self._api_key:
+                    logger.warning(
+                        "VLM API key not configured, VLM features will be disabled"
+                    )
+                    self._initialized = False
+                    return False
+
+                self._client = httpx.AsyncClient(trust_env=False, timeout=300.0)
+                self._initialized = True
+                logger.info(
+                    f"VLM client initialized successfully with model: {self._model}"
                 )
+                return True
+            except Exception as e:
+                logger.error(f"Failed to initialize VLM client: {e}")
                 self._initialized = False
                 return False
-
-            self._client = httpx.AsyncClient(trust_env=False, timeout=300.0)
-            self._initialized = True
-            logger.info(
-                f"VLM client initialized successfully with model: {self._model}"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Failed to initialize VLM client: {e}")
-            self._initialized = False
-            return False
 
     async def analyze_image(
         self,
@@ -240,14 +248,30 @@ class VLMClient:
         self._client = None
 
 
+_CLIENTS_BY_LOOP: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, VLMClient]" = (
+    weakref.WeakKeyDictionary()
+)
+_CLIENTS_GUARD = threading.Lock()
+
+
 async def get_vlm_client() -> VLMClient | None:
     """
-    获取VLM客户端单例
+    获取当前事件循环上的 VLM 客户端单例。
+
+    以前的实现声称单例却每次新建 ``VLMClient``(每次一个新的
+    ``httpx.AsyncClient``,调用方不 ``close()`` 就累积连接)。缓存按事件
+    循环隔离:asyncio 原语与 HTTP 客户端不得跨循环共享(项目多循环纪律),
+    循环销毁后 WeakKeyDictionary 自动回收对应条目。
 
     Returns:
-        VLM客户端实例
+        初始化成功的客户端实例;未配置/初始化失败时返回 None
     """
-    client = VLMClient()
+    loop = asyncio.get_running_loop()
+    with _CLIENTS_GUARD:
+        client = _CLIENTS_BY_LOOP.get(loop)
+        if client is None:
+            client = VLMClient()
+            _CLIENTS_BY_LOOP[loop] = client
     if await client.initialize():
         return client
     return None

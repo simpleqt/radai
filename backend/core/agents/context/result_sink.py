@@ -35,6 +35,7 @@ class ResultSink:
         persist_threshold: int | None = None,
         summary_max_chars: int = 4000,
         artifact_attributes: dict[str, object] | None = None,
+        persist_large_results: bool = True,
     ):
         self._artifact_store = artifact_store or create_context_artifact_store()
         self._artifact_attributes = dict(artifact_attributes or {})
@@ -47,6 +48,7 @@ class ResultSink:
         )
         self._persist_threshold = max(1, resolved_threshold)
         self._summary_max_chars = max(200, summary_max_chars)
+        self._persist_large_results = bool(persist_large_results)
 
     def ingest(
         self,
@@ -58,11 +60,14 @@ class ResultSink:
         importance_hint: float | None = None,
         tags: list[str] | None = None,
         kind_override: ContextKind | None = None,
+        force_persist: bool = False,
     ) -> ContextItem:
         content = normalize_text(raw_content)
         kind = kind_override or self._infer_kind(source_tool)
         raw_ref = None
-        if len(content) >= self._persist_threshold:
+        if (
+            self._persist_large_results or force_persist
+        ) and len(content) >= self._persist_threshold:
             artifact_attributes = dict(self._artifact_attributes)
             if thread_id:
                 artifact_attributes.setdefault("owner_thread_id", str(thread_id))

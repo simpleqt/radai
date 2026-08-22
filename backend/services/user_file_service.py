@@ -53,6 +53,21 @@ ExtraImageUrlLoader = Callable[
 ParsedCallback = Callable[[str, ParseResult], Awaitable[None]]
 
 
+def _safe_object_component(name: str, *, fallback: str) -> str:
+    """净化用户提供的文件名,使其可安全用作 MinIO 对象键的一段。
+
+    multipart filename 完全由客户端控制,可含 ``..``、前导 ``/``、控制字符;
+    直接拼进 ``users/{owner}/...`` 对象键时,唯一防线只剩 S3/MinIO 服务端对
+    坏路径组件的拒绝(各后端/版本行为不一)。取 basename、剔除路径分隔与控制
+    字符、限长,得到确定安全的一段(R4-SV-3)。
+    """
+    base = Path(str(name or "")).name
+    cleaned = "".join(
+        ch for ch in base if ch.isprintable() and ch not in '/\\"\r\n\t'
+    ).strip().strip(".")
+    return cleaned[:200] or fallback
+
+
 def _artifact_key(*parts: str) -> str:
     canonical = "\0".join(str(part or "") for part in parts)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -151,10 +166,6 @@ class StoredUploadedUserFile:
     uploaded_object_keys: tuple[str, ...]
 
 
-def is_allowed_upload_filename(filename: str) -> bool:
-    return Path(filename or "").suffix.lower() in ALLOWED_UPLOAD_EXTENSIONS
-
-
 def _build_download_url(file_id: str) -> str:
     return f"/api/v2/files/{file_id}/download"
 
@@ -167,7 +178,9 @@ async def cleanup_uploaded_minio_objects(
     if not any(str(key or "").strip().lstrip("/") for key in object_keys):
         return
     try:
-        client = _get_minio_client()
+        # 首次惰性初始化会做 bucket_exists/make_bucket 网络往返并持线程锁,
+        # 不能留在事件循环上(R4-SV-15)。
+        client = await asyncio.to_thread(_get_minio_client)
     except Exception as exc:
         logger.exception(
             "[UserFileService] 初始化 MinIO 回滚客户端失败: bucket=%s error=%s",
@@ -244,7 +257,8 @@ async def _prepare_uploaded_user_file(
         base_prefix = f"users/{owner_user_id}/threads/{thread_id}/chat-files/{file_id}"
     else:
         base_prefix = f"users/{owner_user_id}/personal-files/{file_id}"
-    storage_object = f"{base_prefix}/{filename}"
+    safe_filename = _safe_object_component(filename, fallback=f"{file_id}.bin")
+    storage_object = f"{base_prefix}/{safe_filename}"
 
     # Record ownership before the blocking upload starts. The storage helper
     # waits for an in-flight thread on cancellation, so compensation can then
@@ -262,7 +276,10 @@ async def _prepare_uploaded_user_file(
     image_urls: list[dict] = []
     for raw_image in parse_result.images or []:
         image = await asyncio.to_thread(compress_image_if_needed, raw_image)
-        image_object = f"{base_prefix}/images/{image.name}"
+        safe_image_name = _safe_object_component(
+            image.name, fallback=f"image_{len(image_urls)}.png"
+        )
+        image_object = f"{base_prefix}/images/{safe_image_name}"
         uploaded_object_keys.append(image_object)
         image_uploaded = await upload_bytes_to_minio(
             content=image.data,
@@ -272,10 +289,12 @@ async def _prepare_uploaded_user_file(
         )
         if not image_uploaded:
             raise UserFileServiceError("文件图片上传对象存储失败")
+        # name/url 必须与已净化的对象键一致,否则回取会按存储名重算出不同的
+        # 对象键而落空(R4-SV-3)。
         image_urls.append(
             {
-                "url": image_url_builder(file_id, image.name),
-                "name": image.name,
+                "url": image_url_builder(file_id, safe_image_name),
+                "name": safe_image_name,
                 "caption": image.caption,
                 "content_type": image.content_type,
                 "storage_object": image_object,
@@ -592,205 +611,6 @@ async def register_local_artifact_for_thread(
         return file_id, _build_download_url(file_id)
 
 
-async def register_minio_artifact_for_thread(
-    *,
-    internal_thread_id: str,
-    artifact_filename: str,
-    storage_bucket: str,
-    storage_object: str,
-    mime_type: str | None = "text/markdown",
-) -> tuple[str, str] | None:
-    """将 MinIO 对象登记为用户文件，并返回(file_id, download_url)。"""
-    user_id, external_thread_id = parse_internal_thread_key(internal_thread_id)
-    if not user_id:
-        return None
-
-    safe_name = (artifact_filename or "").strip().lstrip("/")
-    object_name = (storage_object or "").strip().lstrip("/")
-    bucket_name = (storage_bucket or "").strip()
-    if not safe_name or not object_name or not bucket_name:
-        return None
-    artifact_key = _artifact_key(
-        "minio", user_id, external_thread_id, bucket_name, object_name
-    )
-
-    factory = get_async_session_factory()
-    async with factory() as session:
-        existing = await session.execute(
-            text(
-                """
-                SELECT file_id
-                FROM user_files
-                WHERE owner_user_id = :owner_user_id
-                  AND thread_id = :thread_id
-                  AND source_type = 'minio'
-                  AND storage_bucket = :storage_bucket
-                  AND storage_object = :storage_object
-                  AND status = 'active'
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            ),
-            {
-                "owner_user_id": user_id,
-                "thread_id": external_thread_id,
-                "storage_bucket": bucket_name,
-                "storage_object": object_name,
-            },
-        )
-        row = existing.mappings().first()
-        if row and row.get("file_id"):
-            file_id = str(row["file_id"])
-            return file_id, _build_download_url(file_id)
-
-        file_id = f"uf_{uuid.uuid4().hex}"
-        file_id = await _commit_artifact_insert_async(
-            session,
-            text(
-                """
-                INSERT INTO user_files (
-                    file_id,
-                    owner_user_id,
-                    thread_id,
-                    source_type,
-                    storage_bucket,
-                    storage_object,
-                    artifact_key,
-                    display_name,
-                    mime_type,
-                    status
-                ) VALUES (
-                    :file_id,
-                    :owner_user_id,
-                    :thread_id,
-                    'minio',
-                    :storage_bucket,
-                    :storage_object,
-                    :artifact_key,
-                    :display_name,
-                    :mime_type,
-                    'active'
-                )
-                """
-            ),
-            {
-                "file_id": file_id,
-                "owner_user_id": user_id,
-                "thread_id": external_thread_id,
-                "storage_bucket": bucket_name,
-                "storage_object": object_name,
-                "artifact_key": artifact_key,
-                "display_name": Path(safe_name).name,
-                "mime_type": mime_type,
-            },
-            artifact_key,
-        )
-        return file_id, _build_download_url(file_id)
-
-
-def register_local_artifact_for_thread_sync(
-    *,
-    internal_thread_id: str,
-    artifact_filename: str,
-) -> tuple[str, str] | None:
-    """同步版本：将线程输出目录中的工件登记为用户文件。"""
-    user_id, external_thread_id = parse_internal_thread_key(internal_thread_id)
-    if not user_id:
-        return None
-
-    safe_name = (artifact_filename or "").strip().lstrip("/")
-    if not safe_name:
-        return None
-
-    outputs_dir = get_paths().thread_artifacts_dir(internal_thread_id).resolve()
-    local_path = (outputs_dir / safe_name).resolve()
-    try:
-        local_path.relative_to(outputs_dir)
-    except ValueError:
-        logger.warning("[UserFileService] 非法工件路径，已拒绝登记: %s", artifact_filename)
-        return None
-
-    if not local_path.exists() or not local_path.is_file():
-        logger.warning("[UserFileService] 工件文件不存在，无法登记: %s", local_path)
-        return None
-
-    mime_type, _ = mimetypes.guess_type(str(local_path))
-    file_size = local_path.stat().st_size
-    artifact_key = _artifact_key(
-        "local", user_id, external_thread_id, str(local_path)
-    )
-
-    factory = get_session_factory()
-    with factory() as session:
-        existing = session.execute(
-            text(
-                """
-                SELECT file_id
-                FROM user_files
-                WHERE owner_user_id = :owner_user_id
-                  AND thread_id = :thread_id
-                  AND local_abs_path = :local_abs_path
-                  AND status = 'active'
-                ORDER BY id DESC
-                LIMIT 1
-                """
-            ),
-            {
-                "owner_user_id": user_id,
-                "thread_id": external_thread_id,
-                "local_abs_path": str(local_path),
-            },
-        )
-        row = existing.mappings().first()
-        if row and row.get("file_id"):
-            file_id = str(row["file_id"])
-            return file_id, _build_download_url(file_id)
-
-        file_id = f"uf_{uuid.uuid4().hex}"
-        file_id = _commit_artifact_insert_sync(
-            session,
-            text(
-                """
-                INSERT INTO user_files (
-                    file_id,
-                    owner_user_id,
-                    thread_id,
-                    source_type,
-                    local_abs_path,
-                    artifact_key,
-                    display_name,
-                    mime_type,
-                    size_bytes,
-                    status
-                ) VALUES (
-                    :file_id,
-                    :owner_user_id,
-                    :thread_id,
-                    'local',
-                    :local_abs_path,
-                    :artifact_key,
-                    :display_name,
-                    :mime_type,
-                    :size_bytes,
-                    'active'
-                )
-                """
-            ),
-            {
-                "file_id": file_id,
-                "owner_user_id": user_id,
-                "thread_id": external_thread_id,
-                "local_abs_path": str(local_path),
-                "artifact_key": artifact_key,
-                "display_name": Path(safe_name).name,
-                "mime_type": mime_type,
-                "size_bytes": file_size,
-            },
-            artifact_key,
-        )
-        return file_id, _build_download_url(file_id)
-
-
 def register_minio_artifact_for_thread_sync(
     *,
     internal_thread_id: str,
@@ -974,35 +794,53 @@ async def write_download_audit(
     ip: str | None,
     user_agent: str | None,
 ) -> None:
-    await session.execute(
-        text(
-            """
-            INSERT INTO file_download_audit (
-                file_id,
-                user_id,
-                decision,
-                reason,
-                ip,
-                user_agent
-            ) VALUES (
-                :file_id,
-                :user_id,
-                :decision,
-                :reason,
-                :ip,
-                :user_agent
+    """用独立事务写入下载审计，确保 allow/deny 记录必定落库。
+
+    下载/元数据端点是 GET，其请求级会话（``session``）在安全方法上一律回滚
+    （只读事务卫生），复用它会把审计 INSERT 一并回滚——``file_download_audit``
+    对真实下载将永远为空。因此审计改走独立会话并显式提交；``session`` 形参保留
+    以兼容既有调用点但不再用于写入。写入失败仅告警，不阻断下载本身。
+    """
+    factory = get_async_session_factory()
+    try:
+        async with factory() as audit_session:
+            await audit_session.execute(
+                text(
+                    """
+                    INSERT INTO file_download_audit (
+                        file_id,
+                        user_id,
+                        decision,
+                        reason,
+                        ip,
+                        user_agent
+                    ) VALUES (
+                        :file_id,
+                        :user_id,
+                        :decision,
+                        :reason,
+                        :ip,
+                        :user_agent
+                    )
+                    """
+                ),
+                {
+                    "file_id": file_id,
+                    "user_id": user_id,
+                    "decision": decision,
+                    "reason": reason,
+                    "ip": ip,
+                    "user_agent": user_agent,
+                },
             )
-            """
-        ),
-        {
-            "file_id": file_id,
-            "user_id": user_id,
-            "decision": decision,
-            "reason": reason,
-            "ip": ip,
-            "user_agent": user_agent,
-        },
-    )
+            await audit_session.commit()
+    except Exception:
+        logger.warning(
+            "下载审计写入失败: file_id=%s decision=%s",
+            file_id,
+            decision,
+            exc_info=True,
+        )
 
 
 async def list_download_audit_for_user(

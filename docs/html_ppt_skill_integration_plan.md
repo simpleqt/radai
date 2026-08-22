@@ -144,6 +144,6 @@ users/{user_id}/threads/{thread_id}/html-ppt/{uuid}-{filename}
 标准化回归测试：
 
 ```bash
-python \
+/home/inspur/myenv/langchian_project/venv314/bin/python \
   -m pytest backend/tests/test_agent_platform_standardization.py -q
 ```

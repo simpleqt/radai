@@ -1,0 +1,3 @@
+# Internal modules referenced only through guarded optional imports
+# (try/except ImportError) that legitimately do not exist in this project.
+backend.kafka.log_schemas

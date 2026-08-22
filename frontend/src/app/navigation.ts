@@ -1,11 +1,10 @@
-/** 一级导航栏（Nav Rail）配置：集中管理多学习模式入口。 */
+/** 侧栏一级导航配置：集中管理多学习模式入口。 */
 
 export interface NavItem {
   id: string;
   label: string;
   /** lucide-vue-next 图标名 */
   icon: string;
-  /** 目标路由（桌面）；移动端由各页自行处理 */
   to: string;
   /** 命中高亮的路径前缀 */
   match: string[];
@@ -19,7 +18,7 @@ export const NAV_ITEMS: NavItem[] = [
     label: '知识问答',
     icon: 'MessagesSquare',
     to: '/app',
-    match: ['/app', '/m'],
+    match: ['/app'],
     enabled: true,
   },
   {
@@ -27,15 +26,35 @@ export const NAV_ITEMS: NavItem[] = [
     label: '探索式学习',
     icon: 'Compass',
     to: '/explore',
-    match: ['/explore', '/m/explore'],
+    match: ['/explore'],
     enabled: true,
+  },
+  {
+    id: 'custom-learning',
+    label: '自定义学习',
+    icon: 'Route',
+    to: '/custom-learning',
+    match: ['/custom-learning'],
+    enabled: true,
+  },
+  {
+    id: 'learning-style',
+    label: '学习风格',
+    icon: 'BrainCircuit',
+    to: '/learning-style',
+    match: ['/learning-style'],
+    enabled: true,
+  },
+  {
+    id: 'skills-market',
+    label: '专家·技能·连接器',
+    icon: 'PlugZap',
+    to: '/skills',
+    match: ['/skills'],
+    enabled: false,
   },
 ];
 
 export function isNavItemActive(item: NavItem, currentPath: string): boolean {
-  return item.match.some((m) => {
-    if (m === '/app') return currentPath === '/app' || currentPath.startsWith('/app/');
-    if (m === '/m') return currentPath === '/m' || (currentPath.startsWith('/m/') && !currentPath.startsWith('/m/explore'));
-    return currentPath === m || currentPath.startsWith(`${m}/`);
-  });
+  return item.match.some((m) => currentPath === m || currentPath.startsWith(`${m}/`));
 }

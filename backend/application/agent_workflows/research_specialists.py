@@ -103,17 +103,3 @@ def normalize_research_specialist(
     )
 
 
-def research_specialist_instruction(
-    agent_type: str,
-    *,
-    agent_specs: Mapping[str, RuntimeAgentSpec] | None = None,
-) -> str:
-    normalized = normalize_research_specialist(
-        agent_type,
-        agent_specs=agent_specs,
-        default_index=None,
-    )
-    for specialist in planner_research_specialists(agent_specs):
-        if specialist.key == normalized:
-            return specialist.instruction
-    raise AssertionError(f"Normalized planner role disappeared: {normalized}")

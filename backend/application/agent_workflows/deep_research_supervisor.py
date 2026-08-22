@@ -689,7 +689,44 @@ class DeepResearchSupervisor(CoordinationComponent):
                 _cancel_child_on_parent_exit(future)
             followup_phase_timed_out = False
             if research_deadline is None:
-                followup_results = await asyncio.gather(*followup_futures)
+                # 生产路径反思仅在 deep_research 下运行且必有截止时间;此分支
+                # 服务直接调用门面的调用方。与下方 deadline 分支同一纪律:
+                # 单个补研分支逃逸的异常/取消不得中止其余分支并丢弃其证据。
+                gathered_followups = await asyncio.gather(
+                    *followup_futures,
+                    return_exceptions=True,
+                )
+                followup_results = []
+                for offset, (task, outcome) in enumerate(
+                    zip(followup_tasks, gathered_followups, strict=True),
+                    start=1,
+                ):
+                    if isinstance(outcome, asyncio.CancelledError):
+                        followup_results.append(
+                            self._research_phase_timeout_result(
+                                index=len(tasks) + offset,
+                                task=task,
+                                used_fallback=False,
+                                context=context,
+                            )
+                        )
+                    elif isinstance(outcome, BaseException):
+                        followup_results.append(
+                            CoordinationUnitResult(
+                                role=self._research_role(
+                                    task=task,
+                                    index=len(tasks) + offset,
+                                    used_fallback=False,
+                                    context=context,
+                                ),
+                                answer="",
+                                error=str(outcome) or type(outcome).__name__,
+                                task_key=task.key,
+                                task_title=task.title,
+                            )
+                        )
+                    else:
+                        followup_results.append(outcome)
             else:
                 remaining_research_seconds = max(
                     0.0,

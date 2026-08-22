@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from backend.application.coordination.base import CoordinationPlan, CoordinationStage
+from backend.config.log_privacy import text_fingerprint
 from backend.domain.agents.request import AgentRequest
 from backend.domain.agents.runtime_context import AgentRuntimeContext
 
@@ -64,6 +65,6 @@ class DefaultCoordinationStrategy:
             stages=stages,
             metadata={
                 "agent_code": context.agent_profile.code,
-                "question": request.question[:120],
+                "question_fingerprint": text_fingerprint(request.question),
             },
         )

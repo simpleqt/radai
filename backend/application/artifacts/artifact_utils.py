@@ -160,12 +160,14 @@ def build_minio_artifact_download_url(
     filename: str,
     mime_type: str | None = None,
 ) -> str:
+    # ``mime_type`` is accepted for call-site compatibility but deliberately not
+    # placed in the URL: the download endpoint derives the response type from the
+    # stored object so a link cannot dictate how the bytes are rendered.
+    del mime_type
     query = (
         f"object_name={quote(str(minio_object or '').lstrip('/'), safe='')}"
         f"&filename={quote(str(Path(filename or 'artifact').name), safe='')}"
     )
-    if mime_type:
-        query += f"&mime_type={quote(str(mime_type), safe='')}"
     return f"/api/v2/files/minio-artifact/download?{query}"
 
 

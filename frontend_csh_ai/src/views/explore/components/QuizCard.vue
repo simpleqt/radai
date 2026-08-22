@@ -58,7 +58,7 @@ function optionState(key: string): 'correct' | 'wrong' | 'normal' {
 </script>
 
 <template>
-  <div class="rounded-2xl border border-slate-200 dark:border-slate-700 p-4 bg-white dark:bg-slate-800/50">
+  <div class="rounded-2xl border border-border-subtle p-4 bg-surface">
     <!-- 头部 -->
     <div class="flex items-center gap-2 mb-3">
       <span class="w-6 h-6 rounded-lg bg-teal-600 text-white text-xs font-bold flex items-center justify-center shrink-0">{{ index }}</span>
@@ -67,7 +67,7 @@ function optionState(key: string): 'correct' | 'wrong' | 'normal' {
     </div>
 
     <!-- 题干 -->
-    <p class="text-[14px] font-medium text-slate-800 dark:text-slate-100 leading-relaxed mb-3">{{ question.stem }}</p>
+    <p class="text-[14px] font-medium text-text-primary leading-relaxed mb-3">{{ question.stem }}</p>
 
     <!-- 选项（选择/多选） -->
     <div v-if="question.type === 'choice' || question.type === 'multi'" class="space-y-2">
@@ -76,19 +76,18 @@ function optionState(key: string): 'correct' | 'wrong' | 'normal' {
         :key="opt.key"
         type="button"
         class="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border text-left text-sm transition-all"
-        :class="[
-          optionState(opt.key) === 'correct' ? 'border-emerald-400 bg-emerald-50 dark:bg-emerald-900/20'
+        :class="[ optionState(opt.key) === 'correct' ? 'border-emerald-400 bg-emerald-50 dark:bg-emerald-900/20'
           : optionState(opt.key) === 'wrong' ? 'border-rose-400 bg-rose-50 dark:bg-rose-900/20'
           : isSelected(opt.key) ? 'border-teal-400 bg-teal-50 dark:bg-teal-500/10'
-          : 'border-slate-200 dark:border-slate-700 hover:border-teal-300 dark:hover:border-teal-500/60',
+          : 'border-border-subtle hover:border-teal-300 dark:hover:border-teal-500/60',
         ]"
         @click="selectOption(opt.key)"
       >
         <span
           class="w-5 h-5 rounded-full border flex items-center justify-center text-[11px] font-bold shrink-0"
-          :class="isSelected(opt.key) ? 'border-teal-500 bg-teal-500 text-white' : 'border-slate-300 dark:border-slate-600 text-slate-400'"
+          :class="isSelected(opt.key) ? 'border-teal-500 bg-teal-500 text-white' : 'border-border-subtle text-text-tertiary'"
         >{{ opt.key }}</span>
-        <span class="text-slate-700 dark:text-slate-200">{{ opt.text }}</span>
+        <span class="text-text-secondary">{{ opt.text }}</span>
       </button>
     </div>
 
@@ -99,19 +98,18 @@ function optionState(key: string): 'correct' | 'wrong' | 'normal' {
         :key="opt.key"
         type="button"
         class="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl border text-left text-sm transition-all"
-        :class="[
-          showAnswer && question.answer === opt.key ? 'border-emerald-400 bg-emerald-50 dark:bg-emerald-900/20'
+        :class="[ showAnswer && question.answer === opt.key ? 'border-emerald-400 bg-emerald-50 dark:bg-emerald-900/20'
           : showAnswer && isSelected(opt.key) ? 'border-rose-400 bg-rose-50 dark:bg-rose-900/20'
           : isSelected(opt.key) ? 'border-teal-400 bg-teal-50 dark:bg-teal-500/10'
-          : 'border-slate-200 dark:border-slate-700 hover:border-teal-300',
+          : 'border-border-subtle hover:border-teal-300',
         ]"
         @click="selectOption(opt.key)"
       >
         <span class="w-5 h-5 rounded-full border flex items-center justify-center shrink-0"
-          :class="isSelected(opt.key) ? 'border-teal-500 bg-teal-500' : 'border-slate-300 dark:border-slate-600'">
+          :class="isSelected(opt.key) ? 'border-teal-500 bg-teal-500' : 'border-border-subtle'">
           <CheckCircle2 v-if="isSelected(opt.key)" class="w-3 h-3 text-white" />
         </span>
-        <span class="text-slate-700 dark:text-slate-200">{{ opt.text }}</span>
+        <span class="text-text-secondary">{{ opt.text }}</span>
       </button>
     </div>
 
@@ -122,7 +120,7 @@ function optionState(key: string): 'correct' | 'wrong' | 'normal' {
         @input="emit('update:userAnswer', ($event.target as HTMLTextAreaElement).value)"
         rows="3"
         placeholder="在此处输入答案…"
-        class="w-full px-3 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm text-slate-700 dark:text-slate-200 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-400/50 resize-y"
+        class="w-full px-3 py-2.5 rounded-xl border border-border-subtle bg-surface text-sm text-text-secondary placeholder:text-text-tertiary focus:outline-none focus:ring-2 focus:ring-teal-400/50 resize-y"
       />
       <div class="flex justify-end">
         <button
@@ -137,15 +135,15 @@ function optionState(key: string): 'correct' | 'wrong' | 'normal' {
       </div>
 
       <!-- 评分结果 -->
-      <div v-if="grade" class="rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 p-3">
+      <div v-if="grade" class="rounded-xl bg-surface-sunken border border-border-subtle p-3">
         <div class="flex items-center gap-2 mb-1.5">
           <span class="text-lg font-black text-teal-600 dark:text-teal-400">{{ grade.score }}</span>
-          <span class="text-xs text-slate-400">/ 100</span>
+          <span class="text-xs text-text-tertiary">/ 100</span>
           <span class="text-xs px-2 py-0.5 rounded-md bg-teal-50 dark:bg-teal-500/10 text-teal-600 dark:text-teal-400">{{ grade.verdict }}</span>
         </div>
-        <p class="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">{{ grade.feedback }}</p>
+        <p class="text-xs text-text-secondary leading-relaxed">{{ grade.feedback }}</p>
         <div v-if="grade.missing_points && grade.missing_points.length" class="mt-1.5">
-          <p class="text-[11px] text-slate-400">遗漏要点：</p>
+          <p class="text-[11px] text-text-tertiary">遗漏要点：</p>
           <ul class="text-[11px] text-rose-500 list-disc pl-4">
             <li v-for="(m, i) in grade.missing_points" :key="i">{{ m }}</li>
           </ul>
@@ -164,13 +162,13 @@ function optionState(key: string): 'correct' | 'wrong' | 'normal' {
         <ChevronDown class="w-3.5 h-3.5 transition-transform" :class="showAnswer ? 'rotate-180' : ''" />
       </button>
       <div v-if="showAnswer" class="mt-2 rounded-xl bg-teal-50/50 dark:bg-teal-900/10 border border-teal-100 dark:border-teal-500/20 p-3 text-xs leading-relaxed">
-        <p v-if="isObjective" class="text-slate-700 dark:text-slate-200">
+        <p v-if="isObjective" class="text-text-secondary">
           <span class="font-semibold text-emerald-600 dark:text-emerald-400">正确答案：</span>{{ question.answer }}
         </p>
-        <p v-if="isSubjective && question.reference_answer" class="text-slate-700 dark:text-slate-200">
+        <p v-if="isSubjective && question.reference_answer" class="text-text-secondary">
           <span class="font-semibold text-emerald-600 dark:text-emerald-400">参考答案：</span>{{ question.reference_answer }}
         </p>
-        <p v-if="question.explanation" class="text-slate-500 dark:text-slate-400 mt-1.5">
+        <p v-if="question.explanation" class="text-text-secondary mt-1.5">
           <span class="font-semibold">解析：</span>{{ question.explanation }}
         </p>
       </div>

@@ -23,6 +23,7 @@ from backend.api.dependencies.auth import (
     optional_verify_api_key,
     require_kb_access,
 )
+from backend.api.rate_limit import positive_int_env, request_rate_limiter
 from backend.api.routers.auth import get_current_user
 from backend.application.checkpointing.checkpointer import get_checkpointer_from_request
 from backend.application.event_stream.sse_encoder import SSEEncoder
@@ -34,6 +35,48 @@ from backend.storage.streaming import iter_minio_response
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/explore", tags=["explore"])
+
+
+async def enforce_anonymous_generation_limit(
+    request: Request,
+    auth: ApiKeyAuth = Depends(optional_verify_api_key),
+) -> None:
+    """匿名 explore 生成类请求的设备+IP 双桶限流。
+
+    explore 端点是 Agent API 上的匿名 LLM 消耗面（出题/讲解/追问都
+    触发模型推理），只有全局 IP 桶兜底；无凭据请求在此加设备桶（最强
+    界），设备头可伪造故同时保留 IP 桶封顶轮换滥用。登录请求不受影响。
+    """
+
+    if auth.api_key or auth.user_id != "guest":
+        return
+
+    buckets: list[tuple[str, int]] = []
+    device_id = (request.headers.get("X-Device-ID") or "").strip()
+    if device_id:
+        import hashlib
+
+        device_limit = positive_int_env("EXPLORE_ANON_RATE_PER_MINUTE", 30)
+        buckets.append(
+            (
+                "explore-anon-device:"
+                + hashlib.sha256(device_id.encode("utf-8")).hexdigest(),
+                device_limit,
+            )
+        )
+    ip_limit = positive_int_env("EXPLORE_ANON_RATE_PER_IP_PER_MINUTE", 300)
+    from backend.core.utils.client_ip import resolve_client_ip
+
+    buckets.append((f"explore-anon-ip:{resolve_client_ip(request)}", ip_limit))
+
+    for bucket_key, bucket_limit in buckets:
+        allowed, retry_after = await request_rate_limiter.allow(bucket_key, bucket_limit)
+        if not allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="请求过于频繁，请稍后重试",
+                headers={"Retry-After": str(retry_after)},
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -55,68 +98,72 @@ class ExploreDomainRequest(BaseModel):
 
 
 class TopicsRequest(ExploreDomainRequest):
-    kb_ids: list[str] | None = Field(default=None, description="知识库 ID 列表（取首个）")
+    kb_ids: list[str] | None = Field(default=None, max_length=50, description="知识库 ID 列表（取首个）")
     count: int = Field(default=20, ge=1, le=50, description="主题数量")
-    seed: str = Field(default="", description="聚焦方向（可选）")
-    model: str | None = Field(default=None, description="模型名称（可选）")
+    seed: str = Field(default="", max_length=200, description="聚焦方向（可选）")
+    model: str | None = Field(default=None, max_length=128, description="模型名称（可选）")
 
 
 class MapRequest(ExploreDomainRequest):
-    topic: str = Field(..., description="探索主题")
-    kb_ids: list[str] | None = None
+    topic: str = Field(..., max_length=200, description="探索主题")
+    kb_ids: list[str] | None = Field(default=None, max_length=50)
     max_children: int = Field(default=6, ge=1, le=20, description="一级子节点数量上限")
-    model: str | None = None
+    model: str | None = Field(default=None, max_length=128)
 
 
 class ExpandRequest(ExploreDomainRequest):
-    node_title: str = Field(..., description="待展开节点标题")
-    path: list[str] = Field(default_factory=list, description="从根到该节点的路径")
-    kb_ids: list[str] | None = None
+    node_title: str = Field(..., max_length=200)
+    path: list[str] = Field(default_factory=list, max_length=20, description="从根到该节点的路径")
+    kb_ids: list[str] | None = Field(default=None, max_length=50)
     max_children: int = Field(default=5, ge=1, le=20, description="子节点数量上限")
-    model: str | None = None
+    model: str | None = Field(default=None, max_length=128)
 
 
 class DetailRequest(ExploreDomainRequest):
-    node_title: str
-    path: list[str] = Field(default_factory=list)
-    kb_ids: list[str] | None = None
-    model: str | None = None
+    node_title: str = Field(..., max_length=200)
+    path: list[str] = Field(default_factory=list, max_length=20)
+    kb_ids: list[str] | None = Field(default=None, max_length=50)
+    model: str | None = Field(default=None, max_length=128)
 
 
 class DetailChatMessage(BaseModel):
-    role: str = Field(default="user")
-    content: str = Field(default="")
+    role: str = Field(default="user", max_length=16)
+    # 前端把助手长回答原样回显进 history，router 上界须与服务层「截断而非
+    # 拒绝」的语义相容（服务层每条截 500 字），这里只挡恶意体量。
+    content: str = Field(default="", max_length=20000)
 
 
 class DetailChatRequest(ExploreDomainRequest):
-    node_title: str
-    question: str
-    detail_content: str = Field(default="")
-    path: list[str] = Field(default_factory=list)
-    kb_ids: list[str] | None = None
-    model: str | None = None
-    history: list[DetailChatMessage] = Field(default_factory=list)
+    node_title: str = Field(..., max_length=200)
+    question: str = Field(..., max_length=2000)
+    detail_content: str = Field(default="", max_length=64000)
+    path: list[str] = Field(default_factory=list, max_length=20)
+    kb_ids: list[str] | None = Field(default=None, max_length=50)
+    model: str | None = Field(default=None, max_length=128)
+    history: list[DetailChatMessage] = Field(default_factory=list, max_length=20)
 
 
 class ResourcesRequest(ExploreDomainRequest):
-    node_title: str
-    kb_ids: list[str] | None = None
+    node_title: str = Field(..., max_length=200)
+    kb_ids: list[str] | None = Field(default=None, max_length=50)
     top_k: int = Field(default=8, ge=1, le=50)
 
 
 class QuizRequest(ExploreDomainRequest):
-    node_title: str
-    kb_ids: list[str] | None = None
-    types: list[str] = Field(default_factory=lambda: ["choice", "judge", "short"])
-    difficulty: str = Field(default="all")
+    node_title: str = Field(..., max_length=200)
+    kb_ids: list[str] | None = Field(default=None, max_length=50)
+    # 上界按合法题型全集（choice/multi/judge/short/calc 共 5 种）取值；
+    # 前端默认「全部」会发送 4 种，max_length=3 曾把默认出题请求整体 422。
+    types: list[str] = Field(default_factory=lambda: ["choice", "judge", "short"], max_length=5)
+    difficulty: str = Field(default="all", max_length=16)
     count: int = Field(default=6, ge=1, le=30)
-    model: str | None = None
+    model: str | None = Field(default=None, max_length=128)
 
 
 class GradeRequest(ExploreDomainRequest):
     question: dict[str, Any]
-    user_answer: str = ""
-    model: str | None = None
+    user_answer: str = Field(default="", max_length=4000)
+    model: str | None = Field(default=None, max_length=128)
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +194,7 @@ async def _authorized_first_kb(
 # 路由
 # ---------------------------------------------------------------------------
 
-@router.post("/topics")
+@router.post("/topics", dependencies=[Depends(enforce_anonymous_generation_limit)])
 async def explore_topics(
     payload: TopicsRequest,
     auth: ApiKeyAuth = Depends(optional_verify_api_key),
@@ -163,7 +210,7 @@ async def explore_topics(
     )
 
 
-@router.post("/map")
+@router.post("/map", dependencies=[Depends(enforce_anonymous_generation_limit)])
 async def explore_map(
     payload: MapRequest,
     auth: ApiKeyAuth = Depends(optional_verify_api_key),
@@ -179,7 +226,7 @@ async def explore_map(
     )
 
 
-@router.post("/expand")
+@router.post("/expand", dependencies=[Depends(enforce_anonymous_generation_limit)])
 async def explore_expand(
     payload: ExpandRequest,
     auth: ApiKeyAuth = Depends(optional_verify_api_key),
@@ -267,7 +314,7 @@ async def explore_resource_download(
     raise HTTPException(status_code=404, detail="找不到文档原始文件")
 
 
-@router.post("/quiz")
+@router.post("/quiz", dependencies=[Depends(enforce_anonymous_generation_limit)])
 async def explore_quiz(
     payload: QuizRequest,
     auth: ApiKeyAuth = Depends(optional_verify_api_key),
@@ -285,8 +332,13 @@ async def explore_quiz(
     )
 
 
-@router.post("/quiz/grade")
-async def explore_quiz_grade(payload: GradeRequest):
+@router.post("/quiz/grade", dependencies=[Depends(enforce_anonymous_generation_limit)])
+async def explore_quiz_grade(
+    payload: GradeRequest,
+    auth: ApiKeyAuth = Depends(optional_verify_api_key),
+):
+    # 判分走真实 LLM：此前是全 explore 唯一完全无鉴权依赖的端点（其余至少
+    # optional_verify_api_key），匿名方可用任意模型名免费消耗配额。
     return await svc.grade_answer(
         question=payload.question,
         user_answer=payload.user_answer,
@@ -295,7 +347,7 @@ async def explore_quiz_grade(payload: GradeRequest):
     )
 
 
-@router.post("/detail")
+@router.post("/detail", dependencies=[Depends(enforce_anonymous_generation_limit)])
 async def explore_detail(
     payload: DetailRequest,
     request: Request,
@@ -304,12 +356,16 @@ async def explore_detail(
 ):
     """知识点详解（SSE 流式）。
 
-    委托统一 AgentRuntime 执行 lightweight 工作流。路由层只负责探索式学习参数转换，
-    不再直接实例化具体智能体执行类。
+    委托统一 AgentRuntime 执行探索详解专用的 lightweight 工作流。普通问答仍使用
+    目标智能体的默认工作流，两类服务配置互不影响。
     """
     kb_id = await _authorized_first_kb(payload.kb_ids, auth, session)
+    # 详解 SSE 生成器不使用请求会话：返回前归还连接（流可达数十秒；
+    # 契约测试注入 None 会话，跳过）。
+    if session is not None:
+        await session.rollback()
     question = svc.build_detail_question(payload.node_title, payload.path)
-    agent_code = svc.resolve_agent_code(payload.domain)
+    runtime_config = svc.resolve_detail_runtime_config(payload.domain, payload.model)
 
     async def stream_generator():
         try:
@@ -328,17 +384,20 @@ async def explore_detail(
             service = AgentService(checkpointer=checkpointer)
             agent_request = AgentRequest(
                 question=question,
-                agent_code=agent_code,
+                agent_code=runtime_config.agent_code,
                 user_id=user_id,
                 conversation_id=thread_id,
-                requested_workflow="lightweight",
+                requested_workflow=runtime_config.workflow_name,
                 selected_kb_ids=[kb_id] if kb_id else [],
                 selected_skills=[],
-                model_name=svc.resolve_learning_fast_model_name(payload.model),
+                model_name=runtime_config.model_name,
                 use_search=False,  # 探索式学习详解仅使用知识库，不启用联网搜索。
                 subagent_enabled=False,
                 thinking_enabled=False,
-                metadata={"source": "explore.detail"},
+                metadata={
+                    "source": "explore.detail",
+                    "runtime_config_scope": f"explore.detail.{runtime_config.domain}",
+                },
             )
 
             from backend.core.utils.async_tasks import iterate_until_disconnected
@@ -348,8 +407,10 @@ async def explore_detail(
             async for event in iterate_until_disconnected(upstream, request):
                 yield encoder.encode(event)
         except Exception as exc:  # noqa: BLE001
+            # 内部异常细节只记日志，不回传客户端（SSE 绕过全局 handler 的兜底，
+            # str(exc) 会泄露内部路径/组件名/依赖错误串）。
             logger.exception("[Explore] 详解流式失败: %s", exc)
-            yield f"data: {json.dumps({'error': str(exc)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'error': '服务处理出现错误，请稍后重试'}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(
@@ -363,7 +424,7 @@ async def explore_detail(
     )
 
 
-@router.post("/detail/chat")
+@router.post("/detail/chat", dependencies=[Depends(enforce_anonymous_generation_limit)])
 async def explore_detail_chat(
     payload: DetailChatRequest,
     request: Request,
@@ -372,6 +433,9 @@ async def explore_detail_chat(
 ):
     """围绕当前知识点详解输出进行多轮追问（SSE 流式）。"""
     kb_id = await _authorized_first_kb(payload.kb_ids, auth, session)
+    # 追问 SSE 生成器不使用请求会话：返回前归还连接（None 会话跳过）。
+    if session is not None:
+        await session.rollback()
     subject = svc.resolve_subject(payload.domain)
 
     async def stream_generator():

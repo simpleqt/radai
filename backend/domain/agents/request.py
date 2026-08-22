@@ -19,6 +19,7 @@ class AgentRequest:
     use_search: bool = True
     subagent_enabled: bool = False
     thinking_enabled: bool = True
+    deep_retrieval: bool = False
     attachments: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     # Runtime control fields are deliberately separate from client metadata.

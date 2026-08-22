@@ -10,6 +10,13 @@ import yaml
 
 from backend.domain.agents.runtime_agent import RuntimeAgentSpec
 
+# Loader 实例随 AgentService 按请求构造,实例缓存跨请求无效;签名命中的
+# 解析结果按配置路径共享在进程级(specs 视为不可变,返回时浅拷贝外层 dict)。
+_RUNTIME_AGENT_CACHE: dict[
+    str, tuple[tuple[int, int], dict[str, RuntimeAgentSpec]]
+] = {}
+_RUNTIME_AGENT_CACHE_LOCK = threading.RLock()
+
 
 class RuntimeAgentLoader:
     _SPEC_FIELDS = {
@@ -47,9 +54,8 @@ class RuntimeAgentLoader:
             / "agents"
             / "runtime_agents.yaml"
         )
-        self._cache: dict[str, RuntimeAgentSpec] | None = None
-        self._cache_signature: tuple[int, int] | None = None
-        self._cache_lock = threading.RLock()
+        self._cache_key = str(self._config_path)
+        self._cache_lock = _RUNTIME_AGENT_CACHE_LOCK
 
     def get(self, name: str) -> RuntimeAgentSpec:
         normalized = self._normalize_name(name)
@@ -74,8 +80,9 @@ class RuntimeAgentLoader:
                 f"Runtime agent config not found: {self._config_path}"
             ) from None
         signature = (int(stat.st_mtime_ns), int(stat.st_size))
-        if self._cache is not None and self._cache_signature == signature:
-            return dict(self._cache)
+        cached = _RUNTIME_AGENT_CACHE.get(self._cache_key)
+        if cached is not None and cached[0] == signature:
+            return dict(cached[1])
         raw = yaml.safe_load(self._config_path.read_text(encoding="utf-8")) or {}
         if not isinstance(raw, dict):
             raise ValueError(
@@ -106,16 +113,14 @@ class RuntimeAgentLoader:
                 f"Runtime agent config declares no agents: {self._config_path}"
             )
         self._validate_planner_aliases(specs)
-        self._cache = specs
-        self._cache_signature = signature
+        _RUNTIME_AGENT_CACHE[self._cache_key] = (signature, specs)
         return dict(specs)
 
     def invalidate_cache(self) -> None:
         """Force the next request to reload the manifest."""
 
         with self._cache_lock:
-            self._cache = None
-            self._cache_signature = None
+            _RUNTIME_AGENT_CACHE.pop(self._cache_key, None)
 
     def _parse_spec(self, name: str, raw: dict[str, Any]) -> RuntimeAgentSpec:
         unknown_fields = set(raw) - self._SPEC_FIELDS

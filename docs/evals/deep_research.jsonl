@@ -1,0 +1,1 @@
+{"case_id":"sample-deep-research","run_id":"replace-with-run-id","expected_status":"completed","required_tools":["multi_kb_search"],"min_handoffs":1,"min_context_packs":1,"expected_answer_contains":"替换为期望结论片段"}

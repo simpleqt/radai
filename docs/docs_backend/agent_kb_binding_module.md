@@ -1,7 +1,7 @@
 # 智能体-知识库动态绑定模块
 
-> **最后同步**：2026-06-08  
-> 📊 KB 表与入库 → [infrastructure_module.md](./infrastructure_module.md) · [10_knowledge_base.md](../../plans/qa/10_knowledge_base.md)
+> **最后同步**：2026-07-09
+> 📊 KB 表与入库 → [infrastructure_module.md](./infrastructure_module.md) · 自研入库上手 → [self_ingestion_quickstart.md](../self_ingestion_quickstart.md)
 
 ## 1. 功能概述
 
@@ -12,7 +12,7 @@ init_agent_bindings.py / PUT /api/v1/agents/{code}/kbs
 agents + agent_kb_bindings (MySQL)
         │
         ├─► GET /api/v2/agent-runtime/profiles/{agent_code}/info → 前端 KB 名称/排序
-        └─► AgentInfoService / ProfiledAgentExecutor 读取默认 kb_ids
+        └─► AgentInfoService / KnowledgeBaseAccessPolicy / ProfiledAgentExecutor 读取默认 kb_ids
                 └─► multi_kb_search → retrieve_context 每库并行
 ```
 
@@ -20,6 +20,7 @@ agents + agent_kb_bindings (MySQL)
 
 - 每个智能体绑定的知识库列表**可在运行时通过管理接口动态变更**，无需重启服务；
 - 前端知识库选择器的**名称标签**由后端从 `knowledge_bases` 表实时查询，不再在前端代码中维护映射表；
+- 绑定关系与 KB 的 `ingestion_backend` / `retrieval_backend` **独立**：Agent 通过 `multi_kb_search` 检索时，各 KB 按自身后端路由 legacy DirectRetriever 或 self SelfDirectRetrieverV2；
 - 提供完整的 **RESTful 管理 API**，支持对智能体及其知识库绑定进行增删改查。
 
 ---
@@ -57,8 +58,10 @@ agents + agent_kb_bindings (MySQL)
 
 | agent_code | agent_name | 绑定的 KB ID |
 | :--- | :--- | :--- |
-| `ne` | 核电子学智能体 | `<kb_id_ne>`（核电子学知识库）、`<kb_id_paper>`（核电子学期刊） |
-| `csh` | CSH-AI 水文地质智能体 | `<kb_id_csh>`（CSH 污染场地修复库，`domain` Profile） |
+| `ne` | 核电子学智能体 | `c056bf59-…`（核电子学知识库）、`de4ccde7-…`（核电子学期刊） |
+| `csh` / `csh_full_feature` | CSH-AI 水文地质智能体 | `b4c3f145-de5f-42fb-88de-2d4856d57460`（CSH 污染场地修复库，`domain` Profile） |
+
+> 当前运行时 profile code 为 `ne` / `csh`。历史数据库中可能仍存在 `ne_full_feature` / `csh_full_feature`，`AgentCodeResolver` 与 `get_runtime_agent_kb_ids()` 会做兼容映射并优先读取当前 profile key。
 
 ---
 
@@ -74,13 +77,15 @@ backend/
 │   └── init_agent_bindings.py    # 一次性初始化脚本（预置智能体及其默认知识库）
 ├── api/
 │   └── routers/
-│       └── agents.py             # 管理 API：GET/POST/PUT/DELETE /api/v1/agents
+│       ├── agents.py             # 管理 API：GET/POST/PUT/DELETE /api/v1/agents
+│       ├── agent_skills.py       # Agent-Skill 绑定 API：/api/v1/agents/{code}/skills
+│       └── agent_runtime_v2.py   # /api/v2 聚合 agent-runtime / guest / explore
 ├── application/
 │   └── agents/
 │       └── info_service.py       # 标准 info 响应组装（含动态 KB 查询）
-└── custom/
-    └── api/v2/
-        └── agent_runtime.py      # 统一 Agent Runtime API
+└── application/
+    └── policies/
+        └── knowledge_base_access.py # bound_only / bound_or_selected / owner/default 访问策略
 ```
 
 ---
@@ -112,6 +117,7 @@ class AgentKnowledgeBase(Base):
 | 函数 | 说明 |
 | :--- | :--- |
 | `get_agent_kb_ids(session, agent_code)` | 返回该智能体已绑定的 KB ID 列表，按 `sort_order` 排序 |
+| `get_runtime_agent_kb_ids(session, profile_code)` | 按 `ne`/`csh` 与旧 `*_full_feature` 编码顺序解析运行时绑定 |
 | `get_agent(session, agent_code)` | 获取单个智能体（含绑定） |
 | `list_agents(session, active_only)` | 列出所有智能体（含绑定） |
 | `upsert_agent(session, agent_code, ...)` | 创建或更新智能体元数据 |
@@ -185,11 +191,13 @@ const availableKbs = computed(() => {
 ```json
 {
   "kb_ids": [
-    { "kb_id": "<kb_id_ne>", "sort_order": 0 },
-    { "kb_id": "<kb_id_paper>", "sort_order": 1 }
+    "c056bf59-6091-45ed-98cb-e2e860580a69",
+    "de4ccde7-b286-4e49-bd8c-9dd37bd61878"
   ]
 }
 ```
+
+`set_agent_kb_bindings()` 会按数组顺序写入 `sort_order`；若要设置单条绑定排序，使用 `POST /api/v1/agents/{agent_code}/kbs` 的 `{ "kb_id": "...", "sort_order": 1 }`。
 
 **智能体详情响应（`GET /api/v1/agents/ne`）：**
 
@@ -201,8 +209,8 @@ const availableKbs = computed(() => {
   "is_active": true,
   "sort_order": 0,
   "kb_bindings": [
-    { "kb_id": "<kb_id_ne>", "sort_order": 0 },
-    { "kb_id": "<kb_id_paper>", "sort_order": 1 }
+    { "kb_id": "c056bf59-6091-45ed-98cb-e2e860580a69", "sort_order": 0 },
+    { "kb_id": "de4ccde7-b286-4e49-bd8c-9dd37bd61878", "sort_order": 1 }
   ]
 }
 ```
@@ -270,8 +278,8 @@ GET /api/v2/agent-runtime/profiles/{agent_code}/info
                     ▼
 POST /api/v2/agent-runtime/query
        │
-       ├─ 若请求未携带 kb_ids，再次查 DB 取默认绑定
-       │
+       ├─ 若请求未携带 kb_ids，由 KnowledgeBaseAccessPolicy 解析绑定/默认库
+       ├─ 若请求携带 kb_ids，校验其为当前 agent 绑定库、默认库或当前用户 owner 库
        └─ 将 kb_ids 传入 ProfiledAgentExecutor / ToolAssemblyPipeline 执行
 ```
 
@@ -279,7 +287,7 @@ POST /api/v2/agent-runtime/query
 
 ## 8. 注意事项
 
-1. **唯一事实源**：当前默认知识库来源于 DB 绑定与 profile 组合，不再从旧 FullFeatureAgent 常量兜底。
+1. **唯一事实源**：当前默认知识库来源于 DB 绑定与 profile 的 `kb_policy` 组合，不再从旧 FullFeatureAgent 常量兜底。
 2. **排序**：`agent_kb_bindings.sort_order` 控制前端知识库选择器中各 KB 的展示顺序，`agents.sort_order` 控制多智能体切换列表的顺序。
 3. **删除知识库时**：由于没有 DB 级外键约束，删除 `knowledge_bases` 中的某个 KB 后，需手动或通过管理接口同步删除 `agent_kb_bindings` 中对应的绑定行。
 4. **新增智能体**：需在 `agents` 表与 `agent_kb_bindings` 中补齐数据，并新增对应 profile YAML；运行入口仍复用统一的 `agent-runtime` API。

@@ -40,6 +40,9 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy import (
+    delete as _sa_delete,
+)
 from sqlalchemy.engine import Connection, Engine, RowMapping
 from sqlalchemy.exc import IntegrityError, OperationalError
 
@@ -170,6 +173,51 @@ class SQLAlchemyAgentRuntimeStore:
         """Explicitly create the portable runtime tables and indexes."""
 
         await asyncio.to_thread(_METADATA.create_all, self.engine)
+
+    async def purge_terminal_runs_before(
+        self, cutoff_epoch: float, *, limit: int = 500
+    ) -> int:
+        """删除 ``updated_at`` 早于 cutoff 的终态 run（级联 agents/events）。
+
+        供保留期 GC 使用：观测/恢复数据只对近期 run 有价值，长期终态行
+        只会线性膨胀 MySQL。分批删除，返回本轮删除的 run 数。
+        """
+        return await asyncio.to_thread(
+            self._purge_terminal_runs_before_sync, cutoff_epoch, limit
+        )
+
+    def _purge_terminal_runs_before_sync(
+        self, cutoff_epoch: float, limit: int
+    ) -> int:
+        if not isinstance(cutoff_epoch, int | float):
+            raise TypeError("cutoff_epoch must be numeric")
+        batch_limit = max(1, int(limit))
+        terminal = sorted(TERMINAL_AGENT_STATUSES)
+        with self.engine.begin() as connection:
+            root_ids = list(
+                connection.execute(
+                    select(_RUNS.c.root_id)
+                    .where(
+                        _RUNS.c.status.in_(terminal),
+                        _RUNS.c.updated_at < float(cutoff_epoch),
+                    )
+                    .limit(batch_limit)
+                )
+                .scalars()
+                .all()
+            )
+            if not root_ids:
+                return 0
+            connection.execute(
+                _sa_delete(_EVENTS).where(_EVENTS.c.root_id.in_(root_ids))
+            )
+            connection.execute(
+                _sa_delete(_AGENTS).where(_AGENTS.c.root_id.in_(root_ids))
+            )
+            connection.execute(
+                _sa_delete(_RUNS).where(_RUNS.c.root_id.in_(root_ids))
+            )
+        return len(root_ids)
 
     async def upsert_run(
         self,

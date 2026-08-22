@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import uuid
 from collections.abc import AsyncIterator
@@ -28,8 +29,8 @@ from backend.application.agent_executors.image_url_registry import (
     StreamingTokenResolver,
     resolve_image_tokens,
 )
-from backend.application.agents.profile_loader import AgentProfileLoader
 from backend.application.agent_service import AgentService
+from backend.application.agents.profile_loader import AgentProfileLoader
 from backend.application.checkpointing.checkpointer import get_checkpointer_from_request
 from backend.application.event_stream.thinking_filter import split_thinking_segments
 from backend.application.suggestions.follow_up_service import (
@@ -58,8 +59,19 @@ _DEVICE_ID_PATTERNS = (
 
 
 def _device_scope_id(raw_device_id: str) -> str:
-    """Turn a high-entropy browser token into a non-forgeable internal scope."""
-    secret = (app_settings.minio_secret_key or "").encode("utf-8")
+    """Turn a high-entropy browser token into a non-forgeable internal scope.
+
+    作用域是持久身份（目录行/checkpoint 都挂在它下面），密钥源必须与
+    URL 签名链解耦：URL 签名可随 internal_api_secret/URL_SIGNING_SECRET
+    轮换，而这里换钥会让全部匿名访客丢历史。固定回 minio_secret_key
+    派生（2f5f216 之前的原始行为），GUEST_DEVICE_SCOPE_SECRET 仅在
+    显式配置时覆盖（轮换需自行迁移历史）。
+    """
+    # fallback 取值不 strip：原始派生（2f5f216 之前）用的是未处理的
+    # minio_secret_key 原文；若密钥带首尾空白，strip 会改变所有历史
+    # 作用域哈希（生产密钥无空白，此分支仅为逐字节一致性保留原语义）。
+    secret = (os.getenv("GUEST_DEVICE_SCOPE_SECRET", "").strip()
+              or (app_settings.minio_secret_key or "")).encode("utf-8")
     if not secret:
         raise RuntimeError("guest device signing secret is unavailable")
     return hmac.new(secret, raw_device_id.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
@@ -102,6 +114,29 @@ class GuestQueryRequest(BaseModel):
         return self
 
 
+def _assert_guest_agent_allowed(agent_code: str) -> None:
+    """访客可用的智能体白名单：默认覆盖三个公开站点的访客入口。
+
+    ne（主站/访客站）、csh（csh-ai 站）、fmca（fmca 站）的匿名模式
+    都走 /guest/query 且各自默认 profile 即站点自身；其余已注册
+    profile（如内部审计智能体）默认不对匿名开放，防止借 ownerless
+    知识库触达敏感内容。部署可用 GUEST_ALLOWED_AGENT_CODES 显式
+    收紧或扩展（逗号分隔，大小写不敏感）。
+    """
+    allowed_codes = {
+        item.strip().lower()
+        for item in os.getenv("GUEST_ALLOWED_AGENT_CODES", "ne,csh,fmca").split(",")
+        if item.strip()
+    }
+    if agent_code.lower() not in allowed_codes:
+        raise HTTPException(status_code=403, detail="该智能体不对访客开放")
+
+
+def guest_auth_role(authenticated: bool) -> str:
+    """访客请求的 auth_role 派生（写工具守卫的前提身份）。"""
+    return "user" if authenticated else "guest"
+
+
 def _guest_workflow_name(agent_code: str) -> str:
     """Resolve the guest workflow from the registered profile.
 
@@ -131,6 +166,7 @@ async def _iter_guest_edge_events(
     conversation_id: str,
     internal_tid: str,
     guest_workflow: str,
+    authenticated: bool,
 ) -> AsyncIterator[dict]:
     service = AgentService(checkpointer=get_checkpointer_from_request(request))
     agent_request = AgentRequest(
@@ -145,6 +181,9 @@ async def _iter_guest_edge_events(
         use_search=payload.use_search,
         subagent_enabled=False,
         thinking_enabled=False,
+        # 匿名访客必须是 "guest" 身份：缺省会落到 "user"，使
+        # tool_write_requires_authenticated_user 写工具守卫整体失效。
+        auth_role=guest_auth_role(authenticated),
         metadata={"source": "guest.query"},
     )
     upstream = service.run_stream(agent_request)
@@ -189,6 +228,8 @@ async def query_guest(
 ):
     """访客流式问答（SSE）。登录态携带 Bearer Token 时写入用户会话。"""
     try:
+        _assert_guest_agent_allowed(payload.agent_code)
+
         try:
             guest_workflow = await asyncio.to_thread(
                 _guest_workflow_name,
@@ -261,6 +302,12 @@ async def query_guest(
         )
 
         async def stream_generator():
+            from backend.application.conversations.thread_guard import (
+                start_lease_heartbeat,
+                stop_lease_heartbeat,
+            )
+
+            lease_heartbeat_task = start_lease_heartbeat(thread_lease)
             chunk_count = 0
             in_thought = False
             think_carry = ""
@@ -302,6 +349,7 @@ async def query_guest(
                 conversation_id=conversation_id,
                 internal_tid=internal_tid,
                 guest_workflow=guest_workflow,
+                authenticated=bool(authenticated_user_id),
             )
             try:
                 async for event in iterate_until_disconnected(edge_events, request):
@@ -390,9 +438,53 @@ async def query_guest(
                 yield f"data: {json.dumps({'error': '访客智能体暂时不可用'}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
+                stop_lease_heartbeat(lease_heartbeat_task)
                 if follow_up_stream is not None:
                     follow_up_stream.cancel()
                 await close_async_iterator_safely(edge_events)
+                if thread_lease is not None:
+                    thread_lease.release()
+
+        from backend.application.conversations.thread_guard import (
+            ConversationThreadBusy,
+            acquire_conversation_thread,
+        )
+
+        # Two live guest streams on one conversation would fork the same
+        # checkpoint and interleave state, mirroring the Agent API guard.
+        # The lease key is the internal thread key for both branches:
+        # anonymous conversations are already device-scoped, and
+        # authenticated ones must be user-scoped so two users sharing an
+        # external alias never falsely conflict.
+        try:
+            thread_lease = acquire_conversation_thread(internal_tid)
+        except ConversationThreadBusy as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "conversation_thread_busy",
+                    "message": str(exc),
+                    "thread_id": external_tid,
+                },
+            ) from exc
+
+        # 流式生成器不使用请求会话：返回前结束读事务归还连接，整场 SSE
+        # 不再钉住一个池连接（kb 过滤查询已结束）。
+        await session.rollback()
+
+        # 采集只在请求被接受后进行：被 409 拒绝的并发提问不灌学情统计。
+        from backend.application.question_analytics import schedule_question_collection
+
+        schedule_question_collection(
+            question=payload.question,
+            user_id=user_id,
+            agent_code=payload.agent_code,
+            role=auth.role,
+            thread_id=external_tid,
+            workflow=guest_workflow,
+            model_name=payload.model,
+            is_guest=authenticated_user_id is None,
+        )
 
         return StreamingResponse(
             stream_generator(),

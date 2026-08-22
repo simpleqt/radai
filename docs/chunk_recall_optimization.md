@@ -2,6 +2,7 @@
 
 > **文档状态**：✅ 补丁已集成（`lightrag_chunk_patch.py` 等，见 §8）。  
 > **现行检索主路径**：生产 Stage-1 为 **DirectRetriever 四路** + Profile 驱动 Stage-2（垂直库 **MMR_ONLY**），非下文所述 LightRAG 内置 `aquery_data` 单一路径。  
+> **适用边界**：本文补丁只作用于 legacy LightRAG / fallback 链路；self_ingestion 使用 `SelfDirectRetrieverV2`、Milvus `chunks_v2/entities_v2`、Redis v2 BM25 inverted postings 与 Nebula `relation_v2`，不依赖 LightRAG `text_chunks_db`。
 > **算法主文档**：[知识库算法和架构.md](./知识库算法和架构.md)
 
 ---
@@ -104,6 +105,7 @@ apply_no_truncation_patch()
 - **Path-C**（`chunk_searcher.py`）直接查询 Milvus `chunks_vdb`，不依赖 LightRAG round-robin，是生产 chunk 召回主路径。
 - **实体链路拉 chunk** 仍可能走 `get_chunks_with_milvus_fallback`（`lightrag_chunk_patch.py`），用于弥补 Redis `text_chunks` 缺失。
 - 垂直库 Stage-2 使用 **MMR_ONLY**，不再经过 PPR；本文 §5 中含 PPR 的步骤仅适用于 `FULL` Profile 或 LightRAG 回退路径。
+- **self_ingestion** 不走本补丁：chunk 语料由 `CommitWriter` 写入 Redis v2 BM25 postings 和 Milvus `{kb_code}_chunks_v2`，repair 通过 staging payload 重放。
 
 ## 7. 后续建议
 
@@ -122,7 +124,7 @@ apply_no_truncation_patch()
 ### 新增文件
 - `backend/rag/utils/lightrag_chunk_patch.py` - Milvus Fallback Patch
 - `backend/rag/utils/lightrag_no_truncation_patch.py` - 禁用所有硬编码截断 Patch
-- `backend/rag/utils/chunk_query_fallback.py` - Fallback 工具函数
+- `backend/rag/utils/lightrag_chunk_patch.py` - LightRAG chunk 查询与 Milvus fallback
 - `backend/scripts/restore_chunks_from_milvus.py` - 数据恢复脚本
 - `backend/scripts/refactor_entity_names.py` - 实体名称重构脚本
 - `backend/scripts/test_no_truncation.py` - 测试脚本

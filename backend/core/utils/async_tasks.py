@@ -70,7 +70,35 @@ def consume_background_task_result(task: asyncio.Future[Any]) -> None:
     except (asyncio.CancelledError, StopAsyncIteration):
         pass
     except Exception:
-        logger.debug("后台异步清理任务失败", exc_info=True)
+        logger.warning("后台异步清理任务失败", exc_info=True)
+
+
+async def reap_task_bounded(
+    task: asyncio.Future[Any] | None,
+    *,
+    timeout: float = 1.0,
+) -> bool:
+    """Cancel a still-running task and observe it within a bounded window.
+
+    这是流式管线里反复手写的「cancel + 有界 wait + done 回调观察」模式的
+    共享实现:清理路径绝不无限等待一个可能阻塞在满队列 put/未响应取消的
+    任务。已完成的任务原样返回(其结果/异常由调用方业务逻辑消费,这里
+    不重复读取以免产生虚假的清理告警)。
+
+    Returns True when the task finished (or was ``None``); False when the
+    cancellation did not land within *timeout* — a done-callback will observe
+    the eventual result so asyncio never reports it as lost.
+    """
+
+    if task is None or task.done():
+        return True
+    task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=max(0.0, timeout))
+    if not done:
+        task.add_done_callback(consume_background_task_result)
+        return False
+    consume_background_task_result(task)
+    return True
 
 
 async def close_async_iterator_safely(
@@ -116,7 +144,7 @@ async def close_async_iterator_safely(
     try:
         close_task = asyncio.ensure_future(iterator.aclose())
     except Exception:
-        logger.debug("创建异步迭代器关闭任务失败", exc_info=True)
+        logger.warning("创建异步迭代器关闭任务失败", exc_info=True)
         return False
     # Register the observer immediately.  The caller itself may be cancelled
     # while awaiting cleanup; without an eager callback an implicit
@@ -131,6 +159,6 @@ async def close_async_iterator_safely(
     except (asyncio.CancelledError, StopAsyncIteration):
         return True
     except Exception:
-        logger.debug("关闭异步迭代器失败", exc_info=True)
+        logger.warning("关闭异步迭代器失败", exc_info=True)
         return False
     return True

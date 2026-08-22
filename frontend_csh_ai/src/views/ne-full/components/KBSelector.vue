@@ -36,15 +36,14 @@ const isSelected = (kbId: string) => props.selectedKbs.includes(kbId);
       :key="kb.id"
       @click="toggleKb(kb.id)"
       class="cursor-pointer px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider transition-all duration-300 hover:-translate-y-0.5 flex items-center space-x-1.5 border"
-      :class="[
-        isSelected(kb.id) 
-          ? 'bg-emerald-50 border-emerald-200 text-emerald-600 shadow-sm shadow-emerald-100' 
-          : 'bg-white border-slate-200 text-slate-400 opacity-60 hover:opacity-100'
+      :class="[ isSelected(kb.id) 
+          ? 'bg-emerald-50 border-emerald-200 text-emerald-600 shadow-sm' 
+          : 'bg-surface border-border-subtle text-text-tertiary opacity-60 hover:opacity-100'
       ]"
     >
       <div 
         class="w-1.5 h-1.5 rounded-full transition-colors"
-        :class="[isSelected(kb.id) ? 'bg-emerald-500' : 'bg-slate-300']"
+        :class="[isSelected(kb.id) ? 'bg-emerald-500' : 'bg-surface-sunken']"
       ></div>
       <span>{{ kb.label }}</span>
     </div>

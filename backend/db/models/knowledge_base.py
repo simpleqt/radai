@@ -23,8 +23,12 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 
-from backend.db.models import Base
+from backend.db.models.base import Base
 from backend.domain.knowledge_base.backend_policy import LEGACY_BACKEND
+
+# MySQL 主键保持 BIGINT;SQLite 只有 INTEGER PRIMARY KEY 才走 rowid 自增,
+# 与 skill.py 的既有模式一致,使内存 SQLite 契约测试可以建表插行。
+_AUTOINCREMENT_ID = BigInteger().with_variant(Integer, "sqlite")
 
 
 class KnowledgeBaseStatus(enum.Enum):
@@ -133,7 +137,7 @@ class KnowledgeBaseAcl(Base):
 
     __tablename__ = "knowledge_base_acl"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_AUTOINCREMENT_ID, primary_key=True, autoincrement=True)
     kb_id = Column(String(36), nullable=False, index=True)
     subject_type = Column(String(16), nullable=False, default="user")
     subject_id = Column(String(64), nullable=False)
@@ -162,7 +166,7 @@ class KnowledgeBaseDocument(Base):
 
     __tablename__ = "kb_documents"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_AUTOINCREMENT_ID, primary_key=True, autoincrement=True)
     kb_id = Column(
         String(36),
         ForeignKey("knowledge_bases.kb_id"),
@@ -237,6 +241,9 @@ class KnowledgeBaseDocument(Base):
         Index("idx_kb_doc_sort", "kb_id", "category_path", "sort_order"),
         Index("idx_kb_doc_hash", "kb_id", "source_hash"),
         Index("idx_kb_doc_visible", "kb_id", "visible_at"),
+        # 管理端文档列表默认按 created_at DESC 分页（WHERE kb_id=），
+        # 此前无覆盖索引走全库 filesort。
+        Index("idx_kb_doc_created", "kb_id", "created_at"),
         {"comment": "知识库文档关联表"},
     )
 
@@ -249,7 +256,7 @@ class KnowledgeBaseDirectory(Base):
 
     __tablename__ = "kb_directories"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_AUTOINCREMENT_ID, primary_key=True, autoincrement=True)
     kb_id = Column(
         String(36),
         ForeignKey("knowledge_bases.kb_id"),
@@ -305,7 +312,7 @@ class PendingFile(Base):
 
     __tablename__ = "kb_pending_files"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_AUTOINCREMENT_ID, primary_key=True, autoincrement=True)
     upload_id = Column(String(64), nullable=False, index=True, comment="上传批次ID")
     kb_id = Column(
         String(36),
@@ -359,6 +366,9 @@ class PendingFile(Base):
         Index("idx_pending_created", "created_at"),
         Index("idx_pending_backend", "ingestion_backend"),
         Index("idx_pending_hash", "kb_id", "source_hash"),
+        # 用户面 /uploads/pending 列表按 (created_by, created_at desc) 轮询，
+        # 此前只有单列 created_at 索引，行数增长后全表扫描+filesort。
+        Index("idx_pending_creator_time", "created_by", "created_at"),
         {"comment": "待入库文件缓存表"},
     )
 
@@ -416,7 +426,7 @@ class SelfIngestChunk(Base):
 
     __tablename__ = "kb_self_chunks"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_AUTOINCREMENT_ID, primary_key=True, autoincrement=True)
     kb_id = Column(
         String(36),
         ForeignKey("knowledge_bases.kb_id"),

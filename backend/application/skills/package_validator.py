@@ -30,7 +30,16 @@ ALLOWED_KB_BINDING_MODES = {
     "user_selected",
     "fixed",
 }
-SKILL_KEY_RE = re.compile(r"^[a-z][a-z0-9-]{2,63}$")
+# Skill keys are persisted as identifiers and directory names, so keep the
+# character set deliberately narrow while allowing Chinese package names.
+# The two ranges cover CJK Unified Ideographs and Extension A.
+SKILL_KEY_RE = re.compile(
+    r"^[a-z\u3400-\u4dbf\u4e00-\u9fff]"
+    r"[a-z0-9\u3400-\u4dbf\u4e00-\u9fff-]{2,63}$"
+)
+SKILL_KEY_FORMAT_HINT = (
+    "3-64 个字符，只能包含小写字母、数字、连字符或中文，且不能以数字或连字符开头"
+)
 SEMVER_RE = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
@@ -243,7 +252,9 @@ class SkillPackageValidator:
         description = str(raw.get("description") or "").strip()
         domain = str(raw.get("domain") or "").strip()
         if not SKILL_KEY_RE.fullmatch(name):
-            raise SkillPackageValidationError("Skill name 必须匹配 ^[a-z][a-z0-9-]{2,63}$")
+            raise SkillPackageValidationError(
+                f"Skill name 格式错误：{SKILL_KEY_FORMAT_HINT}"
+            )
         if not SEMVER_RE.fullmatch(version):
             raise SkillPackageValidationError("Skill version 必须是合法 SemVer")
         if not description or len(description) > 1000:

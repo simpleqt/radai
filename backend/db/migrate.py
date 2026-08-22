@@ -16,9 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import text
-
-from backend.db.connection import get_engine
+from sqlalchemy import inspect, text
 
 ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS_DIR = ROOT / "scripts" / "migrations"
@@ -49,7 +47,7 @@ MIGRATIONS: tuple[Migration, ...] = (
     ),
     Migration(
         "202607100005_add_skill_management_tables",
-        MIGRATIONS_DIR / "add_skill_management_tables.sql",
+        MIGRATIONS_DIR / "add_skill_management_tables.py",
     ),
     Migration(
         "202607100006_add_user_display_name",
@@ -107,12 +105,47 @@ MIGRATIONS: tuple[Migration, ...] = (
         "202607230002_add_user_file_artifact_key",
         MIGRATIONS_DIR / "add_user_file_artifact_key.py",
     ),
+    Migration(
+        "202608110001_add_course_eval_tables",
+        MIGRATIONS_DIR / "add_course_eval_tables.py",
+    ),
+    Migration(
+        "202608130001_add_message_feedback_table",
+        MIGRATIONS_DIR / "add_message_feedback_table.sql",
+    ),
+    Migration(
+        "202608130002_add_api_key_hash",
+        MIGRATIONS_DIR / "add_api_key_hash.sql",
+    ),
+    Migration(
+        "202608150001_add_teacher_question_analytics",
+        MIGRATIONS_DIR / "add_teacher_question_analytics.sql",
+    ),
+    Migration(
+        "202608170001_widen_course_question_user_id",
+        MIGRATIONS_DIR / "widen_course_question_user_id.sql",
+    ),
+    Migration(
+        "202608170002_add_question_bank_tables",
+        MIGRATIONS_DIR / "add_question_bank_tables.sql",
+    ),
+    Migration(
+        "202608190001_add_kb_pending_files_creator_index",
+        MIGRATIONS_DIR / "add_kb_pending_files_creator_index.sql",
+    ),
+    Migration(
+        "202608190002_add_kb_doc_created_index",
+        MIGRATIONS_DIR / "add_kb_doc_created_index.sql",
+    ),
 )
 
 # Python wrapper migrations can execute other source files.  Their recorded
 # checksum must cover the full executable migration unit, otherwise a change in
 # a child script would silently bypass drift detection.
 MIGRATION_DEPENDENCIES: dict[str, tuple[Path, ...]] = {
+    "202607100005_add_skill_management_tables": (
+        MIGRATIONS_DIR / "add_skill_management_tables.sql",
+    ),
     "202607100010_run_self_ingestion_migrations": (
         MIGRATIONS_DIR / "ensure_self_ingestion_phase1.py",
         MIGRATIONS_DIR / "add_self_ingestion_compat_columns.py",
@@ -120,7 +153,83 @@ MIGRATION_DEPENDENCIES: dict[str, tuple[Path, ...]] = {
         MIGRATIONS_DIR / "add_kb_document_sort_order.py",
         MIGRATIONS_DIR / "drop_self_ingestion_mysql_graph_tables.py",
     ),
+    "202608110001_add_course_eval_tables": (
+        MIGRATIONS_DIR / "add_course_eval_base_tables.sql",
+        MIGRATIONS_DIR / "add_course_eval_data_tables.sql",
+        MIGRATIONS_DIR / "add_course_eval_report_tables.sql",
+    ),
 }
+
+
+def _get_engine():
+    """Load runtime configuration only for commands that actually use MySQL."""
+    from backend.db.connection import get_engine
+
+    return get_engine()
+
+
+def _validate_migration_file(path: Path, *, migration_root: Path) -> Path:
+    if path.is_symlink():
+        raise RuntimeError(f"迁移文件不能是符号链接: {path.name}")
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"缺少迁移文件: {path.name}") from exc
+    try:
+        resolved.relative_to(migration_root)
+    except ValueError as exc:
+        raise RuntimeError(f"迁移文件位于迁移目录之外: {path.name}") from exc
+    if not resolved.is_file():
+        raise RuntimeError(f"迁移路径不是普通文件: {path.name}")
+    payload = resolved.read_bytes()
+    if not payload.strip():
+        raise RuntimeError(f"迁移文件为空: {path.name}")
+    if resolved.suffix not in {".py", ".sql"}:
+        raise RuntimeError(f"不支持的迁移文件类型: {path.name}")
+    if resolved.suffix == ".py":
+        try:
+            compile(payload, str(resolved), "exec")
+        except SyntaxError as exc:
+            raise RuntimeError(f"迁移脚本语法错误: {path.name}") from exc
+    else:
+        try:
+            payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"SQL 迁移不是 UTF-8: {path.name}") from exc
+    return resolved
+
+
+def validate_migration_package() -> dict[str, str]:
+    """Validate every tracked migration and return its immutable manifest."""
+    migration_root = MIGRATIONS_DIR.resolve(strict=True)
+    versions = [migration.version for migration in MIGRATIONS]
+    if len(versions) != len(set(versions)):
+        raise RuntimeError("迁移版本号重复")
+    if versions != sorted(versions):
+        raise RuntimeError("迁移版本顺序不是严格升序")
+
+    primary_paths = [migration.path for migration in MIGRATIONS]
+    if len(primary_paths) != len(set(primary_paths)):
+        raise RuntimeError("主迁移文件被多个版本重复引用")
+
+    tracked_versions = set(versions)
+    unknown_dependencies = sorted(set(MIGRATION_DEPENDENCIES) - tracked_versions)
+    if unknown_dependencies:
+        raise RuntimeError(
+            "依赖清单引用未知迁移版本: " + ", ".join(unknown_dependencies)
+        )
+
+    seen_files: set[Path] = set()
+    manifest: dict[str, str] = {}
+    for migration in MIGRATIONS:
+        paths = (migration.path, *MIGRATION_DEPENDENCIES.get(migration.version, ()))
+        for path in paths:
+            resolved = _validate_migration_file(path, migration_root=migration_root)
+            if resolved in seen_files:
+                raise RuntimeError(f"迁移文件被重复引用: {path.name}")
+            seen_files.add(resolved)
+        manifest[migration.version] = _migration_checksum(migration)
+    return manifest
 
 
 def _ensure_schema_migrations(conn) -> None:
@@ -161,8 +270,11 @@ def _migration_checksum(migration: Migration) -> str:
     return hasher.hexdigest()
 
 
-def _applied_migrations(conn) -> dict[str, str]:
-    _ensure_schema_migrations(conn)
+def _applied_migrations(conn, *, ensure_table: bool = True) -> dict[str, str]:
+    if ensure_table:
+        _ensure_schema_migrations(conn)
+    elif not inspect(conn).has_table("schema_migrations"):
+        return {}
     result = conn.execute(text("SELECT version, checksum FROM schema_migrations"))
     return {str(row[0]): str(row[1]) for row in result.fetchall()}
 
@@ -267,15 +379,28 @@ def _record_migration(
     )
 
 
-def mark_existing() -> int:
-    engine = get_engine()
+def mark_existing(
+    versions: tuple[str, ...] | list[str],
+    *,
+    acknowledge_existing_schema: bool = False,
+) -> int:
+    if not acknowledge_existing_schema:
+        raise RuntimeError(
+            "补记迁移账本前必须检查实际表结构，并显式传入 --acknowledge-existing-schema"
+        )
+    validate_migration_package()
+    requested = tuple(dict.fromkeys(versions))
+    tracked = {migration.version: migration for migration in MIGRATIONS}
+    unknown = sorted(set(requested) - set(tracked))
+    if unknown:
+        raise RuntimeError("未知迁移版本: " + ", ".join(unknown))
+    engine = _get_engine()
     with _migration_lock(engine):
         with engine.begin() as conn:
             applied = _applied_migrations(conn)
             _verify_applied_checksums(applied)
-            for migration in MIGRATIONS:
-                if not migration.path.exists():
-                    raise FileNotFoundError(migration.path)
+            for version in requested:
+                migration = tracked[version]
                 if migration.version in applied:
                     print(f"already marked {migration.version} {migration.path.name}")
                     continue
@@ -284,8 +409,23 @@ def mark_existing() -> int:
     return 0
 
 
-def run_pending(*, dry_run: bool = False) -> int:
-    engine = get_engine()
+def run_pending(*, dry_run: bool = False, require_clean: bool = False) -> int:
+    validate_migration_package()
+    engine = _get_engine()
+    if dry_run:
+        with engine.connect() as conn:
+            applied = _applied_migrations(conn, ensure_table=False)
+            _verify_applied_checksums(applied)
+        pending = [
+            migration for migration in MIGRATIONS if migration.version not in applied
+        ]
+        if not pending:
+            print("No pending migrations")
+            return 0
+        for migration in pending:
+            print(f"pending {migration.version} {migration.path.name}")
+        return 3 if require_clean else 0
+
     with _migration_lock(engine):
         with engine.begin() as conn:
             applied = _applied_migrations(conn)
@@ -304,10 +444,6 @@ def run_pending(*, dry_run: bool = False) -> int:
             if not migration.path.exists():
                 raise FileNotFoundError(migration.path)
             checksum = _migration_checksum(migration)
-            if dry_run:
-                print(f"pending {migration.version} {migration.path.name}")
-                continue
-
             started_at = datetime.now()
             if migration.path.suffix == ".sql":
                 with engine.begin() as conn:
@@ -329,17 +465,60 @@ def run_pending(*, dry_run: bool = False) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run tracked database migrations")
-    parser.add_argument("--dry-run", action="store_true", help="只列出待执行迁移")
-    parser.add_argument(
-        "--mark-existing",
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("--dry-run", action="store_true", help="只读列出待执行迁移")
+    action.add_argument(
+        "--check",
         action="store_true",
-        help="仅写入 schema_migrations 基线，不执行迁移",
+        help="只读检查待执行迁移；存在待执行版本时返回状态码 3",
+    )
+    action.add_argument(
+        "--verify-package",
+        action="store_true",
+        help="离线校验迁移文件完整性，不连接数据库",
+    )
+    action.add_argument(
+        "--mark-existing",
+        action="append",
+        metavar="VERSION",
+        help="补记一个已人工核对结构的版本；可重复传入",
+    )
+    action.add_argument(
+        "--mark-all-existing",
+        action="store_true",
+        help="补记全部版本（仅适合已逐项核对的历史库）",
+    )
+    parser.add_argument(
+        "--acknowledge-existing-schema",
+        action="store_true",
+        help="确认已核对目标库实际结构，仅与补记命令一起使用",
     )
     args = parser.parse_args(argv)
 
-    if args.mark_existing:
-        return mark_existing()
-    return run_pending(dry_run=args.dry_run)
+    if args.verify_package:
+        manifest = validate_migration_package()
+        for migration in MIGRATIONS:
+            print(
+                f"verified {migration.version} {migration.path.name} "
+                f"sha256={manifest[migration.version]}"
+            )
+        return 0
+    if args.mark_existing or args.mark_all_existing:
+        versions = (
+            [migration.version for migration in MIGRATIONS]
+            if args.mark_all_existing
+            else args.mark_existing
+        )
+        return mark_existing(
+            versions,
+            acknowledge_existing_schema=args.acknowledge_existing_schema,
+        )
+    if args.acknowledge_existing_schema:
+        parser.error(
+            "--acknowledge-existing-schema 只能与 --mark-existing 或 "
+            "--mark-all-existing 一起使用"
+        )
+    return run_pending(dry_run=args.dry_run or args.check, require_clean=args.check)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,8 @@ ANSWER_FORMAT_PROMPT = """
   - [绝对禁止] 输出裸露的 `^` / `_` 或 HTML 上下标标签（如 `<sup>` / `<sub>`）。
 - **图片规范**: 
   - 引用可用图片白名单中的标识符时，必须使用块级 Markdown（前后各空一行）：`![图片说明]([IMAGE:xxx])`，其下方紧跟图注 `*图n：图名*`。
+  - 历史对话中已经出现且仍保留的 `[IMAGE:xxx]` 可以在后续轮次原样复用；禁止自行改号或构造标识符。
+  - 禁止把图片标识、URL 或路径放入 Markdown 表格；多张图片必须按独立图文段落展示。
   - 严禁引用白名单之外的任何图片。
 </answer_structure_and_math_policy>
 """
@@ -105,7 +107,9 @@ def build_system_prompt(
         )
         return (
             LIGHTWEIGHT_BUSINESS_CAPABILITIES_PROMPT
-            + KNOWLEDGE_RETRIEVAL_POLICY_LIGHTWEIGHT.format(kb_binding_note=kb_binding_note)
+            + KNOWLEDGE_RETRIEVAL_POLICY_LIGHTWEIGHT.format(
+                kb_binding_note=kb_binding_note
+            )
             + f"\n<network_search_policy>{search_note}</network_search_policy>\n"
         )
 

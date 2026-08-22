@@ -1,0 +1,16 @@
+code: landslide
+name: 遥感滑坡分析智能体
+domain: remote-sensing-landslide
+description: 面向遥感影像滑坡识别、灾情研判与专题分析报告的专业智能体
+default_model: null
+default_kb_ids: []
+default_skills:
+  - remote-sensing-landslide
+default_workflow: full
+allowed_workflows:
+  - full
+prompt_profile: landslide
+tool_policy: landslide_default
+kb_policy: bound_or_selected
+guardrail_policy: default
+ui_profile: landslide

@@ -7,7 +7,7 @@ from datetime import datetime
 
 from sqlalchemy import BigInteger, Column, DateTime, Index, JSON, String, Text
 
-from backend.db.models import Base
+from backend.db.models.base import Base
 
 
 class ContextArtifactRecord(Base):

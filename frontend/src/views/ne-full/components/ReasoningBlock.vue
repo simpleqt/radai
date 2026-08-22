@@ -48,30 +48,33 @@ const toggle = () => {
 </script>
 
 <template>
-  <div v-if="reasoning" class="overflow-hidden rounded-2xl border border-slate-200/70 bg-white/75 shadow-[0_10px_34px_-26px_rgba(15,23,42,0.45)] backdrop-blur-sm transition-all duration-300 dark:border-slate-800/70 dark:bg-slate-900/45">
+  <div v-if="reasoning" class="overflow-hidden rounded-2xl border border-border-subtle bg-surface/75 backdrop-blur-sm transition-all duration-300">
     <button 
       @click="toggle" 
-      class="flex w-full items-center justify-between gap-4 px-4 py-3 text-left transition-colors hover:bg-slate-50/80 dark:hover:bg-slate-800/50"
+      class="flex w-full items-center justify-between gap-4 px-4 py-3 text-left transition-colors hover:bg-surface-hover"
     >
-      <div class="flex min-w-0 items-center gap-3 text-slate-500 dark:text-slate-400">
-        <div class="flex h-5 w-5 shrink-0 items-center justify-center text-indigo-500 dark:text-indigo-300">
-          <svg v-if="isStreaming && !hasAnswer" class="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
-            <circle class="opacity-25" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" />
-            <path class="opacity-75" d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
-          </svg>
-          <svg v-else class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M20 6 9 17l-5-5" />
-          </svg>
+      <div class="flex min-w-0 items-center gap-3 text-text-secondary">
+        <div class="grid h-5 w-5 shrink-0 place-items-center text-accent">
+          <!-- 思考中/已思考图标叠放于同一格，交叉淡入切换 -->
+          <Transition name="icon-swap">
+            <svg v-if="isStreaming && !hasAnswer" class="col-start-1 row-start-1 h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+              <circle class="opacity-25" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" />
+              <path class="opacity-75" d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+            </svg>
+            <svg v-else class="col-start-1 row-start-1 h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 6 9 17l-5-5" />
+            </svg>
+          </Transition>
         </div>
         <div class="min-w-0">
-          <span class="block truncate text-sm font-semibold text-slate-600 dark:text-slate-300">{{ statusText }}</span>
-          <span class="mt-0.5 block truncate text-xs text-slate-400 dark:text-slate-500">
+          <span class="block truncate text-sm font-semibold text-text-secondary">{{ statusText }}</span>
+          <span class="mt-0.5 block truncate text-xs text-text-tertiary">
             {{ hasAnswer ? '正文已开始输出，思维过程已自动折叠' : '正在展开模型返回的思维过程' }}
           </span>
         </div>
       </div>
       
-      <div class="shrink-0 text-slate-400 dark:text-slate-500">
+      <div class="shrink-0 text-text-tertiary">
         <svg 
           xmlns="http://www.w3.org/2000/svg" 
           width="16" 
@@ -89,11 +92,29 @@ const toggle = () => {
       </div>
     </button>
     
-    <div 
-      v-show="isExpanded" 
-      class="border-t border-slate-100 bg-slate-50/55 px-5 py-4 dark:border-slate-800/60 dark:bg-slate-950/30"
-    >
-      <pre class="whitespace-pre-wrap break-words border-l-2 border-indigo-200 pl-4 font-mono text-xs leading-6 text-slate-500 dark:border-indigo-900/70 dark:text-slate-400">{{ smoothReasoning }}</pre>
+    <div class="collapse-rows" :data-open="isExpanded" :inert="!isExpanded">
+      <div>
+        <div class="border-t border-border-subtle bg-surface-sunken px-5 py-4">
+          <pre class="whitespace-pre-wrap break-words border-l-2 border-accent/30 pl-4 font-mono text-xs leading-6 text-text-secondary">{{ smoothReasoning }}</pre>
+        </div>
+      </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.icon-swap-enter-active,
+.icon-swap-leave-active {
+  transition:
+    opacity 200ms ease,
+    transform 200ms ease;
+}
+.icon-swap-enter-from {
+  opacity: 0;
+  transform: scale(0.6);
+}
+.icon-swap-leave-to {
+  opacity: 0;
+  transform: scale(0.6);
+}
+</style>

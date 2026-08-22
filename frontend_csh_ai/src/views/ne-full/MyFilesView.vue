@@ -1,15 +1,14 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, watch } from 'vue';
 import { useRouter } from 'vue-router';
-import { authState } from '@/utils/request';
-import HistorySidebar from './components/HistorySidebar.vue';
+import { authState, downloadWithAuth } from '@/utils/request';
+import AppShell from '@/components/layout/AppShell.vue';
 
 const router = useRouter();
 
 const files = ref<any[]>([]);
 const total = ref(0);
 const loading = ref(false);
-const showMobileSidebar = ref(false);
 
 // 搜索与过滤条件
 const keyword = ref('');
@@ -167,10 +166,14 @@ async function handleDelete(file: any) {
 }
 
 // 触发下载
-function handleDownload(file: any) {
-  const token = authState.value.token;
-  const url = `${file.download_url}${token ? `?token=${token}` : ''}`;
-  window.open(url, '_blank');
+async function handleDownload(file: any) {
+  if (!file?.download_url) return;
+  try {
+    await downloadWithAuth(file.download_url, { filename: file.file_name || file.name || 'download' });
+  } catch (err) {
+    console.error('下载文件失败:', err);
+    alert(err instanceof Error ? err.message : '下载失败');
+  }
 }
 
 function handleNewChat() {
@@ -243,9 +246,25 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="flex h-screen bg-white dark:bg-[#0b0f1a] relative overflow-hidden">
-    <!-- Premium Backdrop Accent -->
-    <div class="absolute inset-0 bg-[radial-gradient(circle_at_50%_-10%,#eff6ff,transparent_50%)] dark:bg-[radial-gradient(circle_at_50%_-10%,#1e1b4b,transparent_60%)] pointer-events-none opacity-30"></div>
+  <AppShell
+    title="个人文件管理中心"
+    brand-name="成理智学助手"
+    brand-icon="Waves"
+    @new-chat="handleNewChat"
+    @auth-action="handleAuthAction"
+  >
+    <template #actions>
+      <button
+        type="button"
+        class="inline-flex h-8 items-center gap-1.5 rounded-(--radius-control) border border-border-subtle px-2.5 text-xs font-medium text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary"
+        @click="router.push('/app')"
+      >
+        <svg class="size-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
+        </svg>
+        <span class="hidden @compact/main:inline">回到对话</span>
+      </button>
+    </template>
 
     <input
       ref="fileInputRef"
@@ -254,65 +273,9 @@ onMounted(() => {
       @change="handleFileUpload"
     />
 
-    <!-- Desktop Sidebar -->
-    <HistorySidebar
-      class="hidden md:flex flex-shrink-0"
-      @new-chat="handleNewChat"
-      @auth-action="handleAuthAction"
-    />
-
-    <!-- Mobile Toggled Sidebar -->
-    <Transition name="mobile-drawer">
-      <div
-        v-if="showMobileSidebar"
-        class="fixed inset-0 z-[55] bg-black/35 md:hidden"
-        @click.self="showMobileSidebar = false"
-      >
-        <div class="absolute left-0 top-0 h-full w-[84%] max-w-[320px] bg-white dark:bg-[#0f172a] shadow-2xl">
-          <HistorySidebar
-            @new-chat="handleNewChat"
-            @auth-action="handleAuthAction"
-          />
-        </div>
-      </div>
-    </Transition>
-
-    <!-- Main Folder Container -->
-    <div class="flex-1 flex flex-col min-w-0 relative z-10">
-      <!-- Header -->
-      <header class="h-14 border-b border-slate-200 dark:border-slate-800 bg-white/85 dark:bg-slate-900/85 backdrop-blur-md px-6 flex items-center justify-between">
-        <div class="flex items-center space-x-3">
-          <button
-            @click="showMobileSidebar = !showMobileSidebar"
-            class="md:hidden inline-flex items-center justify-center w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-300"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/>
-            </svg>
-          </button>
-          <div class="flex items-center space-x-2">
-            <svg class="w-5 h-5 text-indigo-600 dark:text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-              <path stroke-linecap="round" stroke-linejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
-            </svg>
-            <h1 class="text-base font-bold text-slate-800 dark:text-slate-100 tracking-tight">个人文件管理中心</h1>
-          </div>
-        </div>
-
-        <button
-          @click="router.push('/app')"
-          class="flex items-center space-x-1.5 px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 text-sm font-semibold text-slate-500 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800 transition-colors"
-        >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6" />
-          </svg>
-          <span>回到对话</span>
-        </button>
-      </header>
-
-      <!-- Center content panel -->
-      <div class="flex-1 min-h-0 overflow-y-auto p-6 flex flex-col">
+    <div class="custom-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto p-4 @cozy/main:p-6">
         <!-- Advanced Search and Actions -->
-        <div class="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800/80 rounded-2xl p-5 mb-6 shadow-sm flex flex-col md:flex-row gap-4 items-center justify-between">
+        <div class="bg-surface border border-border-subtle rounded-2xl p-5 mb-6 shadow-sm flex flex-col md:flex-row gap-4 items-center justify-between">
           <div class="flex-1 w-full flex flex-col sm:flex-row gap-3">
             <!-- Search bar -->
             <div class="flex-1 relative">
@@ -321,9 +284,9 @@ onMounted(() => {
                 v-model="keyword"
                 placeholder="按照文件名检索文件..."
                 @keyup.enter="handleSearch"
-                class="w-full h-10 pl-10 pr-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/50 text-sm focus:outline-none focus:border-indigo-500 text-slate-700 dark:text-slate-200"
+                class="w-full h-10 pl-10 pr-4 rounded-xl border border-border-subtle bg-surface-sunken text-sm focus:outline-none focus:border-accent text-text-secondary"
               />
-              <svg class="absolute left-3.5 top-3 w-4.5 h-4.5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+              <svg class="absolute left-3.5 top-3 w-4.5 h-4.5 text-text-tertiary" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
               </svg>
             </div>
@@ -332,18 +295,18 @@ onMounted(() => {
               <select
                 v-model="fileType"
                 @change="handleSearch"
-                class="h-10 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/50 text-sm focus:outline-none text-slate-700 dark:text-slate-200"
+                class="h-10 px-3 rounded-xl border border-border-subtle bg-surface-sunken text-sm focus:outline-none text-text-secondary"
               >
                 <option v-for="opt in typeOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
               </select>
               <select
                 v-model="source"
                 @change="handleSearch"
-                class="h-10 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/50 text-sm focus:outline-none text-slate-700 dark:text-slate-200"
+                class="h-10 px-3 rounded-xl border border-border-subtle bg-surface-sunken text-sm focus:outline-none text-text-secondary"
               >
                 <option v-for="opt in sourceOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
               </select>
-              <button @click="handleSearch" class="px-5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold transition-colors flex items-center justify-center shadow-lg shadow-indigo-100 dark:shadow-none">
+              <button @click="handleSearch" class="px-5 bg-accent hover:bg-accent-hover text-white rounded-xl text-sm font-semibold transition-colors flex items-center justify-center shadow-sm dark:shadow-none">
                 查询
               </button>
             </div>
@@ -353,7 +316,7 @@ onMounted(() => {
           <button
             @click="triggerUpload"
             :disabled="uploading"
-            class="w-full md:w-auto h-10 px-5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-sm font-bold transition-colors flex items-center justify-center space-x-2 shadow-lg shadow-emerald-100 dark:shadow-none"
+            class="w-full md:w-auto h-10 px-5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-sm font-bold transition-colors flex items-center justify-center space-x-2 shadow-sm dark:shadow-none"
           >
             <svg v-if="uploading" class="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
               <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
@@ -367,11 +330,11 @@ onMounted(() => {
         </div>
 
         <!-- Files Data Grid -->
-        <div class="flex-1 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800/80 rounded-2xl shadow-sm flex flex-col overflow-hidden">
+        <div class="flex-1 bg-surface border border-border-subtle rounded-2xl shadow-sm flex flex-col overflow-hidden">
           <div class="flex-1 overflow-x-auto">
             <table class="w-full text-left border-collapse min-w-[700px]">
               <thead>
-                <tr class="border-b border-slate-100 dark:border-slate-800/85 text-xs text-slate-400 font-bold uppercase tracking-wider bg-slate-50/50 dark:bg-slate-800/20">
+                <tr class="border-b border-border-subtle text-xs text-text-tertiary font-bold uppercase tracking-wider bg-surface-sunken">
                   <th class="px-6 py-4">文件名</th>
                   <th class="px-6 py-4">大小</th>
                   <th class="px-6 py-4">类型</th>
@@ -380,20 +343,20 @@ onMounted(() => {
                   <th class="px-6 py-4 text-right">操作</th>
                 </tr>
               </thead>
-              <tbody class="divide-y divide-slate-100 dark:divide-slate-850">
+              <tbody class="divide-y divide-border-subtle">
                 <tr v-if="loading" class="text-center">
                   <td colspan="6" class="py-16">
-                    <svg class="animate-spin h-7 w-7 text-indigo-500 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <svg class="animate-spin h-7 w-7 text-accent mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                       <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                       <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
                     </svg>
-                    <span class="text-xs text-slate-400 mt-2 block">加载个人文件数据中...</span>
+                    <span class="text-xs text-text-tertiary mt-2 block">加载个人文件数据中...</span>
                   </td>
                 </tr>
 
                 <tr v-else-if="files.length === 0" class="text-center">
-                  <td colspan="6" class="py-16 text-slate-400 text-sm">
-                    <svg class="w-12 h-12 text-slate-200 dark:text-slate-700 mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                  <td colspan="6" class="py-16 text-text-tertiary text-sm">
+                    <svg class="w-12 h-12 text-text-tertiary mx-auto mb-2" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
                       <path stroke-linecap="round" stroke-linejoin="round" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
                     </svg>
                     <span>暂无文件记录，点击右上角上传首个文件</span>
@@ -404,36 +367,35 @@ onMounted(() => {
                   v-else
                   v-for="file in files"
                   :key="file.file_id"
-                  class="hover:bg-slate-50/40 dark:hover:bg-slate-850/20 transition-colors group"
+                  class="hover:bg-surface-hover transition-colors group"
                 >
                   <td class="px-6 py-4 min-w-[280px]">
                     <div class="flex items-center space-x-3.5">
-                      <div class="w-9 h-9 rounded-xl bg-slate-50 dark:bg-slate-800 flex items-center justify-center text-slate-400 group-hover:text-indigo-500 transition-colors flex-shrink-0">
+                      <div class="w-9 h-9 rounded-xl bg-surface-sunken flex items-center justify-center text-text-tertiary group-hover:text-accent transition-colors flex-shrink-0">
                         <svg class="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
                           <path stroke-linecap="round" stroke-linejoin="round" :d="getFileIconPath(file.display_name)" />
                         </svg>
                       </div>
-                      <span class="text-sm font-semibold text-slate-700 dark:text-slate-200 truncate max-w-[200px]" :title="file.display_name">
+                      <span class="text-sm font-semibold text-text-secondary truncate max-w-[200px]" :title="file.display_name">
                         {{ file.display_name }}
                       </span>
                     </div>
                   </td>
-                  <td class="px-6 py-4 text-xs font-semibold text-slate-500 dark:text-slate-400">
+                  <td class="px-6 py-4 text-xs font-semibold text-text-secondary">
                     {{ formatBytes(file.size_bytes) }}
                   </td>
-                  <td class="px-6 py-4 text-xs text-slate-500">
-                    <span class="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[10px] uppercase font-bold tracking-wide">
+                  <td class="px-6 py-4 text-xs text-text-secondary">
+                    <span class="px-2 py-0.5 rounded-md bg-surface-sunken text-[10px] uppercase font-bold tracking-wide">
                       {{ file.mime_type?.split('/')?.[1] || 'DOC' }}
                     </span>
                   </td>
-                  <td class="px-6 py-4 text-xs text-slate-400">
+                  <td class="px-6 py-4 text-xs text-text-tertiary">
                     {{ formatDate(file.created_at) }}
                   </td>
                   <td class="px-6 py-4">
                     <span 
                       class="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider"
-                      :class="file.source_type === 'minio'
-                        ? 'bg-indigo-50 text-indigo-600 dark:bg-indigo-950/40 dark:text-indigo-400'
+                      :class="file.source_type === 'minio' ? 'bg-accent-soft text-accent'
                         : 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-400'"
                     >
                       {{ file.source_type === 'minio' ? '主动上传' : '系统生成' }}
@@ -443,7 +405,7 @@ onMounted(() => {
                     <div class="flex items-center justify-end space-x-1.5">
                       <button
                         @click="handleDownload(file)"
-                        class="p-1.5 rounded-lg border border-slate-200 dark:border-slate-850 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 dark:text-slate-300 transition-colors"
+                        class="p-1.5 rounded-lg border border-border-subtle hover:bg-surface-hover text-text-secondary transition-colors"
                         title="下载"
                       >
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -452,7 +414,7 @@ onMounted(() => {
                       </button>
                       <button
                         @click="handleRename(file)"
-                        class="p-1.5 rounded-lg border border-slate-200 dark:border-slate-850 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 dark:text-slate-300 transition-colors"
+                        class="p-1.5 rounded-lg border border-border-subtle hover:bg-surface-hover text-text-secondary transition-colors"
                         title="重命名"
                       >
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -461,7 +423,7 @@ onMounted(() => {
                       </button>
                       <button
                         @click="handleDelete(file)"
-                        class="p-1.5 rounded-lg border border-slate-200 dark:border-slate-850 hover:bg-slate-100 dark:hover:bg-slate-800 text-rose-500 transition-colors"
+                        class="p-1.5 rounded-lg border border-border-subtle hover:bg-surface-hover text-rose-500 transition-colors"
                         title="删除"
                       >
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -476,25 +438,25 @@ onMounted(() => {
           </div>
 
           <!-- Pagination Footer -->
-          <div class="px-6 py-4 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between bg-slate-50/30 dark:bg-slate-900/10">
-            <div class="text-xs text-slate-400 font-medium">
+          <div class="px-6 py-4 border-t border-border-subtle flex items-center justify-between bg-surface-sunken">
+            <div class="text-xs text-text-tertiary font-medium">
               共 {{ total }} 个文件 / 当前显示 {{ files.length }} 个
             </div>
             <div class="flex items-center space-x-2">
               <button
                 @click="prevPage"
                 :disabled="offset === 0 || loading"
-                class="px-3.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 disabled:opacity-50 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800/80 transition-colors text-xs font-semibold"
+                class="px-3.5 py-1.5 rounded-lg border border-border-subtle disabled:opacity-50 text-text-secondary hover:bg-surface-hover transition-colors text-xs font-semibold"
               >
                 上一页
               </button>
-              <span class="text-xs text-slate-400 dark:text-slate-500 font-medium px-2">
+              <span class="text-xs text-text-tertiary font-medium px-2">
                 第 {{ Math.floor(offset / limit) + 1 }} 页 / 共 {{ Math.ceil(total / limit) || 1 }} 页
               </span>
               <button
                 @click="nextPage"
                 :disabled="offset + limit >= total || loading"
-                class="px-3.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-800 disabled:opacity-50 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800/80 transition-colors text-xs font-semibold"
+                class="px-3.5 py-1.5 rounded-lg border border-border-subtle disabled:opacity-50 text-text-secondary hover:bg-surface-hover transition-colors text-xs font-semibold"
               >
                 下一页
               </button>
@@ -502,18 +464,5 @@ onMounted(() => {
           </div>
         </div>
       </div>
-    </div>
-  </div>
+  </AppShell>
 </template>
-
-<style scoped>
-.mobile-drawer-enter-active,
-.mobile-drawer-leave-active {
-  transition: opacity 0.2s ease;
-}
-
-.mobile-drawer-enter-from,
-.mobile-drawer-leave-to {
-  opacity: 0;
-}
-</style>

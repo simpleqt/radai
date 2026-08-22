@@ -16,7 +16,6 @@ from backend.config.filters import (
 from backend.config.handlers import (
     ColoredConsoleHandler,
     KafkaLogHandler,
-    ModuleFileHandler,
     RotatingFileHandlerWithCompression,
 )
 from backend.config.settings import settings
@@ -78,8 +77,14 @@ def setup_logging():
     root_logger = logging.getLogger()
     root_logger.setLevel(settings.log_level)
 
-    # 清除现有的处理器
-    root_logger.handlers.clear()
+    # 清除现有的处理器。必须先 close 再移除:直接 clear 会把旧 KafkaLogHandler
+    # 的 sender 线程与 atexit 引用永久遗留,重复 setup 每次泄漏一个线程。
+    for stale_handler in root_logger.handlers[:]:
+        root_logger.removeHandler(stale_handler)
+        try:
+            stale_handler.close()
+        except Exception:
+            pass
 
     if guest_mode:
         app_log_path = log_dir / "guest-api.log"
@@ -99,6 +104,7 @@ def setup_logging():
         console_handler.setFormatter(formatter)
         console_handler.setLevel(settings.log_level)
         console_handler.addFilter(user_ctx_filter)
+        console_handler.addFilter(SensitiveDataFilter())
         root_logger.addHandler(console_handler)
 
     # 主日志文件处理器（支持轮转）
@@ -127,6 +133,7 @@ def setup_logging():
     error_handler.setLevel(logging.ERROR)
     error_handler.addFilter(user_ctx_filter)
     error_handler.addFilter(ErrorFilter())
+    error_handler.addFilter(SensitiveDataFilter())
     root_logger.addHandler(error_handler)
 
     # 4. 定时轮转处理器（归档）
@@ -213,52 +220,4 @@ def _configure_third_party_loggers():
     for logger_name, level in third_party_loggers.items():
         logging.getLogger(logger_name).setLevel(level)
 
-
-def get_module_handler(logger_name: str) -> logging.Handler:
-    """
-    获取模块日志处理器
-
-    Args:
-        logger_name: 日志记录器名称
-
-    Returns:
-        Handler 实例
-    """
-    formatter = get_log_formatter(settings.log_format)
-
-    handler = ModuleFileHandler(
-        logger_name=logger_name,
-        log_dir=settings.log_dir_path,
-        mode="a",
-        encoding="utf-8",
-    )
-    handler.setFormatter(formatter)
-    handler.setLevel(settings.log_level)
-    handler.addFilter(UserContextFilter())
-    handler.addFilter(SensitiveDataFilter())
-
-    return handler
-
-
-def setup_module_logger(logger_name: str) -> logging.Logger:
-    """
-    设置模块日志记录器
-
-    Args:
-        logger_name: 日志记录器名称
-
-    Returns:
-        Logger 实例
-    """
-    logger = logging.getLogger(logger_name)
-    logger.setLevel(settings.log_level)
-
-    # 添加模块专用处理器
-    module_handler = get_module_handler(logger_name)
-    logger.addHandler(module_handler)
-
-    # 防止日志传播到根日志记录器（避免重复）
-    logger.propagate = True
-
-    return logger
 

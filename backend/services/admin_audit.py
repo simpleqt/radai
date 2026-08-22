@@ -4,6 +4,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.core.utils.client_ip import UNKNOWN_CLIENT_IP, resolve_client_ip
 from backend.db.models import AdminAuditLog
 
 
@@ -15,12 +16,8 @@ def _header(headers: Any, name: str) -> str | None:
 
 
 def _client_ip(request: Any) -> str | None:
-    headers = getattr(request, "headers", None)
-    forwarded = _header(headers, "x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",", 1)[0].strip() or None
-    client = getattr(request, "client", None)
-    return getattr(client, "host", None) if client else None
+    resolved = resolve_client_ip(request)
+    return None if resolved == UNKNOWN_CLIENT_IP else resolved
 
 
 async def write_admin_audit(

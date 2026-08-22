@@ -433,9 +433,45 @@ class ResearchScheduler(CoordinationComponent):
             for _index, _task, future in wave_futures:
                 _cancel_child_on_parent_exit(future)
             if research_deadline is None:
-                raw_results = await asyncio.gather(
-                    *(future for _index, _task, future in wave_futures)
+                # Isolate per branch: one branch raising an unexpected error
+                # (or being cancelled) must not abort the whole wave and
+                # discard already-completed siblings' evidence. This mirrors
+                # the deadline path below; managed failures/timeouts are
+                # already normalized into results by the branch runner.
+                gathered = await asyncio.gather(
+                    *(future for _index, _task, future in wave_futures),
+                    return_exceptions=True,
                 )
+                raw_results = []
+                for (index, task, _future), outcome in zip(
+                    wave_futures, gathered, strict=True
+                ):
+                    if isinstance(outcome, asyncio.CancelledError):
+                        raw_results.append(
+                            self._research_phase_timeout_result(
+                                index=index,
+                                task=task,
+                                used_fallback=used_fallback,
+                                context=context,
+                            )
+                        )
+                    elif isinstance(outcome, BaseException):
+                        raw_results.append(
+                            CoordinationUnitResult(
+                                role=self._research_role(
+                                    task=task,
+                                    index=index,
+                                    used_fallback=used_fallback,
+                                    context=context,
+                                ),
+                                answer="",
+                                error=str(outcome) or type(outcome).__name__,
+                                task_key=task.key,
+                                task_title=task.title,
+                            )
+                        )
+                    else:
+                        raw_results.append(outcome)
             else:
                 remaining_research_seconds = max(
                     0.0,

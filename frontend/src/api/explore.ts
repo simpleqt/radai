@@ -3,7 +3,7 @@ import { streamSSE, type SSEHandlers } from '@/utils/sseClient';
 
 const API_V2_BASE = '/api/v2';
 // 领域标识：决定学科、预制题库与详解所用智能体。RadAI=ne，CSH-AI=csh。
-const EXPLORE_DOMAIN = 'ne';
+const EXPLORE_DOMAIN = import.meta.env.VITE_EXPLORE_DOMAIN || 'ne';
 
 /** 与 utils/request.ts 同构的轻量封装，但 base 指向 /api/v2（探索端点）。 */
 async function requestV2(path: string, options: RequestInit = {}) {
@@ -16,7 +16,7 @@ async function requestV2(path: string, options: RequestInit = {}) {
     headers.set('Content-Type', 'application/json');
   }
   const response = await fetch(url, { ...options, headers });
-  if (response.status === 401 || response.status === 403) {
+  if (response.status === 401) {
     logout();
     throw new Error('认证失败，请重新登录');
   }
@@ -57,6 +57,11 @@ export interface ExploreResource {
   score: number;
   kb_id?: string | null;
   download_url?: string;
+}
+
+export interface ExploreChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
 export type QuizType = 'choice' | 'multi' | 'judge' | 'short' | 'calc';
@@ -149,6 +154,35 @@ export const ExploreAPI = {
     return streamSSE(
       `${API_V2_BASE}/explore/detail`,
       { node_title: payload.nodeTitle, path: payload.path, kb_ids: payload.kbIds, domain: EXPLORE_DOMAIN },
+      handlers,
+      signal,
+    );
+  },
+
+  /** 围绕当前知识点详解继续追问（SSE 流式）。 */
+  detailChat(
+    payload: {
+      nodeTitle: string;
+      path: string[];
+      kbIds: string[];
+      question: string;
+      detailContent: string;
+      history: ExploreChatMessage[];
+    },
+    handlers: SSEHandlers,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return streamSSE(
+      `${API_V2_BASE}/explore/detail/chat`,
+      {
+        node_title: payload.nodeTitle,
+        path: payload.path,
+        kb_ids: payload.kbIds,
+        question: payload.question,
+        detail_content: payload.detailContent,
+        history: payload.history,
+        domain: EXPLORE_DOMAIN,
+      },
       handlers,
       signal,
     );

@@ -128,15 +128,33 @@ const buildTitle = (messages: ChatMessage[]) => {
 };
 
 export const getOrCreateGuestDeviceId = (): string => {
-  const existing = sessionStorage.getItem(DEVICE_ID_KEY);
-  if (existing) return existing;
+  // 身份必须跨标签页共享（localStorage）：会话历史经 IndexedDB 在所有
+  // 标签页互通，而服务端线程按 device scope 命名空间隔离——每个标签页
+  // 铸造新身份会让旧会话在服务端解析到空 checkpoint，模型"失忆"。
+  const stored = localStorage.getItem(DEVICE_ID_KEY);
+  const isValid = (value: string | null): value is string =>
+    !!value
+    && (/^gdev_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
+      || /^gdev_[0-9]{10,16}_[a-zA-Z0-9_-]{16,64}$/.test(value));
+  if (isValid(stored)) return stored;
 
+  // 迁移：本标签页 sessionStorage 里已有旧身份则原位提升。
+  const legacy = sessionStorage.getItem(DEVICE_ID_KEY);
+  if (isValid(legacy)) {
+    localStorage.setItem(DEVICE_ID_KEY, legacy);
+    return legacy;
+  }
+
+  const randomSuffix =
+    typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function'
+      ? Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) => value.toString(16).padStart(2, '0')).join('')
+      : `${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
   const deviceId =
     typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? `gdev_${crypto.randomUUID()}`
-      : `gdev_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      : `gdev_${Date.now()}_${randomSuffix}`;
 
-  sessionStorage.setItem(DEVICE_ID_KEY, deviceId);
+  localStorage.setItem(DEVICE_ID_KEY, deviceId);
   return deviceId;
 };
 
@@ -266,6 +284,8 @@ export const clearGuestConversations = async () => {
     tx.objectStore(MESSAGES_STORE).clear();
     done(undefined);
   });
+  // 全量清除（浏览器会话结束）时同步废弃设备身份，新会话获得新 scope。
+  localStorage.removeItem(DEVICE_ID_KEY);
 };
 
 export const exportGuestConversations = async (): Promise<GuestExportPayload> => {

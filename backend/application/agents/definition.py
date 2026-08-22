@@ -25,6 +25,7 @@ from backend.application.agents.prompt_registry import (
     PromptProfileSpec,
     PromptProvider,
     PromptTemplateRegistry,
+    default_prompt_template_registry,
 )
 from backend.application.domain_context import DomainContextResolver
 from backend.application.policies import ProfileRuntimePolicy
@@ -163,7 +164,9 @@ class AgentDefinitionValidator:
             self._prompt_registry: PromptTemplateRegistry | None = prompt_registry
         else:
             try:
-                self._prompt_registry = PromptTemplateRegistry()
+                # 默认注册表构造后不可变;校验器随 AgentService 按请求构造,
+                # 复用进程级单例避免每请求重复解析 prompts/tools YAML。
+                self._prompt_registry = default_prompt_template_registry()
             except Exception as exc:  # noqa: BLE001 - report registry diagnostics
                 self._prompt_registry = None
                 self._initialization_issues.append(
@@ -173,7 +176,11 @@ class AgentDefinitionValidator:
             self._tool_registry: ToolRegistry | None = tool_registry
         else:
             try:
-                self._tool_registry = ToolRegistry()
+                from backend.application.tools.assembler import (
+                    shared_default_tool_registry,
+                )
+
+                self._tool_registry = shared_default_tool_registry()
             except Exception as exc:  # noqa: BLE001 - report registry diagnostics
                 self._tool_registry = None
                 self._initialization_issues.append(

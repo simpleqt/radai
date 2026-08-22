@@ -2,7 +2,7 @@
 
 > 版本：v2.0  
 > 日期：2026-05-26  
-> 项目：<project_name>（RadAI / CSH-AI 后端）
+> 项目：langchian_project（RadAI / CSH-AI 后端）
 
 ---
 
@@ -55,7 +55,7 @@ root logger
 **现有 Kafka 配置**（`backend/.env` 第 90-114 行）：
 
 ```dotenv
-KAFKA_BOOTSTRAP_SERVERS=<kafka_server_ip>:9092
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092       # compose 内部；宿主机调试可用 localhost:9093
 KAFKA_TOPICS_PREFIX=document-processing-
 KAFKA_TASK_TOPIC=document-processing-tasks
 KAFKA_STATUS_TOPIC=document-processing-status
@@ -109,22 +109,11 @@ root logger
 **Topic 创建命令**（使用现有 `backend.kafka.admin` 模块）：
 
 ```bash
-# 创建全量日志 Topic（7天保留）
-python -m backend.kafka.admin \
-  --bootstrap-servers <kafka_server_ip>:9092 \
-  create-topic application-logs \
-  --partitions 3 \
-  --replication-factor 1 \
-  --retention-ms 604800000
-
-# 创建错误日志 Topic（30天保留）
-python -m backend.kafka.admin \
-  --bootstrap-servers <kafka_server_ip>:9092 \
-  create-topic application-logs-error \
-  --partitions 1 \
-  --replication-factor 1 \
-  --retention-ms 2592000000
+cd /home/inspur/myenv/langchian_project
+venv314/bin/python -m backend.kafka.admin create-topics
 ```
+
+该命令按 `backend/config/settings_sections.py` 中的 `KAFKA_*` 与 `LOG_KAFKA_*` 配置一次性创建文档处理 6 个 Topic 以及 `application-logs`、`application-logs-error`。当前脚本不支持 `create-topic <name> --partitions ...` 这种单 Topic CLI；如需单独调整保留时间或扩容分区，使用 Kafka 原生命令或扩展 `backend/kafka/admin.py`。
 
 ---
 
@@ -682,8 +671,9 @@ pip show kafka-python
 ### Step 6：创建 Kafka Topic
 
 ```bash
-# 在有 kafka-python 的环境中执行
-python -m backend.kafka.admin ...   # 或直接用 kafka-topics.sh
+venv314/bin/python -m backend.kafka.admin create-topics
+venv314/bin/python -m backend.kafka.admin list-topics
+venv314/bin/python -m backend.kafka.admin print-config
 ```
 
 ### Step 7：测试验证
@@ -699,10 +689,11 @@ LOG_KAFKA_ENABLED=true LOG_KAFKA_LEVEL=DEBUG make run-api
 python - <<'EOF'
 from kafka import KafkaConsumer
 import json
+import os
 
 c = KafkaConsumer(
     "application-logs",
-    bootstrap_servers="<kafka_server_ip>:9092",
+    bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9093"),
     auto_offset_reset="latest",
     value_deserializer=lambda v: json.loads(v.decode()),
 )
@@ -717,7 +708,6 @@ EOF
 # .env 修改
 LOG_KAFKA_ENABLED=true
 LOG_KAFKA_LEVEL=INFO        # 发送 INFO 及以上，保留用户问题、业务流程、API 调用日志
-LOG_KAFKA_FILTER_MODE=smart # 启用智能过滤（见下方说明）
 ```
 
 **日志级别策略说明**：

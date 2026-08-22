@@ -1,32 +1,59 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import ChatBox from './components/ChatBox.vue';
 import MessageList from './components/MessageList.vue';
-import HistorySidebar from './components/HistorySidebar.vue';
 import ArtifactSidebar from './components/ArtifactSidebar.vue';
+import ConversationExportMenu from './components/ConversationExportMenu.vue';
 import MyFilesPickerDialog from './components/MyFilesPickerDialog.vue';
-import NavRail from '@/components/NavRail.vue';
+import AppShell from '@/components/layout/AppShell.vue';
 import { useAgentChat } from './composables/useAgentChat';
 import { useFileUpload } from './composables/useFileUpload';
 import { authState, logout } from '@/utils/request';
-import { useUiMode } from '@/composables/useUiMode';
 import type { ResearchPlanPayload } from '@/api/agent-v2';
+import { PanelRight } from 'lucide-vue-next';
+
+const props = withDefaults(defineProps<{
+  agentCode?: string;
+  basePath?: string;
+  brandName?: string;
+  brandIcon?: string;
+  qaOnly?: boolean;
+  emptyLogoSrc?: string;
+  emptyLogoAlt?: string;
+  emptyTitle?: string;
+  emptyDescription?: string;
+  emptySuggestions?: string[];
+  emptySuggestionStyle?: 'technical' | 'audit';
+  emptyLogoCompact?: boolean;
+  emptyLogoDarkInvert?: boolean;
+}>(), {
+  agentCode: 'ne',
+  basePath: '/app',
+  brandName: '核电子学智能助手',
+  brandIcon: 'Atom',
+  qaOnly: false,
+  emptyLogoSrc: '/log.png',
+  emptyLogoAlt: '核电子学智能体',
+  emptyTitle: '你好，我是核电子学智能助手',
+  emptyDescription: '我可以帮你解答专业问题、提供技术知识、辅助学习与研究',
+  emptySuggestions: () => [],
+  emptySuggestionStyle: 'technical',
+  emptyLogoCompact: false,
+  emptyLogoDarkInvert: true,
+});
 
 const route = useRoute();
 const router = useRouter();
-const { messages, isBusy, status, agentInfo, selectedModel, selectedKbs, searchEnabled, selectedSkills, researchMode, artifacts, isGuestMode, activeBackgroundTask, backgroundTaskStreaming, loadAgentInfo, loadHistory, sendMessage, clearMessages, rollbackConversation, cancelStream, cancelBackgroundTask, checkAndResumeBackgroundTask, getPendingInterruptedThreadId } = useAgentChat();
+const { messages, isBusy, status, agentInfo, selectedModel, selectedKbs, searchEnabled, deepRetrievalEnabled, selectedSkills, researchMode, artifacts, isGuestMode, activeBackgroundTask, backgroundTaskStreaming, loadAgentInfo, loadHistory, sendMessage, clearMessages, rollbackConversation, cancelStream, cancelBackgroundTask, checkAndResumeBackgroundTask, getPendingInterruptedThreadId } = useAgentChat({ agentCode: props.agentCode });
 
 const { attachments, isUploading, uploadParseMode, addFiles, uploadPendingFiles, removeAttachment, clearAttachments, getReadyFileIds, addReadyAttachment, setUploadParseMode } = useFileUpload();
 const showArtifacts = ref(false);
 const artifactResetKey = ref(0);
-const sidebarRef = ref<any>(null);
-const mobileSidebarRef = ref<any>(null);
+const shellRef = ref<InstanceType<typeof AppShell> | null>(null);
 const localThreadId = ref<string | null>(null);
 const draftQuestion = ref('');
-const showMobileSidebar = ref(false);
 const showMyFilesPicker = ref(false);
-const { mode, effectiveMode } = useUiMode();
 
 const handleConfirmMyFiles = (selectedFiles: any[]) => {
   for (const f of selectedFiles) {
@@ -41,39 +68,12 @@ const handleConfirmMyFiles = (selectedFiles: any[]) => {
   }
 };
 
-const isMobileLayout = computed(() => route.path.startsWith('/m'));
-const chatBasePath = computed(() => (isMobileLayout.value ? '/m' : '/app'));
-// showHistorySidebar can always be true, CSS 'hidden md:flex' handles responsiveness
-const showHistorySidebar = computed(() => true);
-
-const getTargetChatPath = (targetMode: 'mobile' | 'desktop') => {
-  const targetBase = targetMode === 'mobile' ? '/m' : '/app';
-  const threadId = (route.params.threadId as string | undefined) || localThreadId.value || undefined;
-  return threadId ? `${targetBase}/${threadId}` : targetBase;
-};
-
-const syncLayoutRoute = async (targetMode: 'mobile' | 'desktop') => {
-  const targetPath = getTargetChatPath(targetMode);
-  if (route.path === targetPath) return;
-
-  await router.replace({
-    path: targetPath,
-    query: route.query,
-    hash: route.hash,
-  });
-};
-
 const handleAuthAction = () => {
-  showMobileSidebar.value = false;
   if (isGuestMode.value) {
-    router.push('/login');
+    router.push({ path: '/login', query: { redirect: route.fullPath } });
     return;
   }
   logout();
-};
-
-const toggleMobileSidebar = () => {
-  showMobileSidebar.value = !showMobileSidebar.value;
 };
 
 const createThreadId = () => {
@@ -89,7 +89,7 @@ onMounted(async () => {
   if (!route.params.threadId && pendingThreadId) {
     localThreadId.value = pendingThreadId;
     await router.replace({
-      path: `${chatBasePath.value}/${pendingThreadId}`,
+      path: `${props.basePath}/${pendingThreadId}`,
       query: route.query,
       hash: route.hash,
     });
@@ -99,28 +99,21 @@ onMounted(async () => {
     loadHistory(route.params.threadId as string);
     localThreadId.value = route.params.threadId as string;
   }
-  if (mode.value === 'auto') {
-    await syncLayoutRoute(effectiveMode.value);
-  }
 });
 
 watch(() => route.params.threadId, (newId) => {
   const threadId = (newId as string) || '';
   if (threadId) {
-    loadHistory(threadId);
+    if (threadId !== localThreadId.value || messages.value.length === 0) {
+      loadHistory(threadId);
+    }
     localThreadId.value = threadId;
-    showMobileSidebar.value = false;
   } else {
     messages.value = [];
     localThreadId.value = null;
   }
   // 切换会话时清空附件，避免把上一个会话的文件带入新会话
   clearAttachments();
-});
-
-watch(effectiveMode, async (nextMode) => {
-  if (mode.value !== 'auto') return;
-  await syncLayoutRoute(nextMode);
 });
 
 const shouldAutoOpenArtifacts = (items: any[]) => {
@@ -163,9 +156,13 @@ const handleSend = async (text: string) => {
   const currentThreadId = routeThreadId || localThreadId.value || undefined;
   const isFirstMessageInNewThread = !routeThreadId && !!localThreadId.value && messages.value.length === 0;
 
-  // 先上传 pending 文件
+  // 先上传 pending 文件；有失败/解析错误就中止发送——问题不带 file_ids
+  // 发出去会让模型"失明"作答，错误附件保留在输入区展示原因。
   if (attachments.value.some((a) => a.status === 'pending') && currentThreadId) {
     await uploadPendingFiles(currentThreadId);
+    if (attachments.value.some((a) => a.status === 'error')) {
+      return;
+    }
   }
 
   // 绑定从个人文件夹添加的已有文件到当前会话
@@ -173,7 +170,7 @@ const handleSend = async (text: string) => {
   const readyFilesFromLibrary = attachments.value.filter((a) => a.status === 'ready' && a.id.startsWith('uf_'));
   for (const a of readyFilesFromLibrary) {
     try {
-      await fetch(`/api/v1/sessions/${currentThreadId}/files/attach`, {
+      const res = await fetch(`/api/v1/sessions/${currentThreadId}/files/attach`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -181,8 +178,14 @@ const handleSend = async (text: string) => {
         },
         body: JSON.stringify({ file_id: a.id }),
       });
+      if (!res.ok) {
+        // 绑定失败不能静默当作已绑定：从本次发送中剔除该文件。
+        console.error('绑定文件到会话失败:', res.status);
+        attachments.value = attachments.value.filter((x) => x.id !== a.id);
+      }
     } catch (err) {
       console.error('绑定文件到会话失败:', err);
+      attachments.value = attachments.value.filter((x) => x.id !== a.id);
     }
   }
 
@@ -198,23 +201,12 @@ const handleSend = async (text: string) => {
     fileIds: fileIds.length > 0 ? fileIds : undefined,
   });
 
-  // 发送完成后只清除 pending/error 状态的附件，保留已就绪文件以支持多轮对话
-  attachments.value = attachments.value.filter((a) => a.status === 'ready');
-  
-  if (isFirstMessageInNewThread && sidebarRef.value) {
-    sidebarRef.value.loadConversations();
-  }
-  if (isFirstMessageInNewThread && mobileSidebarRef.value) {
-    mobileSidebarRef.value.loadConversations();
-  }
-};
+  // 发送完成后只清除 pending 状态的附件，保留已就绪文件以支持多轮对话；
+  // error 附件保留到用户手动移除——静默丢弃会掩盖"模型其实没收到文件"。
+  attachments.value = attachments.value.filter((a) => a.status !== 'pending');
 
-const handleClear = () => {
-  clearMessages();
-  clearAttachments();
-  draftQuestion.value = '';
-  if (!route.params.threadId) {
-    localThreadId.value = null;
+  if (isFirstMessageInNewThread) {
+    shellRef.value?.reloadConversations();
   }
 };
 
@@ -223,10 +215,9 @@ const handleNewChat = async () => {
   clearAttachments();
   draftQuestion.value = '';
   localThreadId.value = null;
-  showMobileSidebar.value = false;
 
   if (route.params.threadId) {
-    await router.push(chatBasePath.value);
+    await router.push(props.basePath);
   }
 };
 
@@ -242,12 +233,47 @@ const getCurrentThreadId = (): string | undefined => {
   return routeThreadId || localThreadId.value || undefined;
 };
 
-const handleEditAndResend = async (payload: { index: number; content: string }) => {
-  if (isBusy.value || payload.index < 0 || payload.index >= messages.value.length) return;
+// 回滚要先 await 网络请求，这段窗口里 isBusy 仍是 false、按钮仍可点；用一个
+// 飞行中标记挡住重复触发，否则连点会回滚两次并发出两次请求。
+let rollbackInFlight = false;
 
-  const keepUserTurns = countUserTurnsBeforeIndex(payload.index);
-  await rollbackConversation(getCurrentThreadId(), keepUserTurns);
-  draftQuestion.value = payload.content;
+const handleEditAndResend = async (payload: { index: number; content: string }) => {
+  if (rollbackInFlight || isBusy.value || payload.index < 0 || payload.index >= messages.value.length) return;
+
+  rollbackInFlight = true;
+  try {
+    const keepUserTurns = countUserTurnsBeforeIndex(payload.index);
+    await rollbackConversation(getCurrentThreadId(), keepUserTurns);
+    draftQuestion.value = payload.content;
+  } finally {
+    rollbackInFlight = false;
+  }
+};
+
+/** 一键重新生成：回滚到该回答对应的问题，并按当前 composer 设置自动重发。 */
+const handleRegenerate = async (payload: { index: number }) => {
+  if (rollbackInFlight || isBusy.value || payload.index <= 0 || payload.index >= messages.value.length) return;
+
+  let userIndex = -1;
+  for (let i = payload.index - 1; i >= 0; i -= 1) {
+    if (messages.value[i]?.role === 'user') {
+      userIndex = i;
+      break;
+    }
+  }
+  if (userIndex < 0) return;
+
+  const question = String(messages.value[userIndex].content || '').trim();
+  if (!question) return;
+
+  const keepUserTurns = countUserTurnsBeforeIndex(userIndex);
+  rollbackInFlight = true;
+  try {
+    await rollbackConversation(getCurrentThreadId(), keepUserTurns);
+  } finally {
+    rollbackInFlight = false;
+  }
+  await handleSend(question);
 };
 
 const handleResearchDraftSubmit = async (payload: {
@@ -259,9 +285,8 @@ const handleResearchDraftSubmit = async (payload: {
   const question = String(payload.question || '').trim();
   if (!question || isBusy.value) return;
 
-  const currentThreadId = getCurrentThreadId();
   await sendMessage(question, {
-    threadId: currentThreadId,
+    threadId: getCurrentThreadId(),
     researchMode: 'deep_research',
     kbIds: selectedKbs.value,
     useSearch: searchEnabled.value,
@@ -289,163 +314,118 @@ const handleAbort = () => {
 </script>
 
 <template>
-  <div class="flex flex-col h-screen bg-white dark:bg-[#0b0f1a] relative overflow-hidden">
-    <!-- Premium Backdrop Accent -->
-    <div class="absolute inset-0 bg-[radial-gradient(circle_at_50%_-10%,#eff6ff,transparent_50%)] dark:bg-[radial-gradient(circle_at_50%_-10%,#1e1b4b,transparent_60%)] pointer-events-none opacity-30"></div>
-    <!-- Header -->
-    <header class="h-14 border-b border-slate-200 dark:border-slate-800 bg-white/85 dark:bg-slate-900/85 backdrop-blur-md px-4 md:px-6 flex items-center justify-between sticky top-0 z-50">
-      <div class="flex items-center space-x-3 min-w-0">
-        <button
-          @click="toggleMobileSidebar"
-          class="md:hidden inline-flex items-center justify-center w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-300"
-          title="会话列表"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="18" x2="20" y2="18"/>
-          </svg>
-        </button>
+  <AppShell
+    ref="shellRef"
+    :brand-name="props.brandName"
+    :brand-icon="props.brandIcon"
+    :base-path="props.basePath"
+    :qa-only="props.qaOnly"
+    :conversation-agent-code="props.agentCode"
+    :panel-open="showArtifacts"
+    @new-chat="handleNewChat"
+    @auth-action="handleAuthAction"
+  >
+    <template #actions>
+      <span
+        v-if="agentInfo?.subagent_enabled"
+        class="hidden rounded bg-accent-soft px-1.5 py-0.5 text-[10px] font-medium text-accent @cozy/main:inline"
+      >专家模式</span>
+      <span
+        v-if="isGuestMode"
+        class="hidden rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 @cozy/main:inline dark:bg-amber-900/30 dark:text-amber-300"
+      >访客模式</span>
 
-        <div class="hidden sm:flex items-center space-x-1.5">
-          <div class="w-2.5 h-2.5 rounded-full bg-emerald-500"></div>
-          <h1 class="text-sm font-bold text-slate-800 dark:text-slate-100 tracking-tight">核电子学智能助手</h1>
-        </div>
-        <div class="h-4 w-px bg-slate-200 dark:bg-slate-800 hidden md:block"></div>
-        <div class="text-[11px] font-medium text-slate-400 uppercase tracking-widest hidden md:flex items-center space-x-2">
-          <span v-if="agentInfo?.subagent_enabled" class="bg-indigo-50 dark:bg-indigo-900/40 text-indigo-500 px-1.5 py-0.5 rounded text-[9px]">专家模式</span>
-          <span v-if="isGuestMode" class="bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-300 px-1.5 py-0.5 rounded text-[9px]">访客模式</span>
-        </div>
-      </div>
-      
-      <div class="flex items-center space-x-2 md:space-x-3">
-        <div class="h-4 w-px bg-slate-200 dark:bg-slate-800 hidden sm:block"></div>
+      <ConversationExportMenu
+        :messages="messages"
+        :agent-name="props.brandName"
+        :disabled="isBusy"
+      />
 
-        <button 
-          @click="showArtifacts = !showArtifacts"
-          class="p-2 transition-all duration-300 hover:scale-105 active:scale-95 relative"
-          :class="[showArtifacts ? 'text-indigo-600 dark:text-indigo-400' : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-200']"
-          title="Toggle Artifacts"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="9" y1="3" x2="9" y2="21"/>
-          </svg>
-          <span v-if="artifacts.length > 0 && !showArtifacts" class="absolute top-1 right-1 w-2 h-2 bg-indigo-500 rounded-full border-2 border-white dark:border-slate-900"></span>
-        </button>
-
-      </div>
-    </header>
-
-    <Transition name="mobile-drawer">
-      <div
-        v-if="showMobileSidebar"
-        class="fixed inset-0 z-[55] bg-black/35 md:hidden"
-        @click.self="showMobileSidebar = false"
+      <button
+        type="button"
+        class="relative inline-flex size-8 items-center justify-center rounded-lg transition-colors hover:bg-surface-hover"
+        :class="showArtifacts ? 'text-accent' : 'text-text-tertiary hover:text-text-primary'"
+        title="工件预览"
+        @click="showArtifacts = !showArtifacts"
       >
-        <div class="absolute left-0 top-0 h-full w-[84%] max-w-[320px] bg-white dark:bg-[#0f172a] shadow-2xl">
-          <HistorySidebar
-            ref="mobileSidebarRef"
-            @new-chat="handleNewChat"
-            @auth-action="handleAuthAction"
-          />
-        </div>
-      </div>
-    </Transition>
-
-    <!-- Main Content Layout -->
-    <div class="flex-1 min-h-0 flex overflow-hidden relative z-10">
-      <NavRail />
-
-      <HistorySidebar
-        v-if="showHistorySidebar"
-        class="hidden md:flex"
-        ref="sidebarRef"
-        @new-chat="handleNewChat"
-        @auth-action="handleAuthAction"
-      />
-
-      <!-- Chat Area -->
-      <main class="flex-1 min-h-0 overflow-hidden flex flex-col relative w-full items-center">
-        <MessageList
-          :messages="messages"
-          :is-busy="isBusy || isUploading"
-          @edit-user-message="handleEditAndResend"
-          @research-draft-submit="handleResearchDraftSubmit"
-          @select-suggestion="handleSelectSuggestion"
+        <PanelRight class="size-4.5" />
+        <span
+          v-if="artifacts.length > 0 && !showArtifacts"
+          class="absolute right-1 top-1 size-1.5 rounded-full bg-accent"
         />
-        
-        <div class="w-full bg-transparent pointer-events-none sticky bottom-0 flex justify-center pb-1 md:pb-8">
-          <div class="w-full max-w-4xl relative pointer-events-auto">
-            <ChatBox
-              :is-busy="isBusy || isUploading"
-              :status="isUploading ? '正在上传文件...' : status"
-              :search-enabled="searchEnabled"
-              :research-mode="researchMode"
-              :selected-skills="selectedSkills"
-              :selected-kbs="selectedKbs"
-              :guest-mode="isGuestMode"
-              :model-value="draftQuestion"
-              :agent-info="agentInfo"
-              :selected-model="selectedModel"
-              :attachments="attachments"
-              :upload-parse-mode="uploadParseMode"
-              @update:search-enabled="searchEnabled = $event"
-              @update:research-mode="researchMode = $event"
-              @update:selected-skills="selectedSkills = $event"
-              @update:selected-kbs="selectedKbs = $event"
-              @update:model-value="draftQuestion = $event"
-              @update:selected-model="selectedModel = $event"
-              @update:upload-parse-mode="setUploadParseMode"
-              @send="handleSend"
-              @abort="handleAbort"
-              @files-selected="handleFilesSelected"
-              @remove-attachment="removeAttachment"
-              @open-library-picker="showMyFilesPicker = true"
-            />
-          </div>
-        </div>
-      </main>
+      </button>
+    </template>
 
-      <!-- ArtifactSidebar -->
-      <ArtifactSidebar 
-        :artifacts="artifacts" 
-        :reset-key="artifactResetKey"
-        :show="showArtifacts" 
-        @close="showArtifacts = false" 
-      />
+    <MessageList
+      class="min-h-0 w-full flex-1"
+      :messages="messages"
+      :is-busy="isBusy || isUploading"
+      :thread-id="String(route.params.threadId || localThreadId || '')"
+      :agent-code="props.agentCode"
+      :model-name="selectedModel"
+      :empty-logo-src="props.emptyLogoSrc"
+      :empty-logo-alt="props.emptyLogoAlt"
+      :empty-title="props.emptyTitle"
+      :empty-description="props.emptyDescription"
+      :empty-suggestions="props.emptySuggestions.length ? props.emptySuggestions : undefined"
+      :empty-suggestion-style="props.emptySuggestionStyle"
+      :empty-logo-compact="props.emptyLogoCompact"
+      :empty-logo-dark-invert="props.emptyLogoDarkInvert"
+      @edit-user-message="handleEditAndResend"
+      @regenerate-answer="handleRegenerate"
+      @research-draft-submit="handleResearchDraftSubmit"
+      @select-suggestion="handleSelectSuggestion"
+      @process-action-send="handleSelectSuggestion"
+      @process-action-fill="(value: string) => { draftQuestion = value; }"
+    />
+
+    <div class="shrink-0 bg-surface px-3 pb-3 pt-1 @cozy/main:px-6 @cozy/main:pb-4">
+      <div class="mx-auto w-full min-w-0 max-w-(--content-max)">
+        <ChatBox
+          :is-busy="isBusy || isUploading"
+          :status="isUploading ? '正在上传文件...' : status"
+          :search-enabled="searchEnabled"
+          :deep-retrieval="deepRetrievalEnabled"
+          :research-mode="researchMode"
+          :selected-skills="selectedSkills"
+          :selected-kbs="selectedKbs"
+          :guest-mode="isGuestMode"
+          :model-value="draftQuestion"
+          :agent-info="agentInfo"
+          :selected-model="selectedModel"
+          :attachments="attachments"
+          :upload-parse-mode="uploadParseMode"
+          @update:search-enabled="searchEnabled = $event"
+          @update:deep-retrieval="deepRetrievalEnabled = $event"
+          @update:research-mode="researchMode = $event"
+          @update:selected-skills="selectedSkills = $event"
+          @update:selected-kbs="selectedKbs = $event"
+          @update:model-value="draftQuestion = $event"
+          @update:selected-model="selectedModel = $event"
+          @update:upload-parse-mode="setUploadParseMode"
+          @send="handleSend"
+          @abort="handleAbort"
+          @files-selected="handleFilesSelected"
+          @remove-attachment="removeAttachment"
+          @open-library-picker="showMyFilesPicker = true"
+        />
+      </div>
     </div>
-  </div>
 
-  <!-- 个人文件库选择弹窗 -->
-  <MyFilesPickerDialog
-    :show="showMyFilesPicker"
-    @close="showMyFilesPicker = false"
-    @confirm="handleConfirmMyFiles"
-  />
+    <template #panel>
+      <ArtifactSidebar
+        :artifacts="artifacts"
+        :reset-key="artifactResetKey"
+        :show="showArtifacts"
+        @close="showArtifacts = false"
+      />
+    </template>
+
+    <!-- fixed 定位弹窗，放在 AppShell 内以保持路由组件单根（路由过渡要求） -->
+    <MyFilesPickerDialog
+      :show="showMyFilesPicker"
+      @close="showMyFilesPicker = false"
+      @confirm="handleConfirmMyFiles"
+    />
+  </AppShell>
 </template>
-
-<style scoped>
-/* Scrolled content fade out top/bottom if needed */
-main::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 20px;
-  background: linear-gradient(to bottom, #ffffff, transparent);
-  z-index: 10;
-  pointer-events: none;
-}
-.dark main::before {
-  background: linear-gradient(to bottom, #0b0f1a, transparent);
-}
-
-.mobile-drawer-enter-active,
-.mobile-drawer-leave-active {
-  transition: opacity 0.2s ease;
-}
-
-.mobile-drawer-enter-from,
-.mobile-drawer-leave-to {
-  opacity: 0;
-}
-</style>

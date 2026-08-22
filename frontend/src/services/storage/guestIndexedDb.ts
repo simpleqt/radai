@@ -16,6 +16,7 @@ export interface GuestConversationMeta {
   title: string;
   updatedAt: number;
   createdAt: number;
+  agentCode?: string;
 }
 
 export interface GuestExportPayload {
@@ -127,20 +128,46 @@ const buildTitle = (messages: ChatMessage[]) => {
   return raw.length > 30 ? `${raw.slice(0, 30)}...` : raw;
 };
 
-export const getOrCreateGuestDeviceId = (): string => {
-  const existing = sessionStorage.getItem(DEVICE_ID_KEY);
-  if (existing) return existing;
+const DEVICE_ID_PATTERN =
+  /^gdev_[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const DEVICE_ID_LEGACY_PATTERN = /^gdev_[0-9]{10,16}_[a-zA-Z0-9_-]{16,64}$/;
+const isValidDeviceId = (value: string | null): value is string =>
+  !!value && (DEVICE_ID_PATTERN.test(value) || DEVICE_ID_LEGACY_PATTERN.test(value));
 
+export const getOrCreateGuestDeviceId = (): string => {
+  // 身份必须跨标签页共享（localStorage）：会话历史经 IndexedDB 在所有
+  // 标签页互通，而服务端线程按 device scope 命名空间隔离——每个标签页
+  // 铸造新身份会让旧会话在服务端解析到空 checkpoint，模型"失忆"。
+  // 生命周期与 IndexedDB 数据一致：clearGuestConversations 全清时移除。
+  const stored = localStorage.getItem(DEVICE_ID_KEY);
+  if (isValidDeviceId(stored)) return stored;
+
+  // 迁移：本标签页 sessionStorage 里已有旧身份则原位提升（当前会话的
+  // 服务端历史保持可达）；其它标签页的旧身份随其会话一次性失效。
+  const legacy = sessionStorage.getItem(DEVICE_ID_KEY);
+  if (isValidDeviceId(legacy)) {
+    localStorage.setItem(DEVICE_ID_KEY, legacy);
+    return legacy;
+  }
+
+  const randomSuffix =
+    typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function'
+      ? Array.from(crypto.getRandomValues(new Uint8Array(16)), (value) => value.toString(16).padStart(2, '0')).join('')
+      : `${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
   const deviceId =
     typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? `gdev_${crypto.randomUUID()}`
-      : `gdev_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      : `gdev_${Date.now()}_${randomSuffix}`;
 
-  sessionStorage.setItem(DEVICE_ID_KEY, deviceId);
+  localStorage.setItem(DEVICE_ID_KEY, deviceId);
   return deviceId;
 };
 
-export const saveGuestConversation = async (threadId: string, messages: ChatMessage[]) => {
+export const saveGuestConversation = async (
+  threadId: string,
+  messages: ChatMessage[],
+  agentCode?: string,
+) => {
   const normalizedMessages = (messages || []).map(normalizeMessageForStorage);
   const now = Date.now();
   await runTxn<void>([CONVERSATIONS_STORE, MESSAGES_STORE], 'readwrite', (tx, done, fail) => {
@@ -155,6 +182,7 @@ export const saveGuestConversation = async (threadId: string, messages: ChatMess
         title: buildTitle(normalizedMessages),
         updatedAt: now,
         createdAt: existing?.createdAt || now,
+        agentCode: agentCode || existing?.agentCode,
       });
 
       const index = msgStore.index('threadId');
@@ -260,12 +288,22 @@ export const renameGuestConversation = async (threadId: string, title: string) =
   });
 };
 
-export const clearGuestConversations = async () => {
+export const clearGuestConversations = async (agentCode?: string) => {
+  if (agentCode) {
+    const existing = await listGuestConversations();
+    const targets = existing.filter(
+      (item) => item.agentCode === agentCode || (!item.agentCode && agentCode === 'ne'),
+    );
+    await Promise.all(targets.map((item) => deleteGuestConversation(item.threadId)));
+    return;
+  }
   await runTxn<void>([CONVERSATIONS_STORE, MESSAGES_STORE], 'readwrite', (tx, done) => {
     tx.objectStore(CONVERSATIONS_STORE).clear();
     tx.objectStore(MESSAGES_STORE).clear();
     done(undefined);
   });
+  // 全量清除（浏览器会话结束）时同步废弃设备身份，新会话获得新 scope。
+  localStorage.removeItem(DEVICE_ID_KEY);
 };
 
 export const exportGuestConversations = async (): Promise<GuestExportPayload> => {
@@ -364,6 +402,11 @@ const removeCurrentTab = (tabId: string) => {
 
 export const initializeGuestSessionLifecycle = () => {
   if (typeof window === 'undefined') return;
+
+  // 登录态由服务端持久化；刷新时不能清空 IndexedDB 兜底缓存。
+  if (localStorage.getItem('auth_token')) {
+    return () => {};
+  }
 
   const tabId = ensureSessionTabId();
   const shouldClear = localStorage.getItem(CLEAR_ON_BOOT_KEY) === '1';

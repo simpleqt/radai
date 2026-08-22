@@ -1,0 +1,48 @@
+[
+  {
+    "name": "groundwater_params",
+    "subject": "hydrogeology",
+    "chunks": [
+      {
+        "chunk_id": "c1",
+        "doc_id": "d1",
+        "content": "承压含水层渗透系数 K=2.5 m/d，水位埋深 15.3 m，与断层 F3 呈切割关系。"
+      }
+    ],
+    "expect_chunk_ids": ["c1"],
+    "require_evidence": true,
+    "expect_entity_types": ["aquifer", "parameter"],
+    "expect_relation_types": ["has_parameter", "intersects"],
+    "expect_relation_edges": [
+      {
+        "relation_type": "has_parameter",
+        "source_contains": "含水层",
+        "target_contains": "渗透系数",
+        "chunk_ids": ["c1"]
+      },
+      {
+        "relation_type": "intersects",
+        "source_contains": "断层",
+        "target_contains": "含水层",
+        "chunk_ids": ["c1"]
+      }
+    ],
+    "min_entities": 3
+  },
+  {
+    "name": "electronics_terms",
+    "subject": "nuclear_electronics",
+    "chunks": [
+      {
+        "chunk_id": "c2",
+        "doc_id": "d2",
+        "content": "HPGe 探测器与前置放大器通过同轴电缆连接，输出信号经 MCA 采集。"
+      }
+    ],
+    "expect_chunk_ids": ["c2"],
+    "require_evidence": true,
+    "expect_entity_types": ["detector", "circuit", "model_or_code"],
+    "expect_relation_types": ["co_occurs"],
+    "min_entities": 3
+  }
+]

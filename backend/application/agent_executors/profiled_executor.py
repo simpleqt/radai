@@ -20,6 +20,9 @@ from backend.application.agent_executors.streaming_runtime import (
     AgentStreamRuntime,
     StreamRuntimeConfig,
 )
+from backend.application.agent_executors.stream_timeouts import (
+    load_stream_timeout_policy,
+)
 from backend.application.agents.definition import ResolvedAgentDefinition
 from backend.application.tools.assembler import PolicyToolAssembler
 from backend.core.agents.context import ContextPolicy
@@ -66,18 +69,50 @@ class ProfiledAgentExecutor:
     """Application executor contract backed directly by profile runtime config."""
 
     DEEP_RESEARCH_TASK_TYPE = "deep_research"
-    DEEP_RESEARCH_STREAM_TIMEOUT_SECONDS = 1800
-    DEEP_RESEARCH_IDLE_TIMEOUT_SECONDS = 600
-    DEEP_RESEARCH_FINALIZE_IDLE_TIMEOUT_SECONDS = 300
-    DEEP_RESEARCH_TASK_STALL_GRACE_SECONDS = 300
-    DEEP_RESEARCH_FINALIZE_GRACE_SECONDS = 180
+    # 深研各项超时数值统一由 StreamTimeoutPolicy 提供(env/profile 可覆盖),
+    # 不在此处重复定义第二份可能漂移的常量。
 
-    def __init__(self, *, profile: AgentProfile, **kwargs: Any):
+    def __init__(
+        self,
+        *,
+        profile: AgentProfile,
+        resolved_agent_definition: ResolvedAgentDefinition | None = None,
+        agent_bindings: AgentRuntimeBindings | None = None,
+        model_name: str | None = None,
+        thinking_enabled: bool = False,
+        subagent_enabled: bool = False,
+        use_search: bool = True,
+        deep_retrieval: bool = False,
+        lightweight_mode: bool = False,
+        thread_id: str | None = None,
+        external_thread_id: str | None = None,
+        request_metadata: dict[str, Any] | None = None,
+        workflow_name: str | None = None,
+        domain: str | None = None,
+        prompt_profile: str | None = None,
+        tool_policy: str | None = None,
+        guardrail_policy: str | None = None,
+        runtime_permissions: dict[str, Any] | None = None,
+        guardrail_instructions: str | None = None,
+        time_context: str | None = None,
+        tool_runtime_context: Any | None = None,
+        task_type: str | None = None,
+        checkpointer: Any | None = None,
+        runtime_budget: AgentRuntimeBudget | None = None,
+        agent_specs: dict[str, RuntimeAgentSpec] | None = None,
+        context_policy: ContextPolicy | None = None,
+        run_budget: RunBudget | None = None,
+        user_id: str | None = None,
+        managed_skills: bool = False,
+        skills_provider: Any | None = None,
+        kb_ids: list[str] | None = None,
+        selected_skills: Any | None = None,
+        max_concurrent_subagents: int = 5,
+        normal_max_output_chars: int = 0,
+        multi_kb_search_max_calls: int | None = None,
+    ):
         self.profile = profile
-        self._resolved_agent_definition: ResolvedAgentDefinition | None = kwargs.pop(
-            "resolved_agent_definition",
-            None,
-        )
+        self._resolved_agent_definition = resolved_agent_definition
         if self._resolved_agent_definition is not None:
             if not isinstance(
                 self._resolved_agent_definition,
@@ -106,9 +141,7 @@ class ProfiledAgentExecutor:
                 registry_scope.tool_registry if registry_scope is not None else None
             )
         )
-        self._agent_bindings: AgentRuntimeBindings | None = kwargs.pop(
-            "agent_bindings", None
-        )
+        self._agent_bindings = agent_bindings
         if self._agent_bindings is not None:
             if not isinstance(self._agent_bindings, AgentRuntimeBindings):
                 raise TypeError(
@@ -119,77 +152,62 @@ class ProfiledAgentExecutor:
                     "Runtime binding agent_code does not match executor profile: "
                     f"{self._agent_bindings.agent_code} != {profile.code}"
                 )
-        self._model_name: str | None = kwargs.pop("model_name", None)
-        self._thinking_enabled = bool(kwargs.pop("thinking_enabled", False))
-        self._subagent_enabled = bool(kwargs.pop("subagent_enabled", False))
-        self._use_search = bool(kwargs.pop("use_search", True))
-        self._lightweight_mode = bool(kwargs.pop("lightweight_mode", False))
-        self._thread_id: str | None = kwargs.pop("thread_id", None)
-        self._external_thread_id: str | None = kwargs.pop(
-            "external_thread_id", self._thread_id
+        self._model_name: str | None = model_name
+        self._thinking_enabled = bool(thinking_enabled)
+        self._subagent_enabled = bool(subagent_enabled)
+        self._use_search = bool(use_search)
+        self._deep_retrieval = bool(deep_retrieval)
+        self._lightweight_mode = bool(lightweight_mode)
+        self._thread_id: str | None = thread_id
+        self._external_thread_id: str | None = (
+            external_thread_id if external_thread_id is not None else thread_id
         )
-        self._request_metadata = dict(kwargs.pop("request_metadata", None) or {})
-        self._workflow_name = str(kwargs.pop("workflow_name", "") or "").strip() or None
-        requested_domain = kwargs.pop("domain", profile.domain)
-        requested_prompt_profile = kwargs.pop("prompt_profile", profile.prompt_profile)
-        requested_tool_policy = kwargs.pop("tool_policy", profile.tool_policy)
+        self._request_metadata = dict(request_metadata or {})
+        self._workflow_name = str(workflow_name or "").strip() or None
+        self._timeout_policy = load_stream_timeout_policy(profile)
         self._domain = str(
             self._agent_bindings.domain
             if self._agent_bindings is not None
-            else requested_domain or profile.domain
+            else domain or profile.domain
         )
         self._prompt_profile = str(
             self._agent_bindings.prompt_profile
             if self._agent_bindings is not None
-            else requested_prompt_profile or profile.prompt_profile
+            else prompt_profile or profile.prompt_profile
         )
         self._tool_policy = str(
             self._agent_bindings.tool_policy
             if self._agent_bindings is not None
-            else requested_tool_policy or profile.tool_policy
+            else tool_policy or profile.tool_policy
         )
-        self._guardrail_policy = str(
-            kwargs.pop("guardrail_policy", profile.guardrail_policy)
-            or profile.guardrail_policy
-        )
-        self._runtime_permissions = dict(kwargs.pop("runtime_permissions", None) or {})
-        self._guardrail_instructions = str(
-            kwargs.pop("guardrail_instructions", "") or ""
-        )
-        self._time_context = str(kwargs.pop("time_context", "") or "")
-        self._tool_runtime_context = kwargs.pop("tool_runtime_context", None)
-        self._task_type = str(kwargs.pop("task_type", "") or "").strip() or None
-        self._checkpointer = kwargs.pop("checkpointer", None)
-        self._agent_runtime_budget: AgentRuntimeBudget | None = kwargs.pop(
-            "runtime_budget", None
-        )
+        self._guardrail_policy = str(guardrail_policy or profile.guardrail_policy)
+        self._runtime_permissions = dict(runtime_permissions or {})
+        self._guardrail_instructions = str(guardrail_instructions or "")
+        self._time_context = str(time_context or "")
+        self._tool_runtime_context = tool_runtime_context
+        self._task_type = str(task_type or "").strip() or None
+        self._checkpointer = checkpointer
+        self._agent_runtime_budget = runtime_budget
         if self._agent_runtime_budget is not None and not isinstance(
             self._agent_runtime_budget, AgentRuntimeBudget
         ):
             raise TypeError("runtime_budget must be an AgentRuntimeBudget instance")
-        self._agent_specs: dict[str, RuntimeAgentSpec] = dict(
-            kwargs.pop("agent_specs", None) or {}
-        )
-        self._context_policy: ContextPolicy | None = kwargs.pop("context_policy", None)
-        self._run_budget: RunBudget | None = kwargs.pop("run_budget", None)
+        self._agent_specs: dict[str, RuntimeAgentSpec] = dict(agent_specs or {})
+        self._context_policy: ContextPolicy | None = context_policy
+        self._run_budget: RunBudget | None = run_budget
         if self._run_budget is not None and not isinstance(self._run_budget, RunBudget):
             raise TypeError("run_budget must be a RunBudget instance")
-        self._user_id = str(kwargs.pop("user_id", "") or "").strip() or None
-        self._managed_skills = bool(kwargs.pop("managed_skills", False))
-        self._skills_provider = kwargs.pop(
-            "skills_provider", None
-        ) or ScopedSkillsProvider(user_id=self._user_id)
-        supplied_kb_ids = kwargs.pop("kb_ids", None)
-        self._kb_ids = list(
-            profile.default_kb_ids if supplied_kb_ids is None else supplied_kb_ids
+        self._user_id = str(user_id or "").strip() or None
+        self._managed_skills = bool(managed_skills)
+        self._skills_provider = skills_provider or ScopedSkillsProvider(
+            user_id=self._user_id
         )
-        self._selected_skills = self._normalize_selected_skills(
-            kwargs.pop("selected_skills", None)
-        )
-        self._lightweight_has_kb = self._lightweight_mode and bool(self._kb_ids)
-        self._max_concurrent_subagents = int(
-            kwargs.pop("max_concurrent_subagents", 5) or 5
-        )
+        self._kb_ids = list(profile.default_kb_ids if kb_ids is None else kb_ids)
+        self._selected_skills = self._normalize_selected_skills(selected_skills)
+        # Keep the compatibility field name, but pass the actual request-level
+        # KB availability to prompt providers in both lightweight and full flows.
+        self._lightweight_has_kb = bool(self._kb_ids)
+        self._max_concurrent_subagents = int(max_concurrent_subagents or 5)
         if self._run_budget is None and self._agent_runtime_budget is not None:
             self._run_budget = _run_budget_from_runtime_budget(
                 self._agent_runtime_budget,
@@ -199,19 +217,10 @@ class ProfiledAgentExecutor:
                     or self._workflow_name == "deep_research"
                 ),
             )
-        self._normal_max_output_chars = int(
-            kwargs.pop("normal_max_output_chars", 0) or 0
-        )
+        self._normal_max_output_chars = int(normal_max_output_chars or 0)
         self._multi_kb_search_max_calls = int(
-            kwargs.pop(
-                "multi_kb_search_max_calls", self._default_multi_kb_search_max_calls()
-            )
-            or self._default_multi_kb_search_max_calls()
+            multi_kb_search_max_calls or self._default_multi_kb_search_max_calls()
         )
-        if kwargs:
-            raise TypeError(
-                "Unsupported profiled executor arguments: " + ", ".join(sorted(kwargs))
-            )
 
         self._validate_profile_bindings()
 
@@ -243,6 +252,7 @@ class ProfiledAgentExecutor:
                 thinking_enabled=self._thinking_enabled,
                 subagent_enabled=self._subagent_enabled,
                 use_search=self._use_search,
+                deep_retrieval=self._deep_retrieval,
                 kb_ids=list(self._kb_ids),
                 selected_skills=self._selected_skills,
                 skills_provider=self._skills_provider,
@@ -271,6 +281,11 @@ class ProfiledAgentExecutor:
             )
         ).build()
         self._graph = graph_result.graph
+        self._context_pruning_middleware = getattr(
+            graph_result,
+            "context_pruning_middleware",
+            None,
+        )
         self._model_name = graph_result.model_name
         self._compaction_checkpoints = getattr(
             graph_result,
@@ -436,11 +451,22 @@ class ProfiledAgentExecutor:
                 normal_max_output_chars=self._normal_max_output_chars,
                 multi_kb_search_max_calls=self._multi_kb_search_max_calls,
                 deep_research_task_type=self.DEEP_RESEARCH_TASK_TYPE,
-                deep_research_stream_timeout_seconds=self.DEEP_RESEARCH_STREAM_TIMEOUT_SECONDS,
-                deep_research_idle_timeout_seconds=self.DEEP_RESEARCH_IDLE_TIMEOUT_SECONDS,
-                deep_research_finalize_idle_timeout_seconds=self.DEEP_RESEARCH_FINALIZE_IDLE_TIMEOUT_SECONDS,
-                deep_research_task_stall_grace_seconds=self.DEEP_RESEARCH_TASK_STALL_GRACE_SECONDS,
-                deep_research_finalize_grace_seconds=self.DEEP_RESEARCH_FINALIZE_GRACE_SECONDS,
+                deep_research_stream_timeout_seconds=int(
+                    self._timeout_policy.deep_research_stream_timeout_seconds
+                ),
+                deep_research_idle_timeout_seconds=int(
+                    self._timeout_policy.deep_research_idle_timeout_seconds
+                ),
+                deep_research_finalize_idle_timeout_seconds=int(
+                    self._timeout_policy.deep_research_finalize_idle_timeout_seconds
+                ),
+                deep_research_task_stall_grace_seconds=int(
+                    self._timeout_policy.deep_research_task_stall_grace_seconds
+                ),
+                deep_research_finalize_grace_seconds=int(
+                    self._timeout_policy.deep_research_finalize_grace_seconds
+                ),
+                timeout_policy=self._timeout_policy,
                 emit_graph_artifacts=self._emit_graph_artifacts,
                 finalize_deep_research_report=self._finalize_deep_research_report,
                 resolve_history_image_tokens=self._resolve_history_image_tokens,
@@ -451,13 +477,31 @@ class ProfiledAgentExecutor:
                 checkpointer=self._checkpointer,
             )
         )
-        async for event in runtime.aquery_stream(
+        middleware = self._context_pruning_middleware
+        inner_stream = runtime.aquery_stream(
             question=question,
             thread_id=thread_id,
             config=config,
             image_contents=kwargs.get("image_contents"),
-        ):
-            yield event
+        )
+        if middleware is not None:
+            # Bind the request capability ledger for the whole stream so
+            # nested units/sub-agents can restore it after they finish.
+            with middleware.capability_scope():
+                try:
+                    async for event in inner_stream:
+                        yield event
+                finally:
+                    # A consumer that abandons this generator without aclose
+                    # would otherwise defer the runtime's own teardown (and
+                    # this scope's ledger uninstall) to GC finalization.
+                    await inner_stream.aclose()
+        else:
+            try:
+                async for event in inner_stream:
+                    yield event
+            finally:
+                await inner_stream.aclose()
 
     def _resolve_lightweight_allowed_tools(self) -> list[str]:
         if not self._lightweight_mode:
@@ -753,10 +797,11 @@ class ProfiledAgentExecutor:
         from langchain_core.messages import AIMessage as _AIMessage
         from langchain_core.messages import ToolMessage as _ToolMessage
 
+        from backend.application.agent_executors.image_url_registry import get_registry
         from backend.application.agent_executors.stream_utils import (
             stringify_message_content,
         )
-        from backend.application.image_pipeline import strip_unresolved_image_tokens
+        from backend.application.image_pipeline import strip_unregistered_image_tokens
 
         try:
             state = await asyncio.wait_for(
@@ -764,7 +809,7 @@ class ProfiledAgentExecutor:
                 timeout=2.0,
             )
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "[%s] 读取图状态用于 image token 解析失败: %s", self._label, exc
             )
             return
@@ -774,13 +819,17 @@ class ProfiledAgentExecutor:
 
         messages = state.values.get("messages") or []
         messages_to_update: list[Any] = []
+        image_registry = get_registry()
 
         for msg in reversed(messages):
             if isinstance(msg, _AIMessage):
                 raw = stringify_message_content(msg.content)
                 if "[IMAGE:" not in raw:
-                    break
-                cleaned = strip_unresolved_image_tokens(raw)
+                    continue
+                cleaned = strip_unregistered_image_tokens(
+                    raw,
+                    resolve_token=image_registry.resolve,
+                )
                 if cleaned != raw:
                     messages_to_update.append(
                         msg.model_copy(update={"content": cleaned})
@@ -789,8 +838,14 @@ class ProfiledAgentExecutor:
                 raw = stringify_message_content(msg.content)
                 if "[IMAGE:" not in raw:
                     continue
-                cleaned = strip_unresolved_image_tokens(raw)
-                messages_to_update.append(msg.model_copy(update={"content": cleaned}))
+                cleaned = strip_unregistered_image_tokens(
+                    raw,
+                    resolve_token=image_registry.resolve,
+                )
+                if cleaned != raw:
+                    messages_to_update.append(
+                        msg.model_copy(update={"content": cleaned})
+                    )
 
         if not messages_to_update:
             return
@@ -804,7 +859,7 @@ class ProfiledAgentExecutor:
                 timeout=3.0,
             )
             logger.info(
-                "[%s] 已清理历史中 %d 条消息的图片 token",
+                "[%s] 已清理历史中 %d 条失效图片 token（保留可复用引用）",
                 self._label,
                 len(messages_to_update),
             )

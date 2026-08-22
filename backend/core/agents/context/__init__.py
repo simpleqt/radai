@@ -10,6 +10,11 @@ from backend.core.agents.context.artifact_store import (
     create_context_artifact_store,
     record_context_artifact_metadata,
 )
+from backend.core.agents.context.capability_ledger import (
+    CapabilityLedger,
+    Grant,
+    LedgerRow,
+)
 from backend.core.agents.context.capture import (
     CapturedContext,
     ContextArtifactReadCaptureHandler,
@@ -30,7 +35,6 @@ from backend.core.agents.context.compaction_checkpoint import (
     CompactionCheckpointUnavailable,
     RecoveredHistoryCompaction,
 )
-from backend.core.agents.context.context_governor import ContextGovernor
 from backend.core.agents.context.engine import (
     DEFAULT_PROJECT_EVIDENCE_TOOLS,
     DEFAULT_SEMANTIC_SUMMARY_SKIP_TOOLS,
@@ -53,8 +57,25 @@ from backend.core.agents.context.ledger import (
     make_evidence_record,
     parse_multikb_text_evidence,
 )
+from backend.core.agents.context.object_store import ContextObjectStore
+from backend.core.agents.context.objects import (
+    ContextObject,
+    Fidelity,
+    ProjectionEntry,
+    ProjectionReceipt,
+    Segment,
+)
 from backend.core.agents.context.policy import ContextPolicy
+from backend.core.agents.context.projection import ProjectionCompiler, ProjectionResult
 from backend.core.agents.context.result_sink import ResultSink
+from backend.core.agents.context.segmenters import (
+    FallbackSegmenter,
+    MultiKbSegmenter,
+    Segmenter,
+    SegmenterRegistry,
+    WebSearchSegmenter,
+    create_default_segmenter_registry,
+)
 from backend.core.agents.context.state_adapter import ContextStateAdapter
 from backend.core.agents.context.subagent_adapter import (
     SubagentResultValidationError,
@@ -87,6 +108,9 @@ __all__ = [
     "ArtifactStore",
     "ContextArtifactStore",
     "ContextArtifactMetadata",
+    "CapabilityLedger",
+    "ContextObject",
+    "ContextObjectStore",
     "context_artifact_scope_matches",
     "FallbackContextArtifactStore",
     "MinioContextArtifactStore",
@@ -102,7 +126,10 @@ __all__ = [
     "ContextBudgetState",
     "ContextCapabilities",
     "ContextEngine",
-    "ContextGovernor",
+    "Fidelity",
+    "FallbackSegmenter",
+    "Grant",
+    "LedgerRow",
     "HistoryCompactionAttempt",
     "HistoryCompactionResult",
     "HistoryCompactor",
@@ -119,9 +146,14 @@ __all__ = [
     "LedgerBudget",
     "LargeResultCaptureHandler",
     "LargeResultSummarizer",
+    "MultiKbSegmenter",
     "MultiKbCaptureHandler",
     "ProjectBootstrapCaptureHandler",
     "ProjectEvidenceCaptureHandler",
+    "ProjectionCompiler",
+    "ProjectionEntry",
+    "ProjectionReceipt",
+    "ProjectionResult",
     "ResultSink",
     "RecoveredHistoryCompaction",
     "SubagentResult",
@@ -133,12 +165,17 @@ __all__ = [
     "CompiledContextRequest",
     "SUMMARY_PREFIX",
     "SkillCaptureHandler",
+    "Segment",
+    "Segmenter",
+    "SegmenterRegistry",
     "WebSearchCaptureHandler",
+    "WebSearchSegmenter",
     "TokenCounter",
     "WorkingMemory",
     "build_subagent_result",
     "context_item_to_record",
     "create_context_artifact_store",
+    "create_default_segmenter_registry",
     "record_context_artifact_metadata",
     "extract_claim_summary",
     "format_handoff_bundle",

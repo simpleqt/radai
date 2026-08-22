@@ -165,6 +165,13 @@ async def require_admin(auth: ApiKeyAuth = Depends(verify_api_key)) -> ApiKeyAut
     return auth
 
 
+async def require_teacher(auth: ApiKeyAuth = Depends(verify_api_key)) -> ApiKeyAuth:
+    """要求教师（或管理员）权限，用于基础力学课程智能体的教学分析功能。"""
+    if (auth.role or "").lower() not in {"teacher", "admin"}:
+        raise HTTPException(status_code=403, detail="需要教师权限")
+    return auth
+
+
 def _status_value(value) -> str:
     return str(getattr(value, "value", value) or "").lower()
 
@@ -329,28 +336,8 @@ async def require_kb_access(
     raise HTTPException(status_code=403, detail="无权访问该知识库")
 
 
-class TaskContext(BaseModel):
-    """任务上下文"""
-
-    task_id: str
-    user_id: str | None = None
-    priority: int = 0
-
-
-async def get_task_context(
-    x_task_id: str | None = Header(None, alias="X-Task-ID"),
-    x_priority: int = Header(0, alias="X-Priority"),
-    x_user_id: str | None = Header(None, alias="X-User-ID"),
-) -> TaskContext:
-    """获取任务上下文"""
-    if not x_task_id:
-        raise HTTPException(status_code=400, detail="缺少 Task ID")
-
-    return TaskContext(
-        task_id=x_task_id,
-        user_id=x_user_id,
-        priority=x_priority,
-    )
+# 注意：不要重新引入"信任 X-User-ID 头"的任务上下文依赖——那是把
+# 客户端可伪造的头当作身份原语；身份一律经 request.state.auth 解析。
 
 
 class PaginationParams(BaseModel):

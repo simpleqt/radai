@@ -26,22 +26,23 @@ function regenerate(force = false) {
 }
 
 watch(
-  () => props.nodeTitle,
-  (t) => { if (t) regenerate(); },
+  () => [props.nodeTitle, props.kbIds.join(',')],
+  ([t]) => { if (t) regenerate(); },
   { immediate: true },
 );
 
-watch([typeFilter, difficulty], () => regenerate());
+watch(typeFilter, () => setPage(1));
+watch(difficulty, () => regenerate());
 </script>
 
 <template>
   <div class="h-full flex flex-col">
     <!-- 头部工具 -->
-    <div class="shrink-0 px-4 pt-3 pb-2 border-b border-slate-100 dark:border-slate-800">
+    <div class="shrink-0 px-4 pt-3 pb-2 border-b border-border-subtle">
       <div class="flex items-center justify-between mb-2.5">
         <div>
-          <h3 class="text-sm font-bold text-slate-800 dark:text-slate-100">题库练习</h3>
-          <p class="text-[11px] text-slate-400">检验学习成果，巩固知识点</p>
+          <h3 class="text-sm font-bold text-text-primary">题库练习</h3>
+          <p class="text-[11px] text-text-tertiary">检验学习成果，巩固知识点</p>
         </div>
         <button
           type="button"
@@ -61,15 +62,14 @@ watch([typeFilter, difficulty], () => regenerate());
           :key="tab.key"
           type="button"
           class="text-xs px-2.5 py-1 rounded-full border transition-all"
-          :class="typeFilter === tab.key
-            ? 'bg-teal-600 border-teal-600 text-white'
-            : 'border-slate-200 dark:border-slate-700 text-slate-500 hover:border-teal-300'"
+          :class="typeFilter === tab.key ? 'bg-teal-600 border-teal-600 text-white'
+            : 'border-border-subtle text-text-secondary hover:border-teal-300'"
           @click="typeFilter = tab.key"
         >{{ tab.label }}</button>
 
         <select
           v-model="difficulty"
-          class="ml-auto text-xs px-2 py-1 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-500 focus:outline-none"
+          class="ml-auto text-xs px-2 py-1 rounded-lg border border-border-subtle bg-surface text-text-secondary focus:outline-none"
         >
           <option value="all">难度：全部</option>
           <option value="easy">简单</option>
@@ -81,13 +81,13 @@ watch([typeFilter, difficulty], () => regenerate());
 
     <!-- 题目列表 -->
     <div class="flex-1 overflow-y-auto custom-scrollbar px-4 py-3 space-y-3">
-      <div v-if="loading" class="flex items-center gap-2 text-sm text-slate-400 py-10 justify-center">
+      <div v-if="loading" class="flex items-center gap-2 text-sm text-text-tertiary py-10 justify-center">
         <Loader2 class="w-4 h-4 animate-spin" /> 正在生成习题…
       </div>
 
       <div v-else-if="error" class="text-sm text-rose-500 py-10 text-center">{{ error }}</div>
 
-      <div v-else-if="filtered.length === 0" class="flex flex-col items-center gap-2 text-slate-400 py-12">
+      <div v-else-if="filtered.length === 0" class="flex flex-col items-center gap-2 text-text-tertiary py-12">
         <FileQuestion class="w-8 h-8" />
         <p class="text-sm">暂无题目</p>
       </div>
@@ -108,17 +108,17 @@ watch([typeFilter, difficulty], () => regenerate());
     </div>
 
     <!-- 分页 -->
-    <div v-if="totalPages > 1" class="shrink-0 px-4 py-2.5 border-t border-slate-100 dark:border-slate-800 flex items-center justify-center gap-2">
+    <div v-if="totalPages > 1" class="shrink-0 px-4 py-2.5 border-t border-border-subtle flex items-center justify-center gap-2">
       <button
         type="button"
-        class="w-7 h-7 rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40"
+        class="w-7 h-7 rounded-lg flex items-center justify-center text-text-secondary hover:bg-surface-hover disabled:opacity-40"
         :disabled="page <= 1"
         @click="setPage(page - 1)"
       ><ChevronLeft class="w-4 h-4" /></button>
-      <span class="text-xs text-slate-400">{{ page }} / {{ totalPages }}</span>
+      <span class="text-xs text-text-tertiary">{{ page }} / {{ totalPages }}</span>
       <button
         type="button"
-        class="w-7 h-7 rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40"
+        class="w-7 h-7 rounded-lg flex items-center justify-center text-text-secondary hover:bg-surface-hover disabled:opacity-40"
         :disabled="page >= totalPages"
         @click="setPage(page + 1)"
       ><ChevronRight class="w-4 h-4" /></button>

@@ -231,21 +231,6 @@ def resolve_table_file_reference(
     return resolve_table_file_source(row.file_id, user_id=user_id, role=role)
 
 
-def get_table_file_info(
-    file_id: str,
-    *,
-    user_id: str | None = None,
-    role: str = "user",
-) -> dict[str, Any] | None:
-    """Return table-file metadata for one file id, or None if it is unavailable."""
-    try:
-        _source, info = resolve_table_file_source(file_id, user_id=user_id, role=role)
-        return info
-    except Exception as exc:
-        logger.warning("[TableAnalysis] 表格文件解析失败: file_id=%s, error=%s", file_id, exc)
-        return None
-
-
 def list_table_files_by_ids(
     file_ids: list[str],
     user_id: str | None = None,

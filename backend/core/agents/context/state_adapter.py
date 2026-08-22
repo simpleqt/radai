@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -9,6 +10,12 @@ from backend.core.agents.context.ledger import (
     context_item_to_record,
     make_evidence_record,
     parse_multikb_text_evidence,
+)
+from backend.core.agents.context.objects import (
+    ContextObject,
+    make_context_object,
+    make_segment,
+    split_text_blocks,
 )
 from backend.core.agents.context.policy import ContextPolicy
 from backend.core.agents.context.types import EvidenceRecord
@@ -108,6 +115,164 @@ class ContextStateAdapter:
         for item in state.get("context_items") or []:
             records.append(context_item_to_record(item))
         return records
+
+    def context_objects(self, state: Mapping[str, Any]) -> list[ContextObject]:
+        """Promote every legacy state shape into synthetic context objects."""
+
+        objects: list[ContextObject] = []
+        origin_base = {
+            "thread_id": str(
+                (state.get("thread_data") or {}).get("thread_id")
+                if isinstance(state.get("thread_data"), Mapping)
+                else ""
+            ),
+            "created_at": time.time(),
+            "last_seen_at": time.time(),
+        }
+
+        def origin(tool: str) -> dict[str, Any]:
+            return {**origin_base, "tool": tool}
+
+        for index, record in enumerate(state.get("context_records") or []):
+            if not isinstance(record, Mapping):
+                continue
+            if str(record.get("object_ref") or "").strip():
+                continue
+            content = str(record.get("content") or record.get("claim") or "")
+            segment = make_segment(
+                sid=str(record.get("id") or f"legacy:record:{index}"),
+                text=content,
+                title=str(record.get("doc_title") or record.get("source_id") or "旧上下文记录"),
+                score=float(record.get("score") or 0.5),
+                tags=list(record.get("tags") or []),
+            )
+            objects.append(
+                make_context_object(
+                    schema="legacy/record/v1",
+                    origin=origin(str(record.get("source_tool") or "legacy")),
+                    segments=[segment],
+                )
+            )
+
+        for index, item in enumerate(state.get("context_items") or []):
+            if not isinstance(item, Mapping):
+                continue
+            content = str(item.get("summary") or "")
+            if not content.strip():
+                continue
+            objects.append(
+                make_context_object(
+                    schema="legacy/item/v1",
+                    origin=origin(str(item.get("source_tool") or "legacy")),
+                    segments=[
+                        make_segment(
+                            sid=str(item.get("id") or f"legacy:item:{index}"),
+                            text=content,
+                            title=str(item.get("source_tool") or "旧上下文项"),
+                            score=float(item.get("importance") or 0.5),
+                            tags=list(item.get("tags") or []),
+                        )
+                    ],
+                )
+            )
+
+        for block_index, content in enumerate(
+            self._bounded_recent(
+                state.get("retrieved_evidence") or [],
+                max_blocks=self._policy.retrieval_fallback_blocks,
+                max_chars=self._policy.retrieval_fallback_chars,
+            )
+        ):
+            parsed = parse_multikb_text_evidence(content)
+            segments = [
+                make_segment(
+                    sid=str(record.get("id") or f"legacy:evidence:{block_index}:{idx}"),
+                    text=str(record.get("content") or ""),
+                    title=str(record.get("doc_title") or "旧检索证据"),
+                    score=float(record.get("score") or 0.5),
+                )
+                for idx, record in enumerate(parsed)
+            ]
+            if not segments:
+                segments = split_text_blocks(content, prefix="legacy")
+            objects.append(
+                make_context_object(
+                    schema="legacy/retrieval/v1",
+                    origin=origin("multi_kb_search"),
+                    segments=segments,
+                )
+            )
+
+        for _block_index, content in enumerate(
+            self._bounded_recent(
+                state.get("project_evidence") or [],
+                max_blocks=self._policy.project_fallback_blocks,
+                max_chars=self._policy.project_fallback_chars,
+            )
+        ):
+            objects.append(
+                make_context_object(
+                    schema="legacy/project/v1",
+                    origin=origin("project_evidence"),
+                    segments=split_text_blocks(content, prefix="legacy_project"),
+                )
+            )
+
+        loaded_skills = state.get("loaded_skills") or {}
+        if isinstance(loaded_skills, Mapping):
+            for name, content in loaded_skills.items():
+                objects.append(
+                    make_context_object(
+                        schema="skill/v1",
+                        origin=origin("read_local_skill_file"),
+                        segments=[
+                            make_segment(
+                                sid=f"skill:{name}",
+                                text=str(content or ""),
+                                title=str(name),
+                                score=1.0,
+                                tags=["skill_rule"],
+                            )
+                        ],
+                    )
+                )
+        project_skill = str(state.get("project_skill") or "").strip()
+        if project_skill:
+            objects.append(
+                make_context_object(
+                    schema="skill/v1",
+                    origin=origin("groundwater_project_skill_read"),
+                    segments=[
+                        make_segment(
+                            sid="project_skill:0",
+                            text=project_skill,
+                            title="当前地下水项目 Skill",
+                            score=1.0,
+                            tags=["skill_rule", "groundwater"],
+                        )
+                    ],
+                )
+            )
+        project_bootstrap = state.get("project_bootstrap") or {}
+        if isinstance(project_bootstrap, Mapping) and project_bootstrap.get("project_id"):
+            objects.append(
+                make_context_object(
+                    schema="contract/v1",
+                    origin=origin("groundwater_project_bootstrap"),
+                    segments=[
+                        make_segment(
+                            sid="project_contract:0",
+                            text=self._render_project_bootstrap_contract(
+                                dict(project_bootstrap)
+                            ),
+                            title="当前地下水项目 SQL 合同",
+                            score=1.0,
+                            tags=["groundwater", "sql_contract"],
+                        )
+                    ],
+                )
+            )
+        return objects
 
     @staticmethod
     def _bounded_recent(

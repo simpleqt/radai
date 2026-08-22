@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import threading
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -14,6 +15,23 @@ from backend.core.utils.normalization import normalize_string_set
 
 
 PromptProvider = Callable[..., str]
+
+_DEFAULT_PROMPT_REGISTRY: PromptTemplateRegistry | None = None
+_DEFAULT_PROMPT_REGISTRY_LOCK = threading.Lock()
+
+
+def default_prompt_template_registry() -> PromptTemplateRegistry:
+    """Process-wide default registry; the YAML is parsed once per process.
+
+    构造后不可变(specs/aliases 只读),按请求构造的调用方共享同一份,
+    构造失败不缓存,下一次调用会重试。
+    """
+
+    global _DEFAULT_PROMPT_REGISTRY
+    with _DEFAULT_PROMPT_REGISTRY_LOCK:
+        if _DEFAULT_PROMPT_REGISTRY is None:
+            _DEFAULT_PROMPT_REGISTRY = PromptTemplateRegistry()
+        return _DEFAULT_PROMPT_REGISTRY
 
 
 @lru_cache(maxsize=64)

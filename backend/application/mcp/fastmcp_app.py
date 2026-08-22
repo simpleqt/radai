@@ -6,12 +6,27 @@ import secrets
 from collections.abc import Sequence
 from typing import Any
 
+import anyio
 import mcp.types as mt
 from fastmcp import FastMCP
-from fastmcp.exceptions import AuthorizationError
+
+try:
+    from fastmcp.exceptions import AuthorizationError
+except ImportError:  # FastMCP < 3; retained for local test-environment compatibility.
+    from fastmcp.exceptions import FastMCPError
+
+    class AuthorizationError(FastMCPError):
+        """Compatibility equivalent of FastMCP 3 AuthorizationError."""
+
 from fastmcp.server.middleware import CallNext, MiddlewareContext
 from fastmcp.server.middleware.middleware import Middleware as FastMcpMiddleware
-from fastmcp.tools.base import Tool, ToolResult
+
+try:
+    from fastmcp.tools.base import Tool, ToolResult
+except ImportError:  # FastMCP 2.x module layout.
+    from fastmcp.tools import Tool
+    from fastmcp.tools.tool import ToolResult
+
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
@@ -35,6 +50,7 @@ from backend.application.mcp.query_service import (
 )
 from backend.application.mcp.text_retrieval import (
     NUCLEAR_ELECTRONICS_TEXT_TOOL,
+    KnowledgeBaseSelection,
     query_nuclear_electronics_text,
 )
 from backend.application.mcp.tool_catalog import (
@@ -44,6 +60,9 @@ from backend.application.mcp.tool_catalog import (
 from backend.config.loggers import get_logger
 
 logger = get_logger(__name__)
+
+# The built-in tool that dispatches another catalogued tool by name.
+PROXY_CALL_TOOL = "call_tool"
 
 
 def _request_auth(context: MiddlewareContext[Any]) -> ResolvedAuth | None:
@@ -88,6 +107,16 @@ class McpToolAllowlistMiddleware(FastMcpMiddleware):
         tool_name = context.message.name
         if allowed is not None and tool_name not in allowed:
             raise AuthorizationError(f"API Key 无权调用 MCP 工具: {tool_name}")
+        if allowed is not None and tool_name == PROXY_CALL_TOOL:
+            # ``call_tool`` dispatches a second, caller-named tool from the bound
+            # catalog. Without this check an allowlist containing only the proxy
+            # would reach every other tool the catalog exposes.
+            arguments = context.message.arguments or {}
+            nested_name = str(arguments.get("tool_name") or "").strip()
+            if nested_name not in allowed:
+                raise AuthorizationError(
+                    f"API Key 无权调用 MCP 工具: {nested_name or '(未指定)'}"
+                )
         return await call_next(context)
 
 
@@ -204,6 +233,46 @@ class _AlreadyHandledResponse(Response):
         return None
 
 
+class _McpPostMessageApp:
+    """Turn stale SSE session writes into a retryable HTTP response.
+
+    ``SseServerTransport.handle_post_message`` sends ``202 Accepted`` before
+    writing to the session's in-memory stream.  The SSE connection can close
+    between its session lookup and that write, raising an AnyIO resource error
+    after the success response has already been sent.  Buffering the response
+    lets us report the stale session accurately instead.
+    """
+
+    _SESSION_CLOSED_ERRORS = (
+        anyio.ClosedResourceError,
+        anyio.BrokenResourceError,
+    )
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        pending_messages: list[dict[str, Any]] = []
+
+        async def buffer_send(message: dict[str, Any]) -> None:
+            pending_messages.append(message)
+
+        try:
+            await self.app(scope, receive, buffer_send)
+        except self._SESSION_CLOSED_ERRORS:
+            logger.info(
+                "MCP SSE会话已关闭，拒绝过期消息: path=%s method=%s",
+                scope.get("path", ""),
+                scope.get("method", ""),
+            )
+            response = Response("MCP session is closed", status_code=410)
+            await response(scope, receive, send)
+            return
+
+        for message in pending_messages:
+            await send(message)
+
+
 def create_platform_mcp_app(spec: McpServiceSpec | None = None) -> FastMCP:
     spec = spec or get_default_mcp_service_spec()
     mcp_app = FastMCP(name=spec.name, instructions=spec.instructions)
@@ -265,7 +334,7 @@ def create_platform_mcp_app(spec: McpServiceSpec | None = None) -> FastMCP:
         return catalog.to_dict()
 
     @mcp_app.tool(
-        name="call_tool",
+        name=PROXY_CALL_TOOL,
         description="调用当前 MCP 服务目录中已授权的单个工具",
     )
     async def call_tool(
@@ -286,15 +355,29 @@ def create_platform_mcp_app(spec: McpServiceSpec | None = None) -> FastMCP:
     @mcp_app.tool(
         name=NUCLEAR_ELECTRONICS_TEXT_TOOL,
         description=(
-            "仅检索核电子学期刊知识库并返回原始文字片段；"
+            "从可选核电子学知识库检索原始文字片段；支持单选、多选和 all 全选，"
+            "默认仅选择核电子学知识库；"
             "不生成答案，不返回图片、图片链接或图片内容"
         ),
     )
     async def query_nuclear_electronics_text_tool(
         query: str,
         limit: int = 10,
+        knowledge_bases: list[KnowledgeBaseSelection] | None = None,
     ) -> dict:
-        return await query_nuclear_electronics_text(query, limit=limit)
+        """
+        Args:
+            query: 检索问题。
+            limit: 返回结果总数，范围 1-20。
+            knowledge_bases: 知识库 ID、编码或名称列表。传一个值为单选，
+                传多个值为多选，传 ["all"] 为全选；不传时仅选择默认的
+                核电子学知识库。实际 ID 从当前环境的知识库目录动态解析。
+        """
+        return await query_nuclear_electronics_text(
+            query,
+            limit=limit,
+            knowledge_bases=knowledge_bases,
+        )
 
     return mcp_app
 
@@ -342,6 +425,6 @@ def create_mcp_sse_app(
         routes=[
             Route("/", endpoint=handle_sse),
             Route("/sse", endpoint=handle_sse),
-            Mount("/messages/", app=sse.handle_post_message),
+            Mount("/messages/", app=_McpPostMessageApp(sse.handle_post_message)),
         ],
     )

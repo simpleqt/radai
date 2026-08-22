@@ -1,14 +1,18 @@
 import asyncio
 import mimetypes
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.routers.auth import get_current_user
+from backend.application.conversations.local_catalog import (
+    get_local_conversation_catalog,
+)
+from backend.core.config import build_internal_thread_key, get_paths
 from backend.db.connection import get_async_session
 from backend.db.models import Conversation, User
-from backend.core.config import get_paths, build_internal_thread_key
 
 router = APIRouter()
 
@@ -20,13 +24,22 @@ async def get_thread_artifact(
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
-    result = await session.execute(
-        select(Conversation).where(
-            Conversation.thread_id == thread_id,
-            Conversation.user_id == user.user_id,
+    local_catalog = get_local_conversation_catalog()
+    if local_catalog is not None:
+        conversation = await local_catalog.get(
+            user_id=user.user_id,
+            thread_id=thread_id,
+            include_deleted=False,
         )
-    )
-    if not result.scalar_one_or_none():
+    else:
+        result = await session.execute(
+            select(Conversation).where(
+                Conversation.thread_id == thread_id,
+                Conversation.user_id == user.user_id,
+            )
+        )
+        conversation = result.scalar_one_or_none()
+    if not conversation:
         raise HTTPException(status_code=403, detail="无权访问该资源或资源不存在")
 
     internal_thread_id = build_internal_thread_key(user.user_id, thread_id)
@@ -40,7 +53,7 @@ async def get_thread_artifact(
         )
         actual_path.relative_to(outputs_root)
     except ValueError:
-        raise HTTPException(status_code=403, detail="非法路径越权拦截")
+        raise HTTPException(status_code=403, detail="非法路径越权拦截") from None
 
     exists, is_file = await asyncio.gather(
         asyncio.to_thread(actual_path.exists),

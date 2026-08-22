@@ -10,6 +10,9 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.application.knowledge_bases.catalog_service import (
+    invalidate_knowledge_base_catalog_cache,
+)
 from backend.db.models import (
     AgentKnowledgeBase,
     KnowledgeBase,
@@ -77,6 +80,7 @@ class KnowledgeBaseCRUD:
         session.add(kb)
         await flush_or_commit(session)
         await session.refresh(kb)
+        invalidate_knowledge_base_catalog_cache()
         return kb
 
     @staticmethod
@@ -160,6 +164,7 @@ class KnowledgeBaseCRUD:
             .values(status=status, updated_at=datetime.now())
         )
         await flush_or_commit(session)
+        invalidate_knowledge_base_catalog_cache()
         return await KnowledgeBaseCRUD.get_by_id(session, kb_id)
 
     @staticmethod
@@ -221,6 +226,7 @@ class KnowledgeBaseCRUD:
             .values(**update_data)
         )
         await flush_or_commit(session)
+        invalidate_knowledge_base_catalog_cache()
         return await KnowledgeBaseCRUD.get_by_id(session, kb_id)
 
     @staticmethod
@@ -275,6 +281,7 @@ class KnowledgeBaseCRUD:
                 delete(KnowledgeBase).where(KnowledgeBase.kb_id == kb_id)
             )
             await flush_or_commit(session)
+            invalidate_knowledge_base_catalog_cache()
             return result.rowcount > 0
         except Exception:
             # Restore the session before the manager attempts to reset the KB

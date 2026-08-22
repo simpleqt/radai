@@ -1,9 +1,6 @@
 import asyncio
 import hashlib
 import os
-import time
-from collections import OrderedDict
-from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -14,88 +11,35 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 
 from backend.api.dependencies.auth import ApiKeyAuth, require_admin
+from backend.api.rate_limit import (
+    env_enabled as _env_enabled,
+    positive_int_env as _positive_int_env,
+    request_rate_limiter as _request_rate_limiter,
+)
 from backend.api.startup import (
     ALLOW_QUERY_TOKEN_AUTH,
-    main_lifespan as lifespan,
     service_role,
 )
+from backend.api.startup import (
+    main_lifespan as lifespan,
+)
 from backend.application.auth_service import api_key_scope_allows_path, auth_service
-from backend.application.auth_security import consume_sliding_window_quota
 from backend.application.exceptions import ApplicationError
 from backend.config.filters import clear_user_context, set_user_context
 from backend.config.loggers import get_logger
+from backend.config.runtime_security import (
+    cors_allow_origins,
+    fastapi_documentation_kwargs,
+    install_fastapi_documentation_guard,
+)
 from backend.config.settings import settings
-from backend.db.redis import get_redis
+from backend.core.utils.client_ip import resolve_client_ip
 
 logger = get_logger(__name__)
 
 
-def _positive_int_env(name: str, default: int) -> int:
-    try:
-        return max(1, int(os.getenv(name, str(default)) or default))
-    except (TypeError, ValueError):
-        return default
-
-
-@dataclass
-class _RateBucket:
-    tokens: float
-    updated_at: float
-
-
-class _RequestRateLimiter:
-    """Redis-backed HTTP admission control with an outage-only local fallback."""
-
-    def __init__(self) -> None:
-        self._buckets: OrderedDict[str, _RateBucket] = OrderedDict()
-        self._lock = asyncio.Lock()
-
-    async def allow(self, key: str, limit_per_minute: int) -> tuple[bool, int]:
-        limit = max(1, limit_per_minute)
-        if settings.redis_host:
-            client = get_redis()
-            quota_key = "http:rate:" + hashlib.sha256(
-                key.encode("utf-8")
-            ).hexdigest()
-            try:
-                return await consume_sliding_window_quota(
-                    client,
-                    quota_key,
-                    window_seconds=60,
-                    max_requests=limit,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Redis HTTP 限流不可用，回退到进程内限流: %s",
-                    type(exc).__name__,
-                )
-            finally:
-                await client.aclose()
-
-        now = time.monotonic()
-        refill_per_second = limit / 60.0
-        async with self._lock:
-            bucket = self._buckets.get(key)
-            if bucket is None:
-                bucket = _RateBucket(tokens=float(limit), updated_at=now)
-                self._buckets[key] = bucket
-            else:
-                bucket.tokens = min(
-                    float(limit),
-                    bucket.tokens + (now - bucket.updated_at) * refill_per_second,
-                )
-                bucket.updated_at = now
-                self._buckets.move_to_end(key)
-            allowed = bucket.tokens >= 1.0
-            if allowed:
-                bucket.tokens -= 1.0
-            retry_after = 0 if allowed else max(1, int((1.0 - bucket.tokens) / refill_per_second) + 1)
-            while len(self._buckets) > 10000:
-                self._buckets.popitem(last=False)
-            return allowed, retry_after
-
-
-_request_rate_limiter = _RequestRateLimiter()
+# Rate limiting moved to backend.api.rate_limit (shared with the Guest API);
+# _env_enabled / _positive_int_env / _request_rate_limiter are imported above.
 
 
 class SPAStaticFiles(StaticFiles):
@@ -127,19 +71,26 @@ app = FastAPI(
     description="提供文档解析、抽取、增强和入库的智能体服务",
     version="1.0.0",
     lifespan=lifespan,
+    **fastapi_documentation_kwargs(),
 )
+install_fastapi_documentation_guard(app)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        # Additional CORS origins should be configured via environment variable
-        # CORS_ALLOWED_ORIGINS (comma-separated)
-    ],
+    allow_origins=cors_allow_origins(
+        [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://202.115.138.57:5173",
+            "https://radai2.cdut.edu.cn",
+            "https://csh-ai.cdut.edu.cn",
+            "https://fmca.cdut.edu.cn",
+        ],
+        env_var="CORS_ALLOW_ORIGINS",
+    ),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID", "Accept"],
 )
 
 
@@ -234,16 +185,7 @@ async def user_context_middleware(request: Request, call_next):
                 identity = f"user:{auth.user_id}"
             else:
                 limit = _positive_int_env("HTTP_ANONYMOUS_RATE_LIMIT_PER_MINUTE", 120)
-                client_ip = request.client.host if request.client else "unknown"
-                if os.getenv("HTTP_TRUST_FORWARDED_FOR", "").strip().lower() in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                }:
-                    forwarded = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-                    client_ip = forwarded or client_ip
-                identity = f"ip:{client_ip}"
+                identity = f"ip:{resolve_client_ip(request)}"
             allowed, retry_after = await _request_rate_limiter.allow(identity, limit)
             if not allowed:
                 response = JSONResponse(
@@ -365,30 +307,22 @@ async def health_check():
                 "error": type(exc).__name__,
             }
 
-    if service_role() in {"all", "knowledge"}:
-        try:
-            from backend.rag.service import get_rag_service
 
-            if get_rag_service().is_ready:
-                components["rag"] = {"status": "ready", "error": ""}
-            else:
-                components["rag"] = {"status": "error", "error": "not_ready"}
-        except Exception as exc:
-            logger.warning("RAG 就绪检查失败: %s", type(exc).__name__)
-            components["rag"] = {
-                "status": "error",
-                "error": type(exc).__name__,
-            }
-
-    ready = bool(components) and all(
+    allowed_statuses = {"ready"}
+    if _env_enabled("HEALTH_ALLOW_EXPECTED_DEGRADED"):
+        allowed_statuses.add("degraded")
+    operational = bool(components) and all(
+        item.get("status") in allowed_statuses for item in components.values()
+    )
+    fully_ready = bool(components) and all(
         item.get("status") == "ready" for item in components.values()
     )
     payload = {
-        "status": "healthy" if ready else "degraded",
+        "status": "healthy" if fully_ready else "degraded",
         "service": "document-processing-agent",
         "components": components,
     }
-    return JSONResponse(status_code=200 if ready else 503, content=payload)
+    return JSONResponse(status_code=200 if operational else 503, content=payload)
 
 
 @app.get("/live")
@@ -413,12 +347,6 @@ async def get_config(_admin: ApiKeyAuth = Depends(require_admin)):
 
 @app.get("/")
 async def home():
-    if service_role() == "knowledge":
-        return {
-            "service": "document-processing-agent",
-            "role": "knowledge",
-            "health": "/health",
-        }
     return RedirectResponse(url="/app")
 
 
@@ -429,10 +357,9 @@ async def legacy_ui_redirect():
 
 
 def create_app() -> FastAPI:
-    """应用工厂函数"""
-    role = service_role()
-    runs_agent_runtime = role in {"all", "agent"}
-    runs_knowledge_runtime = role in {"all", "knowledge"}
+    """应用工厂函数(radai 仅运行智能体角色,知识库运行时在 omnigraph)"""
+    runs_agent_runtime = True
+    runs_knowledge_runtime = False
 
     from backend.api.routers.admin import router as admin_router
     from backend.api.routers.auth import router as auth_router
@@ -442,69 +369,18 @@ def create_app() -> FastAPI:
     app.include_router(auth_sms_router, prefix="", tags=["短信认证"])
     app.include_router(admin_router, prefix="/api/v1", tags=["管理员后台"])
 
-    if role == "agent":
-        from backend.api.routers.knowledge_proxy import (
-            router as knowledge_proxy_router,
-        )
+    from backend.api.routers.knowledge_proxy import (
+        router as knowledge_proxy_router,
+    )
 
-        app.include_router(
-            knowledge_proxy_router,
-            prefix="/api/v1",
-            tags=["知识库服务代理"],
-        )
+    app.include_router(
+        knowledge_proxy_router,
+        prefix="/api/v1",
+        tags=["知识库服务代理"],
+    )
 
-    if runs_knowledge_runtime:
-        from backend.api.dependencies.auth import get_db_session
-        from backend.api.routers.directories import router as directories_router
-        from backend.api.routers.document_ingestion import (
-            router as document_ingestion_router,
-        )
-        from backend.api.routers.document_processing import (
-            router as document_processing_router,
-        )
-        from backend.api.routers.keywords import router as keywords_router
-        from backend.api.routers.knowledge_base import router as kb_router
-        from backend.api.routers.knowledge_base_documents import (
-            router as kb_docs_router,
-        )
-        from backend.api.routers.rag import router as rag_router
-        from backend.api.routers.self_ingestion_admin import (
-            router as self_ingestion_admin_router,
-        )
-        from backend.api.routers.uploads import router as uploads_router
 
-        app.include_router(kb_docs_router, prefix="/api/v1", tags=["知识库文档"])
-        app.include_router(
-            document_processing_router,
-            prefix="/api/v1/documents",
-            tags=["文档处理"],
-        )
-        app.include_router(kb_router, prefix="/api/v1", tags=["知识库管理"])
-        app.include_router(directories_router, prefix="/api/v1", tags=["知识库目录"])
-        app.include_router(keywords_router, prefix="/api/v1", tags=["关键词管理"])
-        app.include_router(rag_router, prefix="/api/v1/rag", tags=["RAG服务"])
-        app.include_router(
-            document_ingestion_router,
-            prefix="/api/v1/ingestion",
-            tags=["文档入库"],
-        )
-        app.include_router(uploads_router, prefix="/api/v1", tags=["文件上传"])
-        app.include_router(
-            self_ingestion_admin_router,
-            prefix="/api/v1",
-            tags=["自研入库管理"],
-        )
-
-        @app.get("/api/v1/health/self-ingestion")
-        async def health_self_ingestion_alias(
-            session=Depends(get_db_session),
-            admin: ApiKeyAuth = Depends(require_admin),
-        ):
-            from backend.api.routers.self_ingestion_admin import self_ingestion_health
-
-            return await self_ingestion_health(session, admin)
-
-    if runs_agent_runtime:
+    if True:
         from backend.api.routers.admin_conversations import (
             router as admin_conv_router,
         )
@@ -516,6 +392,8 @@ def create_app() -> FastAPI:
         from backend.api.routers.chat_files import router as chat_files_router
         from backend.api.routers.conversations import (
             router as conversations_router,
+        )
+        from backend.api.routers.conversations import (
             shared_router as shared_conversations_router,
         )
         from backend.api.routers.custom_learning import router as custom_learning_router
@@ -525,11 +403,22 @@ def create_app() -> FastAPI:
             router as groundwater_projects_router,
         )
         from backend.api.routers.learning_style import router as learning_style_router
+        from backend.api.routers.message_feedback import (
+            router as message_feedback_router,
+        )
         from backend.api.routers.mcp import router as mcp_router
         from backend.api.routers.models import router as models_router
         from backend.api.routers.my_files import router as my_files_router
         from backend.api.routers.prompts import router as prompts_router
         from backend.api.routers.skills import router as skills_router
+        from backend.api.routers.teacher_analytics import (
+            router as teacher_analytics_router,
+        )
+        from backend.api.routers.question_bank import (
+            router as question_bank_router,
+        )
+        from backend.api.routers.practice import router as practice_router
+        from backend.api.routers.qb_images import router as qb_images_router
         from backend.application.mcp import create_mcp_sse_app
 
         app.include_router(conversations_router, prefix="/api/v2", tags=["对话管理"])
@@ -537,6 +426,11 @@ def create_app() -> FastAPI:
             shared_conversations_router,
             prefix="/api/v2",
             tags=["对话管理"],
+        )
+        app.include_router(
+            message_feedback_router,
+            prefix="/api/v2",
+            tags=["回答反馈"],
         )
         app.include_router(mcp_router, prefix="/api/v1/mcp", tags=["MCP服务"])
         app.include_router(
@@ -555,6 +449,18 @@ def create_app() -> FastAPI:
             tags=["智能体 Skill 绑定"],
         )
         app.include_router(skills_router, prefix="/api/v1")
+        app.include_router(
+            teacher_analytics_router,
+            prefix="/api/v2",
+            tags=["教师-提问分析"],
+        )
+        app.include_router(
+            question_bank_router,
+            prefix="/api/v2",
+            tags=["教师-题库管理"],
+        )
+        app.include_router(practice_router, prefix="/api/v2", tags=["学生-习题练习"])
+        app.include_router(qb_images_router, prefix="/api/v2", tags=["题库图片"])
         app.include_router(datasets_router, prefix="/api/v1", tags=["实验数据集"])
         app.include_router(chart_images_router, prefix="/api/v1", tags=["可视化图表"])
         app.include_router(
@@ -601,8 +507,7 @@ def create_app() -> FastAPI:
         / "assets"
     )
     if (
-        runs_agent_runtime
-        and html_ppt_assets_dir.exists()
+        html_ppt_assets_dir.exists()
         and html_ppt_assets_dir.is_dir()
     ):
         app.mount(
@@ -614,8 +519,7 @@ def create_app() -> FastAPI:
     # Keep this mount last so API and static skill routes always take precedence.
     frontend_dist_dir = Path(__file__).resolve().parents[2] / "frontend" / "dist"
     if (
-        runs_agent_runtime
-        and frontend_dist_dir.exists()
+        frontend_dist_dir.exists()
         and frontend_dist_dir.is_dir()
     ):
         app.mount(
@@ -637,10 +541,14 @@ if __name__ == "__main__":
     if bind_host in {"127.0.0.1", "localhost"}:
         bind_host = "0.0.0.0"
 
+    from backend.core.utils.client_ip import forwarded_allow_ips
+
     kwargs = {
         "host": bind_host,
         "port": settings.server_port,
         "reload": settings.server_reload,
+        "proxy_headers": True,
+        "forwarded_allow_ips": forwarded_allow_ips(),
     }
 
     if settings.server_reload:

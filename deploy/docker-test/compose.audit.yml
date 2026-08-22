@@ -1,0 +1,38 @@
+services:
+  audit-frontend:
+    env_file:
+      - "${FRONTEND_ENV:?FRONTEND_ENV is required}"
+    image: "${AUDIT_FRONTEND_IMAGE:?AUDIT_FRONTEND_IMAGE is required}"
+    read_only: true
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 15s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 384m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
+    networks:
+      - application
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    depends_on:
+      agent-api:
+        condition: service_healthy
+      knowledge-api:
+        condition: service_healthy
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${TEST_AUDIT_FRONTEND_PORT:-25177}:8080"

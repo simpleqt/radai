@@ -13,7 +13,7 @@ from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.types import Command
 from typing_extensions import override  # noqa: UP035 -- runtime supports Python 3.10
 
-from backend.core.skills.skill_runtime_state import has_loaded_skill
+from backend.core.skills.skill_runtime_state import has_loaded_skill, mark_skill_loaded
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +53,24 @@ class SkillLoadGuardMiddleware(AgentMiddleware[AgentState]):
 
     def _blocked_message(self, request: ToolCallRequest) -> ToolMessage | None:
         tool_name = str(request.tool_call.get("name") or "unknown_tool")
+        if tool_name not in self.guarded_tools:
+            return None
+
         state = getattr(request, "state", None)
         graph_loaded_skills = (
             (state or {}).get("loaded_skills") or {}
             if isinstance(state, dict)
             else {}
         )
+        # Graph state persists loaded Skill content across agent turns, while
+        # the request ContextVar starts empty for every new stream request.
+        # Keep both views consistent before invoking a guarded tool; otherwise
+        # a tool-level compatibility guard can reject a Skill that this
+        # middleware has already verified as loaded.
+        for skill_name in self.required_skills:
+            if skill_name in graph_loaded_skills:
+                mark_skill_loaded(skill_name)
+
         loaded_skills = {
             skill_name
             for skill_name in self.required_skills
@@ -69,7 +81,7 @@ class SkillLoadGuardMiddleware(AgentMiddleware[AgentState]):
             if self.required_skill_mode == "any"
             else loaded_skills == self.required_skills
         )
-        if tool_name not in self.guarded_tools or skill_loaded:
+        if skill_loaded:
             return None
 
         logger.warning(

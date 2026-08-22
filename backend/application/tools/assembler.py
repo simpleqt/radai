@@ -35,6 +35,16 @@ def _default_provider_loader() -> ToolProviderLoader:
     return _DEFAULT_PROVIDER_LOADER
 
 
+def shared_default_tool_registry() -> ToolRegistry:
+    """Expose the process-wide immutable default registry to other layers.
+
+    注册表的 YAML 每进程只解析一次;按请求构造的消费方(如定义校验器)
+    共享同一份只读实例,避免每请求重复解析 registry/policies。
+    """
+
+    return _default_tool_registry()
+
+
 def tool_spec_metadata(spec: ToolSpec) -> dict[str, object]:
     """Translate the registry contract into runtime metadata."""
 

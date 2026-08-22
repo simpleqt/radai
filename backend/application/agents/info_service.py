@@ -35,6 +35,8 @@ class AgentInfoService:
         selected_skills = sorted(profile.default_skills)
         available_skills: list[dict[str, Any]] = []
         required_skills: list[str] = []
+        skill_catalog_status = "ok"
+        skill_catalog_error: dict[str, str] | None = None
         try:
             from backend.application.skills.runtime_resolver import SkillRuntimeResolver
             from backend.db.connection import get_async_session_factory
@@ -83,8 +85,25 @@ class AgentInfoService:
                     for item in available_skills
                     if item["required"]
                 ]
-        except Exception as exc:
-            logger.warning("[AgentInfoService] Skill binding lookup failed: %s", exc)
+        except Exception:
+            # Keep built-in profile Skills usable, but make the degradation
+            # explicit so clients and operators do not mistake an outage for
+            # an authoritative empty managed catalog.
+            logger.exception("[AgentInfoService] Skill binding lookup failed")
+            from backend.application.skills.public_catalog import PublicSkillCatalog
+
+            available_skills = PublicSkillCatalog().to_info_options(profile)
+            required_skills = [
+                str(item["name"])
+                for item in available_skills
+                if item["required"]
+            ]
+            selected_skills = sorted(profile.default_skills)
+            skill_catalog_status = "degraded"
+            skill_catalog_error = {
+                "code": "SKILL_CATALOG_UNAVAILABLE",
+                "message": "托管 Skill 目录暂时不可用，当前展示内置配置",
+            }
 
         from backend.core.agents.config_compat import (
             get_available_model_info,
@@ -114,6 +133,7 @@ class AgentInfoService:
         return {
             "agent_code": profile.code,
             "name": profile.name,
+            "ui_profile": profile.ui_profile,
             "model": default_model,
             "default_model": default_model,
             "available_models": available_models,
@@ -133,6 +153,8 @@ class AgentInfoService:
             "selected_skills": selected_skills,
             "required_skills": required_skills,
             "available_skills": available_skills,
+            "skill_catalog_status": skill_catalog_status,
+            "skill_catalog_error": skill_catalog_error,
             "lightweight_mode": lightweight_mode,
             "lightweight_has_kb": lightweight_mode and bool(kb_ids),
             "features": self._features(
@@ -147,9 +169,11 @@ class AgentInfoService:
     @staticmethod
     def _supports_tool(profile: AgentProfile, tool_name: str) -> bool:
         try:
-            from backend.application.tools.registry import ToolRegistry
+            from backend.application.tools.assembler import (
+                shared_default_tool_registry,
+            )
 
-            registry = ToolRegistry()
+            registry = shared_default_tool_registry()
             selected_skills = set(profile.default_skills)
             for workflow in profile.allowed_workflows:
                 specs = registry.resolve_policy_tools(

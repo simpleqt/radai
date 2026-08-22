@@ -18,7 +18,11 @@ class RuntimeFeatures:
     - An ``AgentMiddleware`` instance: custom implementation
 
     ``summarization`` and ``guardrail`` have no built-in default — they only
-    accept ``False`` or an ``AgentMiddleware`` instance.
+    accept ``False`` or an ``AgentMiddleware`` instance. ``vision`` likewise
+    only honors a custom ``AgentMiddleware`` instance: the old built-in
+    ViewImageMiddleware was removed as deerflow legacy (no ``view_image``
+    tool ever existed), and boolean values are accepted for compatibility but
+    install nothing.
     """
 
     summarization: Literal[False] | AgentMiddleware = False

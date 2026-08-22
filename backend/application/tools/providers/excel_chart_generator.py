@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import io
 import os
-import time
-import uuid
 import warnings
 import matplotlib
 matplotlib.use("Agg")  # 无头模式，必须在 import pyplot 之前设置
@@ -58,7 +56,7 @@ def _get_chinese_font() -> str:
         try:
             fm.fontManager.addfont(font_path)
         except Exception:
-            pass
+            logger.debug("图表字体加载失败: path=%s", font_path, exc_info=True)
     available = {f.name for f in fm.fontManager.ttflist}
     for candidate in _CHINESE_FONT_CANDIDATES + ["Noto Sans CJK JP"]:
         if candidate in available:
@@ -182,6 +180,11 @@ def generate_chart(
         chart_type = auto_detect_chart_type(df, x_col, y_cols)
 
     rc = {**_SCIENCE_RC, **(style or {})}
+    # pyplot 的每个 figure 都被强引用登记在进程级全局 Gcf 里，只有 plt.close 才
+    # 摘除。记录进入时的 figure 号，在 finally 里关闭本次调用新建的所有 figure，
+    # 覆盖 _gen_* 内部抛异常、savefig 抛异常、heatmap 回退分支等泄漏路径；只关本
+    # 次新增号，不影响其他并发图表工具的 figure（长驻单 worker 才不会内存膨胀）。
+    before_fignums = set(plt.get_fignums())
     with plt.rc_context(rc):
         sns.set_theme(style="whitegrid", palette=_PALETTE, font=_FONT_FAMILY)
 
@@ -198,16 +201,19 @@ def generate_chart(
             "barh": _gen_barh,
         }.get(chart_type, _gen_bar)
 
-        fig = _gen_func(
-            df, x_col=x_col, y_cols=y_cols, group_by=group_by,
-            title=title, x_label=x_label, y_label=y_label,
-        )
+        try:
+            fig = _gen_func(
+                df, x_col=x_col, y_cols=y_cols, group_by=group_by,
+                title=title, x_label=x_label, y_label=y_label,
+            )
 
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=rc.get("figure.dpi", 150))
-        plt.close(fig)
-        buf.seek(0)
-        return buf.read()
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=rc.get("figure.dpi", 150))
+            buf.seek(0)
+            return buf.read()
+        finally:
+            for num in set(plt.get_fignums()) - before_fignums:
+                plt.close(num)
 
 
 # ── 各图表实现 ────────────────────────────────────────────────────────
@@ -240,7 +246,7 @@ def _gen_scatter(df, *, x_col, y_cols, group_by, title, x_label, y_label, **_) -
                 xr = np.linspace(xn[mask].min(), xn[mask].max(), 100)
                 ax.plot(xr, np.polyval(coef, xr), "k--", lw=1.2, alpha=0.5, label="趋势线")
         except Exception:
-            pass
+            logger.warning("散点图趋势线计算失败", exc_info=True)
         ax.legend(title=group_by, framealpha=0.8)
     else:
         xn = pd.to_numeric(df[x_col], errors="coerce") if x_col else None
@@ -404,7 +410,7 @@ def _gen_heatmap(df, *, x_col, y_cols, group_by, title, x_label, y_label, **_) -
             fig.tight_layout()
             return fig
         except Exception:
-            pass
+            logger.warning("热力图透视计算失败，回退为相关性矩阵", exc_info=True)
     # 相关性矩阵
     corr = df[num_cols].corr()
     fig, ax = _prep_fig(title or "相关性热力图",
@@ -490,8 +496,12 @@ async def save_chart(
     *,
     user_id: str | None = None,
     chart_id: str | None = None,
+    option_json: dict | None = None,
 ) -> str:
     """保存图表并返回 API 代理 URL（/api/v1/charts/{user_id}/{chart_id}）。
+
+    PNG 作为导出资产保存；``option_json``（ECharts 交互 payload）与 PNG
+    同 chart_id 存储，前端经同一 URL 的 ``format=option`` 获取。
 
     通过 API Server 代理而非直接 MinIO URL 的原因：
     1. MinIO 端口（9004）通常不对外公开
@@ -500,23 +510,11 @@ async def save_chart(
     4. URL 中包含 user_id 实现用户归属
     """
     from backend.services.chart_image_store import store_chart
-    return await store_chart(png_bytes, user_id=user_id, chart_id=chart_id)
+    return await store_chart(
+        png_bytes,
+        user_id=user_id,
+        chart_id=chart_id,
+        option_json=option_json,
+    )
 
 
-# 向后兼容旧调用（不传 user_id 时用 public 命名空间）
-async def save_chart_to_minio(png_bytes: bytes, filename: str | None = None) -> str | None:
-    """兼容旧接口：返回 API 代理 URL（而非 MinIO 直链）"""
-    cid = (filename or "").replace(".png", "").replace("chart_", "") or uuid.uuid4().hex[:16]
-    return await save_chart(png_bytes, user_id="public", chart_id=cid)
-
-
-def save_chart_locally(png_bytes: bytes, filename: str | None = None) -> str:
-    """将图表保存到本地 backend/data/charts/ 目录（MinIO 降级用），返回本地路径"""
-    from pathlib import Path
-
-    charts_dir = Path(__file__).resolve().parents[2] / "data" / "charts" / "public"
-    charts_dir.mkdir(parents=True, exist_ok=True)
-    fname = filename or f"chart_{int(time.time())}_{uuid.uuid4().hex[:8]}.png"
-    dest = charts_dir / fname
-    dest.write_bytes(png_bytes)
-    return str(dest)

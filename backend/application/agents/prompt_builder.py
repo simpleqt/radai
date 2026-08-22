@@ -11,6 +11,7 @@ from backend.application.agents.prompt_registry import (
     PromptProvider,
     PromptTemplateRegistry,
 )
+from backend.config.log_privacy import text_fingerprint
 from backend.core.agents.context.project_instructions import load_project_instructions
 from backend.core.skills.scoped_skills_provider import ScopedSkillsProvider
 
@@ -77,11 +78,10 @@ class PromptBuilder:
         prompt += self._build_skill_enforcement(context)
         prompt += runtime_context
         logger.info(
-            "[PromptBuilder] System Prompt 构建完成: domain=%s length=%d head=%s tail=%s",
+            "[PromptBuilder] System Prompt 构建完成: domain=%s length=%d prompt_meta=%s",
             context.domain,
             len(prompt),
-            prompt[:100].replace("\n", " "),
-            prompt[-200:].replace("\n", " "),
+            text_fingerprint(prompt),
         )
         return prompt
 
@@ -114,6 +114,30 @@ class PromptBuilder:
             lines.extend(f"- file_id: {file_id}" for file_id in file_ids[:10])
             lines.append("</uploaded_table_files>\n")
             chunks.append("\n".join(lines))
+        uploaded_manifest = metadata.get("_uploaded_file_manifest")
+        if isinstance(uploaded_manifest, dict) and uploaded_manifest:
+            manifest_lines = [
+                "\n<uploaded_file_manifest>",
+                "当前请求携带以下上传文件（file_id 与文件名对照）：",
+            ]
+            for fid, info in list(uploaded_manifest.items())[:10]:
+                name = str(info.get("display_name") or fid)
+                mime = str(info.get("mime_type") or "")
+                size = info.get("size_bytes")
+                manifest_lines.append(
+                    f"- file_id: {fid}  display_name: {name}  mime_type: {mime}"
+                    + (f"  size_bytes: {size}" if size is not None else "")
+                )
+            manifest_lines.append(
+                "需要把文件绑定为课程评价材料时，用 attach_material 传入对应 file_id；"
+                "材料类型按文件名自动识别（含「成绩单」=grade_sheet、含「大纲」=syllabus、"
+                "含「试卷」且为 PDF=paper）。"
+            )
+            manifest_lines.append("</uploaded_file_manifest>\n")
+            chunks.append("\n".join(manifest_lines))
+        image_analysis = metadata.get("_uploaded_image_analysis_context")
+        if isinstance(image_analysis, str) and image_analysis.strip():
+            chunks.append(image_analysis)
         return "".join(chunks)
 
     @staticmethod

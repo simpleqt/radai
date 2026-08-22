@@ -14,7 +14,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 PROJECT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 RESOURCE_FILES = {
     "skill": "SKILL.md",
@@ -39,6 +38,12 @@ class GroundwaterProjectContext:
         return int(self.manifest.get("data_version") or 1)
 
 
+# 项目包解压尺寸上限：包本体已限 2GiB，此处再限制解压后的单条目与
+# 累计尺寸，防高压缩比 zip 炸弹耗尽磁盘。
+_MAX_ARCHIVE_MEMBER_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_ARCHIVE_TOTAL_BYTES = 16 * 1024 * 1024 * 1024
+
+
 class GroundwaterProjectService:
     BUILTIN_PROJECT_ID = "liutang-groundwater"
 
@@ -50,12 +55,19 @@ class GroundwaterProjectService:
     ):
         repo_root = Path(__file__).resolve().parents[3]
         configured_root = os.getenv("GROUNDWATER_PROJECT_ROOT", "").strip()
+        configured_builtin_root = os.getenv(
+            "GROUNDWATER_BUILTIN_ROOT", ""
+        ).strip()
         self.projects_root = projects_root or (
             Path(configured_root)
             if configured_root
             else repo_root / "data" / "groundwater_projects"
         )
-        self.builtin_root = builtin_root or repo_root / "六塘项目数据信息" / "standardized"
+        self.builtin_root = builtin_root or (
+            Path(configured_builtin_root)
+            if configured_builtin_root
+            else repo_root / "六塘项目数据信息" / "standardized"
+        )
         # Explicit roots are used by isolated unit tests and do not require MySQL.
         catalog_disabled = os.getenv("GROUNDWATER_CATALOG_DISABLED", "").strip().lower()
         self.catalog_enabled = (
@@ -387,10 +399,21 @@ class GroundwaterProjectService:
         with tempfile.TemporaryDirectory(prefix="groundwater-import-") as temp_dir:
             temp_root = Path(temp_dir)
             with zipfile.ZipFile(archive_path) as archive:
+                total_uncompressed = 0
                 for member in archive.infolist():
                     target = (temp_root / member.filename).resolve()
                     if temp_root.resolve() not in target.parents and target != temp_root.resolve():
                         raise ValueError(f"ZIP 包含不安全路径: {member.filename}")
+                    if not member.is_dir():
+                        # 解压炸弹防护：单条目与累计解压尺寸封顶（包本体已限
+                        # 2GiB，但压缩比可放大百倍）。
+                        if member.file_size > _MAX_ARCHIVE_MEMBER_BYTES:
+                            raise ValueError(
+                                f"ZIP 条目解压后超过上限: {member.filename}"
+                            )
+                        total_uncompressed += member.file_size
+                if total_uncompressed > _MAX_ARCHIVE_TOTAL_BYTES:
+                    raise ValueError("ZIP 解压总量超过上限，疑似压缩炸弹")
                 archive.extractall(temp_root)
             package_root = self._find_package_root(temp_root)
             for item in package_root.iterdir():

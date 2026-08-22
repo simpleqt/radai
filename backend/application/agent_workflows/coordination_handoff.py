@@ -11,10 +11,10 @@ from urllib.parse import urlsplit
 from backend.application.agent_workflows.coordination_types import (
     CoordinationUnitResult,
 )
-from backend.application.agent_workflows.evidence_verifier import normalize_confidence
 from backend.application.agent_workflows.evidence_quality import (
     canonical_source_identity,
 )
+from backend.application.agent_workflows.evidence_verifier import normalize_confidence
 from backend.core.agents.context.ledger import make_evidence_record
 from backend.core.agents.context.subagent_adapter import normalize_subagent_result
 from backend.domain.agents.events import AgentEvent
@@ -83,7 +83,12 @@ class CoordinationHandoffService:
     @staticmethod
     def evidence_record_ref(record: dict[str, Any]) -> str:
         raw_ref = str(record.get("raw_ref") or "").strip()
-        if raw_ref:
+        # Capture handlers use ``artifact://...`` as a pointer to the raw tool
+        # payload.  It is useful for provenance, but it is not a stable,
+        # human-readable citation and several records may share the same
+        # artifact.  Prefer the document/chunk identity for local evidence,
+        # while preserving real web URLs verbatim.
+        if raw_ref.startswith(("http://", "https://")):
             return raw_ref.rstrip(").,;:，。；：）")
         title = str(
             record.get("doc_title")
@@ -94,7 +99,9 @@ class CoordinationHandoffService:
         chunk_id = str(record.get("chunk_id") or "").strip()
         if title and chunk_id:
             return f"[{title}#{chunk_id}]"
-        return f"[{title}]" if title else ""
+        if title:
+            return f"[{title}]"
+        return raw_ref.rstrip(").,;:，。；：）")
 
     @classmethod
     def captured_evidence_ref_map(
@@ -105,18 +112,27 @@ class CoordinationHandoffService:
         """Return the exact source identifiers a model is allowed to cite."""
 
         allowed: dict[str, str] = {}
-        candidates = [str(ref) for ref in evidence_refs]
-        candidates.extend(
-            cls.evidence_record_ref(record)
-            for record in evidence_records
-            if isinstance(record, dict)
-        )
-        for candidate in candidates:
+        candidates: list[tuple[str, str | None]] = [
+            (str(ref), None) for ref in evidence_refs
+        ]
+        for record in evidence_records:
+            if not isinstance(record, dict):
+                continue
+            canonical = cls.evidence_record_ref(record)
+            candidates.append((canonical, canonical))
+            # Models often return the structured record ID instead of the
+            # presentation citation. Bind those exact IDs to the same
+            # canonical document/chunk reference at the trust boundary.
+            for value in (record.get("id"), record.get("source_id")):
+                alias = str(value or "").strip()
+                if alias:
+                    candidates.append((alias, canonical))
+        for candidate, preferred_canonical in candidates:
             normalized = cls._clean_ref(candidate)
             if not normalized:
                 continue
             urls = cls._urls_in_ref(normalized)
-            canonical = urls[0] if urls else normalized
+            canonical = preferred_canonical or (urls[0] if urls else normalized)
             for alias in cls._ref_aliases(normalized):
                 allowed.setdefault(alias, canonical)
         return allowed

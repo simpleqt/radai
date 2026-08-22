@@ -1,11 +1,12 @@
 import { authState } from '@/utils/request';
 
 export interface Conversation {
-  id: number;
+  id: string;
   thread_id: string;
   title: string;
   created_at: string;
   updated_at: string;
+  pinned?: boolean;
 }
 
 export interface ThreadArtifact {
@@ -24,20 +25,25 @@ export const ConversationAPI = {
   /**
    * List all conversations for the current user
    */
-  async list(): Promise<Conversation[]> {
-    const res = await fetch('/api/v2/conversations', {
+  async list(params: { limit?: number; offset?: number; includeMetadata?: boolean } = {}): Promise<Conversation[]> {
+    const query = new URLSearchParams({
+      limit: String(params.limit ?? 20),
+      offset: String(params.offset ?? 0),
+      include_metadata: String(params.includeMetadata ?? false),
+    });
+    const res = await fetch(`/api/v2/conversations?${query.toString()}`, {
       headers: {
         'Authorization': `Bearer ${authState.value.token}`
       }
     });
-    if (!res.ok) throw new Error('ailed to fetch conversations');
+    if (!res.ok) throw new Error(`Failed to fetch conversations (${res.status})`);
     return res.json();
   },
 
   /**
    * Rename a conversation
    */
-  async rename(threadId: string, title: string): Promise<Conversation> {
+  async rename(threadId: string, title: string): Promise<{ success: boolean }> {
     const res = await fetch(`/api/v2/conversations/${threadId}`, {
       method: 'PATCH',
       headers: {
@@ -47,6 +53,22 @@ export const ConversationAPI = {
       body: JSON.stringify({ title })
     });
     if (!res.ok) throw new Error('Failed to rename conversation');
+    return res.json();
+  },
+
+  /**
+   * Pin / unpin a conversation (pinned conversations sort first)
+   */
+  async setPinned(threadId: string, pinned: boolean): Promise<{ success: boolean }> {
+    const res = await fetch(`/api/v2/conversations/${threadId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${authState.value.token}`
+      },
+      body: JSON.stringify({ pinned })
+    });
+    if (!res.ok) throw new Error('Failed to update conversation pin state');
     return res.json();
   },
 
@@ -77,7 +99,7 @@ export const ConversationAPI = {
          'Authorization': `Bearer ${authState.value.token}`
        }
      });
-     if (!res.ok) return [];
+     if (!res.ok) throw new Error(`Failed to fetch conversation messages (${res.status})`);
      return res.json();
   },
 
@@ -88,7 +110,7 @@ export const ConversationAPI = {
         'Authorization': `Bearer ${authState.value.token}`
       }
     });
-    if (!res.ok) return [];
+    if (!res.ok) throw new Error(`Failed to fetch thread artifacts (${res.status})`);
     const payload = await res.json();
     return Array.isArray(payload?.items) ? payload.items : [];
   },

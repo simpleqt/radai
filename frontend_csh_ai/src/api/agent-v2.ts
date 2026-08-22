@@ -1,3 +1,9 @@
+import { humanizeAgentStatus, workflowStartedStatus } from '@/features/process/humanize';
+import type { ToolDisplay } from '@/features/process/types';
+
+export { humanizeAgentStatus, workflowStartedStatus };
+export type { ToolDisplay };
+
 export interface ModelOption {
   name: string;
   display_name: string;
@@ -9,7 +15,23 @@ export interface KbOption {
   label: string;
 }
 
+export interface SkillOption {
+  skill_id?: string;
+  name: string;
+  label?: string;
+  description?: string;
+  display_description?: string;
+  version?: string;
+  required?: boolean;
+  default_selected?: boolean;
+  selectable?: boolean;
+  allowed_workflows?: string[];
+  preferred_workflow?: string | null;
+  guest_selectable?: boolean;
+}
+
 export interface AgentInfo {
+  agent_code?: string;
   name: string;
   model: string | null;
   /** 与后端 llm_models 默认（is_default）一致，供下拉初始选中 */
@@ -20,9 +42,81 @@ export interface AgentInfo {
   available_kbs?: KbOption[];
   subagent_enabled: boolean;
   search_enabled?: boolean;
+  search_provider?: 'firecrawl' | null;
   max_concurrent_subagents?: number;
   selected_skills?: string[] | null;
+  required_skills?: string[];
+  available_skills?: SkillOption[];
+  skill_catalog_status?: 'ok' | 'degraded';
+  skill_catalog_error?: {
+    code: string;
+    message: string;
+  } | null;
+  /** Profile 声明的默认与可用工作流；task_type 为旧后端兼容别名。 */
+  default_workflow?: string;
+  allowed_workflows?: string[];
+  task_type?: string;
+  lightweight_mode?: boolean;
+  lightweight_has_kb?: boolean;
   features: string[];
+}
+
+export function resolveAgentWorkflow(
+  info: AgentInfo | null | undefined,
+  options: {
+    researchMode?: 'normal' | 'deep_research';
+    selectedSkills?: string[];
+    useSearch?: boolean;
+    guest?: boolean;
+  } = {},
+): string | undefined {
+  const normalize = (value: unknown) => String(value || '').trim().toLowerCase().replace(/-/g, '_');
+  const defaultWorkflow = normalize(info?.default_workflow || info?.task_type);
+  const allowed = (info?.allowed_workflows || []).map(normalize).filter(Boolean);
+
+  if (options.guest) return defaultWorkflow || undefined;
+  if (options.researchMode === 'deep_research') {
+    return allowed.includes('deep_research') ? 'deep_research' : (defaultWorkflow || undefined);
+  }
+
+  const profileSelectedSkills = new Set([
+    ...(info?.selected_skills || []),
+    ...(info?.required_skills || []),
+    ...(info?.available_skills || [])
+      .filter((skill) => skill.required || skill.default_selected)
+      .map((skill) => skill.name),
+  ].map((skill) => String(skill || '').trim().toLowerCase()).filter(Boolean));
+  const skillOptions = new Map(
+    (info?.available_skills || []).map((skill) => [
+      String(skill.name || '').trim().toLowerCase(),
+      skill,
+    ]),
+  );
+  const userSelectedSkills = (options.selectedSkills || [])
+    .map((skill) => String(skill || '').trim().toLowerCase())
+    .filter((skill) => skill && !profileSelectedSkills.has(skill));
+
+  for (const skillName of userSelectedSkills) {
+    const skill = skillOptions.get(skillName);
+    const preferred = normalize(skill?.preferred_workflow);
+    const skillAllowed = (skill?.allowed_workflows || []).map(normalize).filter(Boolean);
+    if (
+      preferred
+      && allowed.includes(preferred)
+      && (skillAllowed.length === 0 || skillAllowed.includes(preferred))
+    ) {
+      return preferred;
+    }
+  }
+
+  if (options.useSearch && allowed.includes('full')) {
+    return 'full';
+  }
+  // Leave an optional Skill without a declared/allowed preference to the
+  // server-side resolver. Sending the Profile default here would turn a UI
+  // fallback into an explicit workflow override.
+  if (userSelectedSkills.length > 0) return undefined;
+  return defaultWorkflow || undefined;
 }
 
 export interface AgentProcessEvent {
@@ -35,6 +129,10 @@ export interface AgentProcessEvent {
   summary?: string;
   duration_ms?: number;
   timestamp?: number;
+  /** 流水线阶段码，由后端 presenter 给出（可选） */
+  phase?: string;
+  /** 结构化展示载荷，由后端 presenter 给出（可选） */
+  display?: ToolDisplay;
   metadata?: Record<string, unknown>;
 }
 
@@ -80,6 +178,8 @@ export interface BackgroundTaskInfo {
   error_message: string | null;
 }
 
+export const DEFAULT_AGENT_CODE = import.meta.env.VITE_AGENT_CODE || 'csh';
+
 function normalizeRuntimeEvent(data: any): { type: string | undefined; payload: any } {
   if (data && typeof data === 'object' && data.payload && typeof data.type === 'string') {
     return { type: data.type, payload: data.payload };
@@ -117,12 +217,38 @@ function coordinationEventToProcessEvent(
   if (type === 'coordination.unit.completed' || type === 'coordination.unit.failed') {
     const failed = type.endsWith('.failed');
     return {
-      id: `${type}:${payload.workflow || ''}:${payload.role || ''}`,
+      id: `${type}:${payload.workflow || ''}:${payload.task_id || payload.task_key || payload.role || ''}`,
       kind: failed ? 'error' : 'status',
       title: failed ? `${payload.role || '协作单元'}执行失败` : `${payload.role || '协作单元'}已完成`,
       detail: payload.error || payload.answer_preview || '',
       level: failed ? 'error' : 'success',
-      metadata: { runtime_type: type, role: payload.role },
+      metadata: { runtime_type: type, role: payload.role, task_id: payload.task_id, task_key: payload.task_key, task_title: payload.task_title },
+    };
+  }
+  if (type === 'coordination.partial_handoff') {
+    const handoff = payload.handoff && typeof payload.handoff === 'object' ? payload.handoff : {};
+    const claims = Array.isArray(handoff.claims) ? handoff.claims : [];
+    const summary = String(handoff.summary || '').trim();
+    const metadata = payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {};
+    const taskStatus = String(metadata.task_status || '').trim();
+    const error = String(payload.error || metadata.error || '').trim();
+    const missing = Array.isArray(handoff.missing) ? handoff.missing.map((item: unknown) => String(item)) : [];
+    const abnormalText = [error, summary, ...missing].join(' ');
+    const degraded = Boolean(
+      payload.degraded
+      || payload.valid === false
+      || metadata.degraded
+      || taskStatus === 'task_failed'
+      || taskStatus === 'task_timed_out'
+      || /(?:execution timed out|timed out after|task timed out|执行超时|执行失败|必需工具未完成|不可采信|无有效结果|子任务未返回内容)/i.test(abnormalText)
+    );
+    return {
+      id: `${type}:${payload.workflow || ''}:${payload.task_id || payload.role || ''}`,
+      kind: 'status',
+      title: degraded ? `${payload.role || '研究分支'}阶段性结果异常` : `${payload.role || '研究分支'}已提交阶段性结论`,
+      detail: error || summary || (claims.length ? `已形成 ${claims.length} 条可供汇总的结论。` : '阶段性研究结果已交给汇总智能体。'),
+      level: degraded ? 'warning' : 'success',
+      metadata: { ...metadata, runtime_type: type, role: payload.role, task_id: payload.task_id, handoff, degraded, error: error || undefined },
     };
   }
   if (type === 'coordination.completed') {
@@ -221,7 +347,7 @@ export const ChatFileAPI = {
     const headers: Record<string, string> = {};
     if (token) headers['Authorization'] = `Bearer ${token}`;
     const res = await fetch(`/api/v2/chat-files/${encodeURIComponent(threadId)}`, { headers });
-    if (!res.ok) return [];
+    if (!res.ok) throw new Error(`文件列表加载失败: ${res.status} ${res.statusText}`);
     const data = await res.json();
     return data.items || [];
   },
@@ -229,23 +355,30 @@ export const ChatFileAPI = {
   async deleteFile(fileId: string, token?: string): Promise<void> {
     const headers: Record<string, string> = {};
     if (token) headers['Authorization'] = `Bearer ${token}`;
-    await fetch(`/api/v2/chat-files/${encodeURIComponent(fileId)}`, {
+    const res = await fetch(`/api/v2/chat-files/${encodeURIComponent(fileId)}`, {
       method: 'DELETE',
       headers,
     });
+    if (!res.ok) throw new Error(`文件删除失败: ${res.status} ${res.statusText}`);
   },
 };
 
 export const AgentAPI = {
-  async getInfo(agentCode = 'csh'): Promise<AgentInfo> {
-    const res = await fetch(`/api/v2/agent-runtime/profiles/${encodeURIComponent(agentCode)}/info`);
+  async getInfo(agentCode = DEFAULT_AGENT_CODE): Promise<AgentInfo> {
+    const headers: Record<string, string> = {};
+    const token = localStorage.getItem('auth_token');
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(
+      `/api/v2/agent-runtime/profiles/${encodeURIComponent(agentCode)}/info`,
+      { headers },
+    );
     if (!res.ok) throw new Error('Failed to fetch agent info');
     return res.json();
   },
 
   async queryStream(
     question: string,
-    onChunk: (text: string) => void,
+    onChunk: (text: string, mode?: 'append' | 'replace') => void,
     onStatus: (status: string) => void,
     options?: {
       threadId?: string;
@@ -253,6 +386,7 @@ export const AgentAPI = {
       thinking?: boolean;
       kbIds?: string[];
       useSearch?: boolean;
+      deepRetrieval?: boolean;
       intentMode?: 'auto' | 'manual';
       draftId?: string;
       confirmationStatus?: 'pending' | 'confirmed' | 'revised' | 'cancelled';
@@ -265,6 +399,7 @@ export const AgentAPI = {
       signal?: AbortSignal;
       fileIds?: string[];
       agentCode?: string;
+      workflow?: string;
       metadata?: Record<string, unknown>;
     },
     onEvent?: (event: AgentProcessEvent) => void,
@@ -275,23 +410,29 @@ export const AgentAPI = {
       metadata?: Record<string, unknown>,
     ) => void,
   ): Promise<{ backgroundTaskId?: string; interrupted?: boolean; aborted?: boolean }> {
-    const payload: any = { question, agent_code: options?.agentCode || 'csh' };
+    const agentCode = options?.agentCode || DEFAULT_AGENT_CODE;
+    const payload: any = { question, agent_code: agentCode };
     if (options?.threadId) payload.thread_id = options.threadId;
     const researchMode = options?.researchMode ?? 'normal';
     const endpoint = options?.endpoint || '/api/v2/agent-runtime/query';
     const isGuestEndpoint = endpoint === '/api/v2/guest/query';
+    const requestedWorkflow = String(options?.workflow || '').trim()
+      || (researchMode === 'deep_research' ? 'deep_research' : '');
     if (!isGuestEndpoint && researchMode === 'deep_research') {
       payload.subagent_enabled = true;
-      payload.workflow = 'deep_research';
     } else {
       // 默认普通问题只使用主智能体
       payload.subagent_enabled = false;
     }
+    if (!isGuestEndpoint && requestedWorkflow) payload.workflow = requestedWorkflow;
     if (isGuestEndpoint) {
-      // 访客固定走轻量问答：无技能、无子智能体、无思考链
+      // 访客仍禁用技能、子智能体和思考链；工作流来自 Profile 信息。
       payload.selected_skills = [];
       payload.thinking = false;
-      payload.mode = 'lightweight';
+      if (requestedWorkflow) {
+        payload.mode = requestedWorkflow.replace(/_/g, '-');
+        payload.task_type = requestedWorkflow;
+      }
     } else if (options?.selectedSkills) {
       payload.selected_skills = options.selectedSkills;
     }
@@ -301,6 +442,9 @@ export const AgentAPI = {
     }
     if (options?.kbIds !== undefined) payload.kb_ids = options.kbIds;
     if (options?.useSearch !== undefined) payload.use_search = options.useSearch;
+    if (!isGuestEndpoint && options?.deepRetrieval !== undefined) {
+      payload.deep_retrieval = options.deepRetrieval;
+    }
     if (options?.model) payload.model = options.model;
     const metadata: Record<string, unknown> = { ...(options?.metadata || {}) };
     if (options?.intentMode) metadata.intent_mode = options.intentMode;
@@ -409,7 +553,7 @@ export const AgentAPI = {
             }
 
             if (type === 'workflow.started') {
-              onStatus(`workflow.started:${payload.workflow || ''}`);
+              onStatus(workflowStartedStatus(payload.workflow));
               continue;
             }
 
@@ -437,7 +581,12 @@ export const AgentAPI = {
             }
 
             if (type === 'message.delta' || type === 'chunk') {
-              onChunk(payload.content || '');
+              onChunk(payload.content || '', 'append');
+              continue;
+            }
+
+            if (type === 'message.replace') {
+              onChunk(payload.content || '', 'replace');
               continue;
             }
 
@@ -469,7 +618,7 @@ export const AgentAPI = {
             if (type === 'error' || payload.error !== undefined) {
               const message = payload.message || payload.error || 'Unknown error';
               console.error('Agent error:', message);
-              onStatus(`Error: ${message}`);
+              onStatus(humanizeAgentStatus(`Error: ${message}`));
             }
           } catch (e) {
             console.error('Error parsing SSE data:', e, 'Raw:', dataStr);
@@ -483,31 +632,31 @@ export const AgentAPI = {
 
   // ── 后台任务 API ──────────────────────────────────────
 
-  async getTaskStatus(taskId: string, threadId: string): Promise<TaskStatusResponse> {
+  async getTaskStatus(taskId: string, threadId: string, agentCode = DEFAULT_AGENT_CODE): Promise<TaskStatusResponse> {
     const headers: Record<string, string> = {};
     const token = localStorage.getItem('auth_token');
     if (token) headers['Authorization'] = `Bearer ${token}`;
-    const url = `/api/v2/agent-runtime/csh/task/${taskId}/status?thread_id=${encodeURIComponent(threadId)}`;
+    const url = `/api/v2/agent-runtime/${encodeURIComponent(agentCode)}/task/${taskId}/status?thread_id=${encodeURIComponent(threadId)}`;
     const res = await fetch(url, { headers });
     if (!res.ok) throw new Error('Failed to get task status');
     return res.json();
   },
 
-  async cancelTask(taskId: string, threadId: string): Promise<{ status: string; task_status?: string }> {
+  async cancelTask(taskId: string, threadId: string, agentCode = DEFAULT_AGENT_CODE): Promise<{ status: string; task_status?: string }> {
     const headers: Record<string, string> = {};
     const token = localStorage.getItem('auth_token');
     if (token) headers['Authorization'] = `Bearer ${token}`;
-    const url = `/api/v2/agent-runtime/csh/task/${taskId}/cancel?thread_id=${encodeURIComponent(threadId)}`;
+    const url = `/api/v2/agent-runtime/${encodeURIComponent(agentCode)}/task/${taskId}/cancel?thread_id=${encodeURIComponent(threadId)}`;
     const res = await fetch(url, { method: 'POST', headers });
     if (!res.ok) throw new Error('Failed to cancel task');
     return res.json();
   },
 
-  async getThreadActiveTask(threadId: string): Promise<{ has_active_task: boolean; task: BackgroundTaskInfo | null }> {
+  async getThreadActiveTask(threadId: string, agentCode = DEFAULT_AGENT_CODE): Promise<{ has_active_task: boolean; task: BackgroundTaskInfo | null }> {
     const headers: Record<string, string> = {};
     const token = localStorage.getItem('auth_token');
     if (token) headers['Authorization'] = `Bearer ${token}`;
-    const res = await fetch(`/api/v2/agent-runtime/csh/thread/${threadId}/task`, { headers });
+    const res = await fetch(`/api/v2/agent-runtime/${encodeURIComponent(agentCode)}/thread/${encodeURIComponent(threadId)}/task`, { headers });
     if (!res.ok) throw new Error('Failed to get thread task');
     return res.json();
   },
@@ -521,7 +670,8 @@ export const AgentAPI = {
   subscribeTaskStream(
     taskId: string,
     threadId: string,
-    onChunk: (text: string) => void,
+    agentCode: string,
+    onChunk: (text: string, mode?: 'append' | 'replace') => void,
     onStatus: (status: string) => void,
     onEvent: (event: AgentProcessEvent) => void,
     onDone: () => void,
@@ -536,6 +686,18 @@ export const AgentAPI = {
     const BASE_RETRY_DELAY_MS = 1000;
     let aborted = false;
     let retryCount = 0;
+    const abortController = new AbortController();
+    let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    const waitForRetry = (delay: number) => new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(resolve, delay);
+      abortController.signal.addEventListener('abort', () => {
+        window.clearTimeout(timer);
+        reject(new DOMException('Aborted', 'AbortError'));
+      }, { once: true });
+    });
+    const cursorKey = `agent_task_cursor:${agentCode}:${taskId}`;
+    let lastEventId = Number(sessionStorage.getItem(cursorKey) ?? -1);
+    if (!Number.isFinite(lastEventId)) lastEventId = -1;
 
     const attemptConnect = async (): Promise<void> => {
       const headers: Record<string, string> = {};
@@ -544,8 +706,9 @@ export const AgentAPI = {
         headers['Authorization'] = `Bearer ${token}`;
       }
 
-      const url = `/api/v2/agent-runtime/csh/task/${taskId}/stream?thread_id=${encodeURIComponent(threadId)}`;
-      const res = await fetch(url, { headers });
+      const cursor = lastEventId >= 0 ? `&after_event_id=${lastEventId}` : '';
+      const url = `/api/v2/agent-runtime/${encodeURIComponent(agentCode)}/task/${taskId}/stream?thread_id=${encodeURIComponent(threadId)}${cursor}`;
+      const res = await fetch(url, { headers, signal: abortController.signal });
 
       if (!res.ok) {
         // 对于可重试的 HTTP 状态码（5xx, 429），尝试重连
@@ -555,7 +718,7 @@ export const AgentAPI = {
             const delay = BASE_RETRY_DELAY_MS * Math.pow(2, retryCount - 1);
             console.warn(`[TaskSSE] HTTP ${res.status}, retrying in ${delay}ms (attempt ${retryCount}/${MAX_RETRIES})`);
             onStatus(`连接中断，正在重连... (${retryCount}/${MAX_RETRIES})`);
-            await new Promise(resolve => setTimeout(resolve, delay));
+            await waitForRetry(delay);
             return attemptConnect();
           }
         }
@@ -568,6 +731,7 @@ export const AgentAPI = {
         onError('No reader available');
         return;
       }
+      activeReader = reader;
 
       const decoder = new TextDecoder();
       let buffer = '';
@@ -583,7 +747,7 @@ export const AgentAPI = {
               const delay = BASE_RETRY_DELAY_MS * Math.pow(2, retryCount - 1);
               console.warn(`[TaskSSE] Connection lost without [DONE], retrying in ${delay}ms (attempt ${retryCount}/${MAX_RETRIES})`);
               onStatus(`连接中断，正在重连... (${retryCount}/${MAX_RETRIES})`);
-              await new Promise(resolve => setTimeout(resolve, delay));
+              await waitForRetry(delay);
               return attemptConnect();
             }
             // 重连次数耗尽，通知上层连接中断（上层会尝试自动恢复）
@@ -611,17 +775,25 @@ export const AgentAPI = {
             try {
               const data = JSON.parse(dataStr);
               const { type, payload } = normalizeRuntimeEvent(data);
+              const eventCursor = Number(payload?._task_event_id);
+              if (Number.isInteger(eventCursor) && eventCursor > lastEventId) {
+                lastEventId = eventCursor;
+                sessionStorage.setItem(cursorKey, String(lastEventId));
+              }
               if (type === 'done') {
                 if (!doneReceived) {
                   doneReceived = true;
+                  sessionStorage.removeItem(cursorKey);
                   onDone();
                 }
               } else if (type === 'message.delta' || type === 'chunk') {
-                onChunk(payload.content || '');
+                onChunk(payload.content || '', 'append');
+              } else if (type === 'message.replace') {
+                onChunk(payload.content || '', 'replace');
               } else if (type === 'reasoning.delta' || type === 'thinking') {
                 if (onThinking) onThinking(payload.content || '');
               } else if (type === 'workflow.started') {
-                onStatus(`workflow.started:${payload.workflow || ''}`);
+                onStatus(workflowStartedStatus(payload.workflow));
               } else if (type === 'workflow.step' && payload.event !== undefined) {
                 onEvent(payload.event as AgentProcessEvent);
               } else if (coordinationEventToProcessEvent(type, payload)) {
@@ -656,6 +828,10 @@ export const AgentAPI = {
       }
     })();
 
-    return () => { aborted = true; };
+    return () => {
+      aborted = true;
+      abortController.abort();
+      if (activeReader) void activeReader.cancel().catch(() => undefined);
+    };
   },
 };

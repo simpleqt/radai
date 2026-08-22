@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 from backend.api.dependencies.auth import ApiKeyAuth, require_admin, verify_api_key as get_api_key_auth
@@ -191,10 +191,47 @@ def _save_local_fallback(content: bytes, ext: str) -> str:
     return str(dest)
 
 
+def _allowed_local_dataset_roots() -> List[Path]:
+    """本地数据集允许的根目录:受管 datasets/ 目录 + 环境变量扩展。"""
+    roots = [_DATASETS_DIR.resolve()]
+    raw = (os.getenv("DATASETS_LOCAL_ALLOWED_ROOTS") or "").strip()
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            roots.append(Path(part).resolve())
+        except OSError:
+            continue
+    return roots
+
+
+def _is_allowed_local_dataset_path(file_path: str) -> bool:
+    try:
+        resolved = Path(str(file_path)).resolve()
+    except OSError:
+        return False
+    for root in _allowed_local_dataset_roots():
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def _get_local_file(ds: Any) -> Optional[str]:
     """获取数据集的本地可读路径（用于 preview 和 schema 解析）"""
-    if ds.storage_type == "local" and Path(ds.file_path).exists():
-        return ds.file_path
+    if ds.storage_type == "local":
+        # 纵深防御(R4-RT-4):公开数据集预览对普通用户开放,若放行任意
+        # 本地路径,一条(误注册/直改 DB 的)local 数据集行就等于任意本地
+        # 文件读取。历史遗留行同样不放行。
+        if not _is_allowed_local_dataset_path(ds.file_path):
+            logger.warning(
+                "[DatasetsAPI] 拒绝受管目录之外的本地数据集路径: %s", ds.file_path
+            )
+            return None
+        return ds.file_path if Path(ds.file_path).exists() else None
     # MinIO 路径：尝试从本地缓存获取
     try:
         from backend.application.tools.providers.excel_engine import _resolve_local_path
@@ -286,6 +323,17 @@ async def create_dataset(
     auth: ApiKeyAuth = Depends(require_admin),
 ):
     from backend.db.crud.dataset_crud import DatasetCRUD
+
+    # 注册期校验(R4-RT-4):local 数据集路径必须落在受管目录内,否则
+    # is_public=True 时普通用户可经 preview 读到服务器任意可读文件。
+    if req.storage_type == "local" and not _is_allowed_local_dataset_path(req.file_path):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "本地数据集路径必须位于受管 datasets 目录内"
+                "(可经 DATASETS_LOCAL_ALLOWED_ROOTS 扩展允许的根目录)"
+            ),
+        )
 
     factory = get_async_session_factory()
     async with factory() as session:
@@ -423,10 +471,19 @@ async def upload_dataset(
                 schema = await asyncio.to_thread(_parse_schema, stored_path)
             else:
                 import tempfile
-                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                    tmp.write(content)
-                    tmp_path = tmp.name
-                schema = await asyncio.to_thread(_parse_schema, tmp_path)
+
+                def _spool_and_parse() -> dict | None:
+                    # 100MB 级同步写盘同样卸到线程，不阻塞事件循环。
+                    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                        tmp.write(content)
+                        spooled = tmp.name
+                    try:
+                        return _parse_schema(spooled)
+                    finally:
+                        Path(spooled).unlink(missing_ok=True)
+
+                schema = await asyncio.to_thread(_spool_and_parse)
+                tmp_path = None
 
             if schema:
                 await DatasetCRUD.update_metadata(
@@ -451,7 +508,8 @@ async def upload_dataset(
 async def preview_dataset(
     dataset_id: str,
     sheet: Optional[str] = None,
-    rows: int = 20,
+    # 负值会一路传到 pandas 的 nrows 并抛 ValueError,把无效输入变成 500。
+    rows: int = Query(20, ge=0, le=200),
     auth: ApiKeyAuth = Depends(get_api_key_auth),
 ):
     from backend.db.crud.dataset_crud import DatasetCRUD
@@ -468,12 +526,16 @@ async def preview_dataset(
     if not local_path:
         raise HTTPException(status_code=404, detail="数据集文件不可访问（MinIO 下载失败或本地文件不存在）")
 
-    rows = min(rows, 200)
     try:
         sheet_data = await asyncio.to_thread(
             _parse_preview, local_path, sheet=sheet, rows=rows
         )
     except Exception:
+        logger.exception(
+            "[DatasetsAPI] 数据集预览读取失败: dataset_id=%s path=%s",
+            dataset_id,
+            local_path,
+        )
         raise HTTPException(status_code=500, detail="读取文件失败")
 
     return {
@@ -502,8 +564,16 @@ async def refresh_dataset_schema(
         try:
             invalidate_cache(ds.file_path)
         except Exception:
-            pass
+            logger.warning(
+                "[DatasetsAPI] schema 缓存失效失败: dataset_id=%s path=%s",
+                dataset_id,
+                ds.file_path,
+                exc_info=True,
+            )
 
+        # MinIO 下载 + pandas 全表解析是秒级重 IO：先提交只读事务归还连接，
+        # 解析期间不钉住 MySQL（expire_on_commit=False，ds 仍可用）。
+        await session.commit()
         local_path = await asyncio.to_thread(_get_local_file, ds)
         if not local_path:
             raise HTTPException(status_code=404, detail="数据集文件不可访问")

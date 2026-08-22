@@ -136,7 +136,7 @@ const cancelResearch = () => {
 <template>
   <section
     v-if="(draftEvent && isPending) || isStreaming"
-    class="rounded-2xl border border-cyan-200 bg-cyan-50/70 p-4 text-slate-800 dark:border-cyan-800 dark:bg-cyan-950/20 dark:text-slate-100"
+    class="animate-in fade-in slide-in-from-bottom-2 rounded-2xl border border-cyan-200 bg-cyan-50/70 p-4 text-text-primary duration-300 dark:border-cyan-800 dark:bg-cyan-950/20"
   >
     <div class="mb-3 flex items-center justify-between gap-2">
       <h3 class="text-sm font-semibold">
@@ -157,13 +157,13 @@ const cancelResearch = () => {
       </span>
     </div>
 
-    <p class="mb-3 text-xs leading-5 text-slate-600 dark:text-slate-300">
+    <p class="mb-3 text-xs leading-5 text-text-secondary">
       {{ isStreaming ? 'AI 正在为你生成研究方案，请稍候...' : '你可以直接编辑下方研究分点后提交，或不修改直接确认开始研究。' }}
     </p>
 
     <div
       v-if="isStreaming && !planText"
-      class="mb-3 min-h-[180px] w-full rounded-xl border border-cyan-200 bg-white/90 px-3 py-2 text-sm leading-6 text-slate-400 dark:border-cyan-800 dark:bg-slate-900/70 dark:text-slate-500"
+      class="mb-3 min-h-[180px] w-full rounded-xl border border-cyan-200 bg-surface/90 px-3 py-2 text-sm leading-6 text-text-tertiary dark:border-cyan-800"
     >
       <div class="flex items-center gap-2">
         <span class="inline-block h-2 w-2 animate-ping rounded-full bg-cyan-500"></span>
@@ -174,7 +174,7 @@ const cancelResearch = () => {
     <textarea
       v-model="planText"
       :disabled="disabled || isStreaming"
-      class="mb-3 min-h-[180px] w-full rounded-xl border border-cyan-200 bg-white/90 px-3 py-2 text-sm leading-6 text-slate-700 outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-100 disabled:opacity-60 dark:border-cyan-800 dark:bg-slate-900/70 dark:text-slate-200 dark:focus:ring-cyan-900/40"
+      class="mb-3 min-h-[180px] w-full rounded-xl border border-cyan-200 bg-surface/90 px-3 py-2 text-sm leading-6 text-text-secondary outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-100 disabled:opacity-60 dark:border-cyan-800 dark:focus:ring-cyan-900/40"
     ></textarea>
 
     <div v-if="!isStreaming" class="flex flex-wrap items-center gap-2">
@@ -189,7 +189,7 @@ const cancelResearch = () => {
       <button
         type="button"
         :disabled="disabled || !sourceQuestion"
-        class="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-600 transition hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+        class="rounded-lg border border-border-subtle bg-surface px-3 py-1.5 text-xs font-semibold text-text-secondary transition hover:bg-surface-hover disabled:opacity-50"
         @click="cancelResearch"
       >
         取消本次研究

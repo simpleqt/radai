@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.api.dependencies.auth import ApiKeyAuth, verify_api_key
 from backend.application.agent_executors.image_url_registry import (
@@ -37,7 +37,9 @@ logger = get_logger(__name__)
 
 
 class McpQueryRequest(BaseModel):
-    query: str = Field(..., description="用户查询")
+    # 与 AgentRuntimeQueryRequest.question 同上界（50000）：MCP 触发完整
+    # Agent 流水线，无上界 query 等于无上界 prompt。
+    query: str = Field(..., min_length=1, max_length=50_000, description="用户查询")
     thread_id: str | None = Field(default=None, min_length=1, max_length=100)
     conversation_id: str | None = Field(default=None, min_length=1, max_length=100)
 
@@ -54,10 +56,18 @@ class McpQueryRequest(BaseModel):
 class McpToolCallRequest(BaseModel):
     tool_name: str = Field(..., min_length=1, max_length=128)
     arguments: dict = Field(default_factory=dict)
-    agent_code: str | None = None
-    workflow: str | None = None
-    selected_skills: list[str] | None = None
+    agent_code: str | None = Field(default=None, min_length=1, max_length=64)
+    workflow: str | None = Field(default=None, min_length=1, max_length=32)
+    selected_skills: list[str] | None = Field(default=None, max_length=32)
     thread_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+    @field_validator("arguments")
+    @classmethod
+    def validate_arguments_size(cls, value: dict) -> dict:
+        # 字典无法用 max_length 限制体量；按序列化长度挡恶意大参数。
+        if len(json.dumps(value, ensure_ascii=False, default=str)) > 65536:
+            raise ValueError("arguments 序列化后超过 64KB 上限")
+        return value
     conversation_id: str | None = Field(default=None, min_length=1, max_length=100)
 
     @model_validator(mode="after")
@@ -95,7 +105,7 @@ async def get_mcp_config(
 ):
     from backend.config.settings import settings
 
-    server_host = settings.server_host or "YOUR_SERVER_HOST"
+    server_host = settings.server_host or "202.115.138.57"
     if server_host in {"127.0.0.1", "localhost"}:
         server_host = "0.0.0.0"
 
@@ -161,6 +171,7 @@ async def call_mcp_tool(
             thread_id=body.thread_id,
             conversation_id=body.conversation_id,
             checkpointer=get_checkpointer_from_request(http_request),
+            allowed_tools=auth.mcp_allowed_tools,
         )
         return {"tool_name": body.tool_name, "result": value}
     except PermissionError as exc:
@@ -252,8 +263,9 @@ async def stream_generator(
         logger.warning("MCP 流式连接被取消")
         raise
     except Exception as e:
+        # 内部异常细节只记日志，不回传客户端（SSE 绕过全局 handler 兜底）。
         logger.exception(f"MCP 流式查询失败: {e}")
-        yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+        yield f"data: {json.dumps({'type': 'error', 'message': '服务处理出现错误，请稍后重试'}, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
     finally:
         await close_async_iterator_safely(edge_events)
@@ -314,25 +326,84 @@ async def mcp_query_stream(
     auth: ApiKeyAuth = Depends(verify_api_key),
 ):
     """MCP 流式查询接口"""
+    from backend.application.conversations.thread_guard import (
+        ConversationThreadBusy,
+        acquire_conversation_thread,
+        conversation_lease_key,
+        start_lease_heartbeat,
+        stop_lease_heartbeat,
+    )
+
+    # MCP is a conversation-writing entry point just like the Agent and Guest
+    # `/query` paths: a caller-supplied thread id runs the same graph and
+    # persists checkpoints. Without the shared lease, an MCP stream and a
+    # browser stream on one thread fork the same parent checkpoint and
+    # interleave their writes. A request without a thread id gets a fresh
+    # internal thread and cannot conflict (the guard returns None).
+    try:
+        thread_lease = acquire_conversation_thread(
+            conversation_lease_key(
+                auth.user_id,
+                body.thread_id or body.conversation_id,
+            )
+        )
+    except ConversationThreadBusy as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "conversation_thread_busy",
+                "message": str(exc),
+                "thread_id": body.thread_id or body.conversation_id,
+            },
+        ) from exc
+
     try:
         from backend.application.checkpointing.checkpointer import get_checkpointer_from_request
 
-        return StreamingResponse(
-            stream_generator(
+        checkpointer = get_checkpointer_from_request(http_request)
+    except Exception as e:
+        if thread_lease is not None:
+            thread_lease.release()
+        logger.exception(f"MCP 流式查询初始化失败: {e}")
+        raise HTTPException(status_code=500, detail="MCP 流式查询初始化失败")
+
+    async def _guarded_stream():
+        heartbeat = start_lease_heartbeat(thread_lease)
+        try:
+            async for item in stream_generator(
                 body.query,
                 user_id=auth.user_id,
                 thread_id=body.thread_id,
                 conversation_id=body.conversation_id,
-                checkpointer=get_checkpointer_from_request(http_request),
+                checkpointer=checkpointer,
                 request=http_request,
-            ),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-    except Exception as e:
-        logger.exception(f"MCP 流式查询初始化失败: {e}")
-        raise HTTPException(status_code=500, detail="MCP 流式查询初始化失败")
+            ):
+                yield item
+        finally:
+            stop_lease_heartbeat(heartbeat)
+            if thread_lease is not None:
+                thread_lease.release()
+
+    from backend.application.mcp.query_service import get_default_mcp_service_spec
+    from backend.application.question_analytics import schedule_question_collection
+
+    mcp_spec = get_default_mcp_service_spec()
+    schedule_question_collection(
+        question=body.query,
+        user_id=auth.user_id,
+        agent_code=mcp_spec.agent_code,
+        role=auth.role,
+        thread_id=body.thread_id or body.conversation_id,
+        workflow=mcp_spec.workflow,
+        model_name=None,
+    )
+
+    return StreamingResponse(
+        _guarded_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

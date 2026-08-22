@@ -78,6 +78,32 @@ def create_tables():
         print(f"  ✓ {table}")
 
 
+def _bootstrap_api_key_columns(session, raw_key: str) -> dict:
+    """Persist the bootstrap key as a digest when the schema supports it."""
+
+    from sqlalchemy import inspect
+
+    from backend.application.api_key_credentials import (
+        API_KEY_HASH_COLUMN,
+        api_key_digest,
+        api_key_prefix,
+    )
+
+    try:
+        columns = {
+            column["name"] for column in inspect(session.bind).get_columns("api_keys")
+        }
+    except Exception:
+        columns = set()
+    if API_KEY_HASH_COLUMN in columns:
+        return {
+            "api_key": None,
+            "api_key_hash": api_key_digest(raw_key),
+            "api_key_prefix": api_key_prefix(raw_key),
+        }
+    return {"api_key": raw_key}
+
+
 def create_default_user():
     """创建默认管理员（如果不存在）。"""
     import os
@@ -112,7 +138,7 @@ def create_default_user():
             session.flush()
 
             api_key = ApiKey(
-                api_key=initial_api_key,
+                **_bootstrap_api_key_columns(session, initial_api_key),
                 user_id=user.user_id,
                 key_name="初始化管理员 Key",
                 is_active=True,

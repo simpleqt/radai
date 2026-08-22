@@ -20,13 +20,44 @@ EMPTY_HTML_IMAGE_PATTERN = re.compile(
     r"<img\b[^>]*\bsrc\s*=\s*(['\"])\s*\1[^>]*>",
     re.IGNORECASE,
 )
-UNRESOLVED_IMAGE_TOKEN_PATTERN = re.compile(r"\[?IMAGE:[^\]\s\)]+(?:\])?", re.IGNORECASE)
+UNRESOLVED_IMAGE_TOKEN_PATTERN = re.compile(
+    r"\[?IMAGE:[^\]\s\)]+(?:\])?", re.IGNORECASE
+)
 MINIO_IMAGE_URL_PATTERN = re.compile(
     r"(?P<url>(?:https?://[^\s<>'\"\]\)]+)?/files/"
     r"[^\s<>'\"\]\)]*?\.(?:jpg|jpeg|png|gif|webp|bmp|tif|tiff)"
     r"(?:\?[^\s<>'\"\]\)]*)?)",
     re.IGNORECASE,
 )
+# 已经是浏览器直连形态的图片代理 URL（知识库图 / 题库图 / 工件下载）。它们携带
+# 自己的签名，不得再走 MinIO 对象归一化——题库图 URL 的查询参数是
+# name=question-bank/…，会被 /files/ 模式误当对象路径改写成不存在的
+# object_name=qb-image 并叠出 /api/v2/api/v2/ 双前缀，导致流式期间图片 404
+# 裂图；工件下载链接（object_name/filename 以图片扩展名结尾时）同理会被
+# 改写成不存在的 kb-image 对象。
+BROWSER_IMAGE_PROXY_PREFIXES = (
+    "/api/v2/files/kb-image?",
+    "/api/v2/files/qb-image?",
+    "/api/v2/files/minio-artifact/download",
+    "/files/kb-image?",
+    "/files/qb-image?",
+    "/files/minio-artifact/download",
+)
+_BROWSER_IMAGE_PROXY_MARKERS = (
+    "/api/v2/files/kb-image?",
+    "/api/v2/files/qb-image?",
+    "/files/minio-artifact/download",
+)
+
+
+def is_browser_image_proxy_url(url: str) -> bool:
+    """Return True when the URL is already a browser-facing signed proxy URL."""
+
+    raw = url or ""
+    if any(raw.startswith(prefix) for prefix in BROWSER_IMAGE_PROXY_PREFIXES):
+        return True
+    # 绝对源形态（https://host/api/v2/...）不做前缀匹配，但路径标记足以判定。
+    return any(marker in raw for marker in _BROWSER_IMAGE_PROXY_MARKERS)
 MARKDOWN_IMAGE_URL_PATTERN = re.compile(
     r"!\[(?P<alt>[^\]]*)\]\(\s*(?P<url>"
     r"(?:https?://[^\s<>'\"\]\)]+)?/files/[^\s<>'\"\]\)]*?"
@@ -52,6 +83,7 @@ HTML_IMAGE_URL_PATTERN = re.compile(
 STANDALONE_IMAGE_URL_PATTERN = re.compile(
     r"`?(?P<url>(?:https?://[^\s`]+?\.(?:jpg|jpeg|png|gif|bmp|webp|tiff|tif)"
     r"|/api/v2/files/kb-image\?[^\s`]+"
+    r"|/api/v2/files/qb-image\?[^\s`]+"
     r"|/files/[^\s`]+?\.(?:jpg|jpeg|png|gif|bmp|webp|tiff|tif)))`?",
     re.IGNORECASE,
 )
@@ -59,8 +91,23 @@ ANSWER_MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\(\s*[^)\n]+\s*\)")
 ANSWER_HTML_IMAGE_PATTERN = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 ANSWER_FENCED_CODE_PATTERN = re.compile(r"```[\s\S]*?```")
 BARE_KB_IMAGE_PROXY_URL_PATTERN = re.compile(
-    r"(?<![\w<\[])"
-    r"(?P<url>/api/v2/files/kb-image\?[^\s<>'\"\]\)]+)",
+    r"(?<![\w<\[])" r"(?P<url>/api/v2/files/kb-image\?[^\s<>'\"\]\)]+)",
+    re.IGNORECASE,
+)
+KB_IMAGE_PROXY_URL_PATTERN = re.compile(
+    r"(?P<url>(?:https?://[^\s<>'\"\]\)\|]+)?"
+    r"/api/v2/files/kb-image\?[^\s<>'\"\]\)\|]+)",
+    re.IGNORECASE,
+)
+# 题库题图代理与 kb-image 同构，但签名域独立（name=question-bank/…）；
+# 历史正文里的 qb URL 同样需要刷新签名（TTL 默认 24h）。
+QB_IMAGE_PROXY_URL_PATTERN = re.compile(
+    r"(?P<url>(?:https?://[^\s<>'\"\]\)\|]+)?"
+    r"/api/v2/files/qb-image\?[^\s<>'\"\]\)\|]+)",
+    re.IGNORECASE,
+)
+BARE_QB_IMAGE_PROXY_URL_PATTERN = re.compile(
+    r"(?<![\w<\[])" r"(?P<url>/api/v2/files/qb-image\?[^\s<>'\"\]\)]+)",
     re.IGNORECASE,
 )
 INTERNAL_MINIO_URL_PATTERN = re.compile(
@@ -85,7 +132,9 @@ def normalize_image_url(url: str) -> str:
     raw = (url or "").strip()
     if not raw:
         return raw
-    if raw.startswith(("data:", "/api/v2/files/kb-image?")):
+    if raw.startswith(("data:", "/api/")):
+        return raw
+    if is_browser_image_proxy_url(raw):
         return raw
 
     try:
@@ -101,9 +150,20 @@ def normalize_image_url(url: str) -> str:
         return raw
 
     try:
-        from backend.storage import get_minio_image_proxy_url, get_presigned_url, get_public_url
+        from backend.storage import (
+            get_minio_image_proxy_url,
+            get_presigned_url,
+            get_public_url,
+        )
 
         obj_key = raw.lstrip("/").replace("\\", "/")
+        # Object keys are not URLs.  Resolve them through the same-origin proxy
+        # directly so a scheme-less MinIO endpoint (for example
+        # ``minio.internal:9000``) cannot leak into browser-facing output as a
+        # malformed relative URL.
+        proxy = get_minio_image_proxy_url(f"/files/{obj_key}")
+        if proxy:
+            return proxy
         public = get_public_url(obj_key)
         if public:
             return get_minio_image_proxy_url(public) or public
@@ -143,17 +203,22 @@ def rewrite_image_references(
     if not text:
         return text
 
-    resolved = _rewrite_minio_image_urls(text)
+    resolved = _refresh_kb_image_proxy_urls(text)
+    resolved = _refresh_qb_image_proxy_urls(resolved)
+    resolved = _rewrite_minio_image_urls(resolved)
     if resolve_token is not None and "IMAGE:" in resolved:
         resolved = IMAGE_TOKEN_PATTERN.sub(
-            lambda match: resolve_token(canonical_image_token(match.group(1))) or match.group(0),
+            lambda match: resolve_token(canonical_image_token(match.group(1)))
+            or match.group(0),
             resolved,
         )
         resolved = BARE_IMAGE_TOKEN_PATTERN.sub(
-            lambda match: resolve_token(canonical_image_token(match.group(1))) or match.group(0),
+            lambda match: resolve_token(canonical_image_token(match.group(1)))
+            or match.group(0),
             resolved,
         )
     resolved = strip_unresolved_image_tokens(resolved)
+    resolved = promote_proxy_image_table_cells(resolved)
     return promote_standalone_image_urls(resolved) if promote_standalone else resolved
 
 
@@ -173,7 +238,10 @@ def replace_image_urls_for_model_context(
         return text
 
     def _token_text(url: str, caption: str = "") -> str:
-        caption = strip_internal_urls_from_caption(caption or default_caption) or default_caption
+        caption = (
+            strip_internal_urls_from_caption(caption or default_caption)
+            or default_caption
+        )
         token = register_image(normalize_image_url(url), caption)
         return f"[图片 {token}｜图注：{caption}]"
 
@@ -200,6 +268,38 @@ def strip_unresolved_image_tokens(text: str) -> str:
         text = UNRESOLVED_MARKDOWN_IMAGE_PATTERN.sub("", text)
         text = UNRESOLVED_IMAGE_TOKEN_PATTERN.sub("", text)
     return strip_empty_image_markup(text)
+
+
+def strip_unregistered_image_tokens(
+    text: str,
+    *,
+    resolve_token: Callable[[str], str | None],
+) -> str:
+    """Drop only stale image tokens while preserving durable history tokens."""
+
+    if not text or "IMAGE:" not in text:
+        return strip_empty_image_markup(text)
+
+    def _registered(raw_token: str) -> bool:
+        match = re.fullmatch(r"\[?IMAGE:(\d+)\]?", raw_token.strip(), re.IGNORECASE)
+        if not match:
+            return False
+        return bool(resolve_token(canonical_image_token(match.group(1))))
+
+    def _replace_markdown(match: re.Match) -> str:
+        token_match = re.search(
+            r"\[?IMAGE:[^\]\)\s]+\]?", match.group(0), re.IGNORECASE
+        )
+        return (
+            match.group(0) if token_match and _registered(token_match.group(0)) else ""
+        )
+
+    cleaned = UNRESOLVED_MARKDOWN_IMAGE_PATTERN.sub(_replace_markdown, text)
+    cleaned = UNRESOLVED_IMAGE_TOKEN_PATTERN.sub(
+        lambda match: match.group(0) if _registered(match.group(0)) else "",
+        cleaned,
+    )
+    return strip_empty_image_markup(cleaned)
 
 
 def strip_empty_image_markup(text: str) -> str:
@@ -269,7 +369,16 @@ def _find_incomplete_markdown_image_start(buf: str) -> int | None:
 def promote_standalone_image_urls(text: str) -> str:
     """Render image-only lines as Markdown images before frontend parsing."""
 
-    if not text or not any(marker in text for marker in ("http://", "https://", "/files/", "/api/v2/files/kb-image?")):
+    if not text or not any(
+        marker in text
+        for marker in (
+            "http://",
+            "https://",
+            "/files/",
+            "/api/v2/files/kb-image?",
+            "/api/v2/files/qb-image?",
+        )
+    ):
         return text
 
     lines = text.split("\n")
@@ -293,9 +402,55 @@ def promote_standalone_image_urls(text: str) -> str:
         if covered != stripped:
             promoted.append(line)
             continue
-        promoted.append("\n\n".join(f"![](<{match.group('url')}>)" for match in matches))
+        promoted.append(
+            "\n\n".join(f"![](<{match.group('url')}>)" for match in matches)
+        )
 
     return "\n".join(promoted)
+
+
+_PROXY_TABLE_CELL_PATTERNS = (
+    (KB_IMAGE_PROXY_URL_PATTERN, "知识库图片"),
+    (QB_IMAGE_PROXY_URL_PATTERN, "题图"),
+)
+
+
+def promote_proxy_image_table_cells(text: str) -> str:
+    """Turn a proxy URL occupying a Markdown table cell into an actual image."""
+
+    if not text or "|" not in text:
+        return text
+    if not any(
+        marker in text for marker in ("/api/v2/files/kb-image?", "/api/v2/files/qb-image?")
+    ):
+        return text
+
+    promoted: list[str] = []
+    for line in text.split("\n"):
+        if (
+            "|" not in line
+            or "/api/v2/files/kb-image?" not in line
+            and "/api/v2/files/qb-image?" not in line
+        ):
+            promoted.append(line)
+            continue
+        cells = line.split("|")
+        changed = False
+        for index, cell in enumerate(cells):
+            stripped = cell.strip().strip("`")
+            for pattern, alt in _PROXY_TABLE_CELL_PATTERNS:
+                match = pattern.fullmatch(stripped)
+                if not match:
+                    continue
+                cells[index] = f" ![{alt}](<{match.group('url')}>) "
+                changed = True
+                break
+        promoted.append("|".join(cells) if changed else line)
+    return "\n".join(promoted)
+
+
+# 兼容旧名（表单元格提升语义未变，只是把 qb 一并纳入）。
+promote_kb_image_table_cells = promote_proxy_image_table_cells
 
 
 def sanitize_answer_image_urls(text: str) -> str:
@@ -306,10 +461,16 @@ def sanitize_answer_image_urls(text: str) -> str:
     protected so the browser-facing image reference is not damaged.
     """
 
-    if not text or "/api/v2/files/kb-image?" not in text:
+    if not text or not any(
+        marker in text
+        for marker in ("/api/v2/files/kb-image?", "/api/v2/files/qb-image?")
+    ):
         return text
 
-    result = promote_standalone_image_urls(text)
+    result = _refresh_kb_image_proxy_urls(text)
+    result = _refresh_qb_image_proxy_urls(result)
+    result = promote_proxy_image_table_cells(result)
+    result = promote_standalone_image_urls(result)
     protected: list[str] = []
 
     def _protect(match: re.Match) -> str:
@@ -330,6 +491,7 @@ def sanitize_answer_image_urls(text: str) -> str:
         return trailing
 
     result = BARE_KB_IMAGE_PROXY_URL_PATTERN.sub(_remove_proxy_url, result)
+    result = BARE_QB_IMAGE_PROXY_URL_PATTERN.sub(_remove_proxy_url, result)
     result = re.sub(r"[ \t]{2,}", " ", result)
     result = re.sub(r"[ \t]+\n", "\n", result)
 
@@ -344,7 +506,7 @@ def _rewrite_minio_image_urls(text: str) -> str:
 
     def _replace(match: re.Match) -> str:
         url = match.group("url")
-        if url.startswith("/files/kb-image?") or "/api/v2/files/kb-image?" in url:
+        if is_browser_image_proxy_url(url):
             return url
         return normalize_image_url(url)
 
@@ -354,11 +516,42 @@ def _rewrite_minio_image_urls(text: str) -> str:
     )
 
 
+def _refresh_kb_image_proxy_urls(text: str) -> str:
+    if not text or "/api/v2/files/kb-image?" not in text:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        from backend.storage import get_minio_image_proxy_url
+
+        return get_minio_image_proxy_url(match.group("url")) or match.group("url")
+
+    return KB_IMAGE_PROXY_URL_PATTERN.sub(_replace, text)
+
+
+def _refresh_qb_image_proxy_urls(text: str) -> str:
+    if not text or "/api/v2/files/qb-image?" not in text:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        from backend.application.question_bank.images import (
+            build_qb_image_url,
+            extract_qb_image_object_name,
+        )
+
+        object_name = extract_qb_image_object_name(match.group("url"))
+        return build_qb_image_url(object_name) if object_name else match.group("url")
+
+    return QB_IMAGE_PROXY_URL_PATTERN.sub(_replace, text)
+
+
 def _replace_context_bare_image_urls(
     text: str,
     replace_url: Callable[[str, str], str],
 ) -> str:
-    if not text or not any(marker in text for marker in ("http://", "https://", "/files/", "/api/v2/files/kb-image?")):
+    if not text or not any(
+        marker in text
+        for marker in ("http://", "https://", "/files/", "/api/v2/files/kb-image?")
+    ):
         return text
 
     def _replace(match: re.Match) -> str:

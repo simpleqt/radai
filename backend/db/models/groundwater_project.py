@@ -5,7 +5,7 @@ from datetime import datetime
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Index, JSON, String, UniqueConstraint
 from sqlalchemy.orm import relationship
 
-from backend.db.models import Base
+from backend.db.models.base import Base
 
 
 class GroundwaterProject(Base):

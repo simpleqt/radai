@@ -1,116 +1,100 @@
 # MD 文件入库接口文档
 
-> **状态**：✅ **已实现** — 复用 `/api/v1/uploads/batch` 上传，Worker 自动识别 `.md` 并走 `MDIngestor` 直入库。  
-> **设计背景**：[md_ingestion_design.md](./md_ingestion_design.md)
+> **状态**：已实现（2026-07-09 对齐当前代码）
+> **设计说明**：[md_ingestion_design.md](./md_ingestion_design.md)
+> **重要说明**：当前生产接口只支持“上传 Markdown 文件后入库”，不支持直接 POST Markdown 文本内容的 `/documents/md` 接口。
 
-## 1. 概述
+## 1. 调用流程
 
-MD 文件入库复用现有的上传和入库接口，底层自动识别 `.md` 文件，跳过 MinerU 解析步骤，直接入库，大幅提升效率。
-
-**与 PDF 入库的区别**：
-
-| 环节 | PDF | MD |
-|------|-----|-----|
-| 解析 | MinerU 解析 PDF→MD（5~30 秒） | **跳过**，直接读 MD 内容 |
-| 其余流程 | 完全一致 | 完全一致 |
-
----
-
-## 2. 调用流程
-
-```
-① 上传 .md 文件 → ② 启动入库 → ③ 轮询状态直到完成
+```text
+1. 上传 .md 文件
+2. 启动入库
+3. 轮询 task_id 状态
+4. 可选：self_ingestion 库通过管理 API 查看 job / repair
 ```
 
----
+## 2. 上传 MD 文件
 
-## 3. 接口详情
+### 2.1 批量上传
 
-### 3.1 上传 MD 文件
-
-> 复用接口，与上传 PDF 完全一致。
-
-**请求**
-
-```
+```http
 POST /api/v1/uploads/batch
 Content-Type: multipart/form-data
-Authorization: Bearer <api_key>
+Authorization: Bearer <token>
 ```
-
-**参数（Form 字段）**
 
 | 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
+| --- | --- | --- | --- |
 | `kb_id` | string | 是 | 知识库 ID |
-| `category_path` | string | 否 | 分类路径，如 `"技术文档/AI"` |
-| `files` | file[] | 是 | 文件列表，支持 `.md` |
-
-**curl 示例**
+| `category_path` | string | 否 | 分类路径 |
+| `files` | file[] | 是 | 文件列表，批量最多 20 个，支持 `.md` |
 
 ```bash
-curl -X POST 'http://<api_server_ip>:8082/api/v1/uploads/batch' \
-  -H 'Authorization: Bearer <api_key>' \
+curl -X POST 'http://localhost:8082/api/v1/uploads/batch' \
+  -H 'Authorization: Bearer <token>' \
   -F 'kb_id=kb-123e4567-e89b-12d3-a456-426614174000' \
   -F 'category_path=技术文档/AI' \
-  -F 'files=@/path/to/技术文档.md' \
-  -F 'files=@/path/to/设计说明.md'
+  -F 'files=@/path/to/技术文档.md;type=text/markdown'
 ```
 
-**响应**
+响应：
 
 ```json
 {
   "success": true,
-  "upload_id": "upload-abc123",
+  "upload_id": "upload-batch-id",
   "files": [
     {
-      "file_id": "file-def456",
+      "file_id": "file-id",
       "file_name": "技术文档.md",
       "file_size": 12345,
-      "minio_path": "pending/kb-xxx/file-def456/技术文档.md",
-      "status": "pending"
-    },
-    {
-      "file_id": "file-ghi789",
-      "file_name": "设计说明.md",
-      "file_size": 67890,
-      "minio_path": "pending/kb-xxx/file-ghi789/设计说明.md",
+      "minio_path": "pending/kb-xxx/file-id/技术文档.md",
       "status": "pending"
     }
   ],
-  "total": 2,
-  "message": "批量上传成功，共 2 个文件等待入库"
+  "total": 1,
+  "message": "批量上传成功，共 1 个文件等待入库"
 }
 ```
 
-> 上传后文件处于 **待入库** 状态（`status=0`），尚未入库到 RAG 系统。
+上传后 `kb_pending_files.status=0`，文件只进入待入库队列。
 
----
+### 2.2 分块上传（大文件）
 
-### 3.2 查看待入库文件
+大文件可使用同一路由前缀的分块接口：
 
-**请求**
-
+```text
+POST /api/v1/uploads/init
+POST /api/v1/uploads/chunks/{upload_id}/{chunk_index}
+POST /api/v1/uploads/complete/{upload_id}
 ```
+
+`complete` 后同样生成 `kb_pending_files.status=0` 的待入库记录。
+
+### 2.3 管理端单文件上传
+
+管理员也可以使用：
+
+```http
+POST /api/v1/knowledge_bases/{kb_id}/documents
+```
+
+该接口当前支持 `pdf/docx/txt/md/png/jpg/jpeg`，文件上限 100MB，上传后仍需启动入库。
+
+## 3. 查看待入库文件
+
+```http
 GET /api/v1/uploads/pending?kb_id=<kb_id>&status=0
-Authorization: Bearer <api_key>
+Authorization: Bearer <token>
 ```
 
-**curl 示例**
-
-```bash
-curl -X GET 'http://<api_server_ip>:8082/api/v1/uploads/pending?kb_id=kb-xxx&status=0' \
-  -H 'Authorization: Bearer <api_key>'
-```
-
-**响应**
+响应：
 
 ```json
 {
   "items": [
     {
-      "file_id": "file-def456",
+      "file_id": "file-id",
       "kb_id": "kb-xxx",
       "file_name": "技术文档.md",
       "file_size": 12345,
@@ -119,120 +103,91 @@ curl -X GET 'http://<api_server_ip>:8082/api/v1/uploads/pending?kb_id=kb-xxx&sta
       "error_message": null,
       "document_date": null,
       "category_path": "技术文档/AI",
-      "created_at": "2026-05-06T10:30:00"
+      "created_at": "2026-07-09T10:30:00"
     }
   ],
   "total": 1
 }
 ```
 
-**`status` 含义**
+`kb_pending_files.status`：
 
-| 值 | 说明 |
-|----|------|
-| 0 | 待入库（已上传，尚未启动入库） |
-| 1 | 入库中（Worker 正在处理） |
-| 2 | 已入库（成功，文档可在 RAG 中查询） |
-| 3 | 失败（error_message 记录了错误） |
+| 值 | 轮询返回 | 含义 |
+| --- | --- | --- |
+| `0` | `pending` | 已上传，尚未启动入库 |
+| `1` | `processing` | 已启动，worker 等待或处理中 |
+| `2` | `completed` | 入库完成 |
+| `3` | `failed` | 入库失败或 self 链路 blocked |
 
----
+## 4. 启动入库
 
-### 3.3 启动入库
-
-**请求**
-
-```
+```http
 POST /api/v1/uploads/ingest
 Content-Type: application/json
-Authorization: Bearer <api_key>
+Authorization: Bearer <token>
 ```
 
-**Body**
+请求：
 
 ```json
 {
   "kb_id": "kb-123e4567-e89b-12d3-a456-426614174000",
-  "file_ids": ["file-def456", "file-ghi789"],
-  "document_date": "2026-05-06",
+  "file_ids": ["file-id"],
+  "document_date": "2026-07-09",
   "category_path": "技术文档/AI"
 }
 ```
 
 | 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
+| --- | --- | --- | --- |
 | `kb_id` | string | 是 | 知识库 ID |
-| `file_ids` | string[] | 是 | 待入库文件 ID 列表（从上传响应中获取） |
-| `document_date` | string | 否 | 文档业务日期（`YYYY-MM-DD`） |
-| `category_path` | string | 否 | 分类路径，传入后会覆盖上传时的设置 |
+| `file_ids` | string[] | 是 | 待入库文件 ID |
+| `document_date` | date | 否 | 文档业务日期，`YYYY-MM-DD` |
+| `category_path` | string | 否 | 传入时覆盖上传阶段的分类路径；传 `""` 可置空 |
+| `options` | object | 否 | 预留字段，当前 worker 不依赖 |
 
-**curl 示例**
-
-```bash
-curl -X POST 'http://<api_server_ip>:8082/api/v1/uploads/ingest' \
-  -H 'Authorization: Bearer <api_key>' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "kb_id": "kb-123e4567-e89b-12d3-a456-426614174000",
-    "file_ids": ["file-def456", "file-ghi789"],
-    "document_date": "2026-05-06",
-    "category_path": "技术文档/AI"
-  }'
-```
-
-**响应**
+响应：
 
 ```json
 {
   "success": true,
-  "task_id": "task-abc123",
-  "files_count": 2,
+  "task_id": "task-id",
+  "files_count": 1,
   "message": "入库任务已创建，已提交给独立 worker 处理"
 }
 ```
 
-> 此时文件状态变为 `status=1`（入库中），独立 Worker 进程会自动拉取并处理。
+接口会把选中文件更新为：
 
----
+- `status=1`
+- `upload_id=task_id`
+- `ingest_job_id=task_id`
+- `ingestion_backend=declared_ingestion_backend(kb)`
+- `document_date` / `category_path`
 
-### 3.4 查看入库进度
+## 5. 轮询入库状态
 
-**请求**
-
-```
+```http
 GET /api/v1/uploads/ingest/status/{task_id}
-Authorization: Bearer <api_key>
+Authorization: Bearer <token>
 ```
 
-**curl 示例**
-
-```bash
-curl -X GET 'http://<api_server_ip>:8082/api/v1/uploads/ingest/status/task-abc123' \
-  -H 'Authorization: Bearer <api_key>'
-```
-
-**响应**
+响应：
 
 ```json
 {
-  "task_id": "task-abc123",
-  "kb_id": "kb-123e4567-e89b-12d3-a456-426614174000",
-  "status": "completed",
-  "total": 2,
-  "completed": 2,
+  "task_id": "task-id",
+  "kb_id": "kb-xxx",
+  "status": "processing",
+  "total": 1,
+  "completed": 0,
   "failed": 0,
-  "progress": 100.0,
+  "progress": 0.0,
   "files": [
     {
-      "file_id": "file-def456",
+      "file_id": "file-id",
       "file_name": "技术文档.md",
-      "status": "completed",
-      "doc_id": null,
-      "error": null
-    },
-    {
-      "file_id": "file-ghi789",
-      "file_name": "设计说明.md",
-      "status": "completed",
+      "status": "processing",
       "doc_id": null,
       "error": null
     }
@@ -240,133 +195,128 @@ curl -X GET 'http://<api_server_ip>:8082/api/v1/uploads/ingest/status/task-abc12
 }
 ```
 
-**`status` 取值**
+整体 `status`：
 
-| 值 | 说明 |
-|----|------|
-| `queued` | 已提交，Worker 尚未开始处理 |
-| `processing` | Worker 正在处理部分文件 |
-| `completed` | 全部文件入库成功 |
-| `partial` | 部分文件入库失败 |
+| 值 | 含义 |
+| --- | --- |
+| `processing` | 仍有文件未到终态 |
+| `completed` | 所有文件成功 |
+| `partial` | 至少一个文件失败 |
 
-**单个文件 `status` 取值**
+单文件 `status`：`pending`、`processing`、`completed`、`failed`。
 
-| 值 | 说明 |
-|----|------|
-| `pending` | 等待 Worker 处理 |
-| `processing` | 正在入库 |
-| `completed` | 入库成功 |
-| `failed` | 入库失败（`error` 字段有详情） |
+注意：该轮询接口基于 `kb_pending_files`，不会返回 self_ingestion 的细粒度 `SelfIngestJob.stage`。需要细粒度阶段时使用管理员接口。
 
----
+## 6. self_ingestion 管理接口
 
-## 4. 完整调用示例（Python）
+管理员接口前缀为：
+
+```text
+/api/v1/admin/self-ingestion
+```
+
+常用端点：
+
+| 端点 | 用途 |
+| --- | --- |
+| `GET /health` | queue_depth 与 MySQL / Milvus / Redis / Nebula / Embedding / LLM / VLM 配置健康检查 |
+| `GET /jobs?kb_id=&status=` | 查询 self 入库 job 列表 |
+| `GET /jobs/stats?kb_id=` | job 状态统计 |
+| `POST /jobs/{job_id}/repair` | 修复单个 job |
+| `POST /repair/scan` | 扫描并修复可重放 job |
+| `POST /kb/{kb_id}/switch-backend` | 切换 KB 后端开关 |
+| `POST /shadow-rebuild` | 将 legacy 文档 shadow 入队到 self，不修改 legacy 索引 |
+
+`SelfIngestJob.status` 使用小写枚举：`pending`、`processing`、`committing`、`completed`、`partial_success`、`failed`、`repairing`。
+
+## 7. 完整 Python 示例
 
 ```python
+import time
 import requests
 
-BASE = "http://<api_server_ip>:8082/api/v1"
-HEADERS = {"Authorization": "Bearer <api_key>"}
+BASE = "http://localhost:8082/api/v1"
+HEADERS = {"Authorization": "Bearer <token>"}
 KB_ID = "kb-123e4567-e89b-12d3-a456-426614174000"
 
-# ① 上传 MD 文件
 with open("技术文档.md", "rb") as f:
-    resp = requests.post(
+    upload_resp = requests.post(
         f"{BASE}/uploads/batch",
         headers=HEADERS,
         files={"files": ("技术文档.md", f, "text/markdown")},
         data={"kb_id": KB_ID, "category_path": "技术文档/AI"},
+        timeout=60,
     )
-data = resp.json()
-print(f"上传完成: {data['message']}")
+upload_resp.raise_for_status()
+uploaded = upload_resp.json()
+file_ids = [item["file_id"] for item in uploaded["files"]]
 
-# ② 获取 file_ids
-file_ids = [f["file_id"] for f in data["files"]]
-
-# ③ 启动入库
-resp = requests.post(
+ingest_resp = requests.post(
     f"{BASE}/uploads/ingest",
     headers={**HEADERS, "Content-Type": "application/json"},
     json={
         "kb_id": KB_ID,
         "file_ids": file_ids,
-        "document_date": "2026-05-06",
+        "document_date": "2026-07-09",
     },
+    timeout=30,
 )
-task = resp.json()
-print(f"入库任务已创建: {task['task_id']}")
+ingest_resp.raise_for_status()
+task_id = ingest_resp.json()["task_id"]
 
-# ④ 轮询状态直到完成
-import time
 while True:
-    resp = requests.get(
-        f"{BASE}/uploads/ingest/status/{task['task_id']}",
+    status_resp = requests.get(
+        f"{BASE}/uploads/ingest/status/{task_id}",
         headers=HEADERS,
+        timeout=30,
     )
-    status = resp.json()
-    print(f"进度: {status['progress']:.0f}% - {status['status']}")
-    if status["status"] in ("completed", "partial"):
+    status_resp.raise_for_status()
+    status = status_resp.json()
+    print(status["status"], status["progress"])
+    if status["status"] in {"completed", "partial"}:
         break
     time.sleep(2)
-
-print("入库完成!")
 ```
 
----
+## 8. 内部机制
 
-## 5. MD 文件入库的内部机制
+legacy Markdown：
 
-```
-Worker 拉取到 status=1 的 .md 文件
-  │
-  ├─ _is_md_file() 判断
-  │   ├─ file_type == "text/markdown"  → ✅
-  │   └─ file_name 以 ".md" 结尾       → ✅ (兜底)
-  │
-  ├─ MinIO 下载 MD 内容 → 内存 decode("utf-8")
-  │
-  ├─ RagService.process_md_content()   ← 跳过 MinerU
-  │   ├─ MDIngestor 解析 <img> 标签提取图片
-  │   ├─ 下载图片 → base64 → ImageModalProcessor
-  │   ├─ insert_text_content (semantic chunking)
-  │   └─ _finalize_document_after_ingest (实体/关系抽取)
-  │
-  └─ PendingFile.status → 2 (已入库)
+```text
+PendingIngestUseCase
+  -> route=legacy-md-direct
+  -> MinIO 下载 bytes
+  -> UTF-8 decode
+  -> RAGService.process_md_content()
+  -> MDIngestor
+  -> KnowledgeBaseDocument 元数据补齐
+  -> kb_pending_files.status=2
 ```
 
-**关键特点**：
-- MD 文件不写本地磁盘缓存，全程内存操作
-- 图片处理（多模态实体抽取）和 PDF 入库完全一致
-- 只需保证 MD 中的 `<img>` 标签的 `src` 指向可访问的图片 URL
+self Markdown：
 
----
-
-## 6. 注意事项
-
-| 项 | 说明 |
-|-----|------|
-| 文件大小限制 | 单文件 ≤ 100MB |
-| 编码要求 | MD 文件需要 UTF-8 编码 |
-| 图片引用 | `<img>` 标签的 `src` 需要是可访问的 HTTP/HTTPS URL |
-| Worker 进程 | 入库依赖 `ingest_worker.py` 进程，需确保已启动 |
-| 并发安全 | Worker 使用 Redis 分布式锁，多个 Worker 实例可并行处理 |
-| MD 纯文本 | 没有 `<img>` 标签的纯文本 MD 也可以正常入库 |
-
----
-
-## 7. Worker 启动
-
-```bash
-# 激活虚拟环境
-source <project_venv>/bin/activate
-
-# 启动 ingest worker
-python -m backend.worker.ingest_worker
+```text
+PendingIngestUseCase
+  -> route=self_ingestion
+  -> SelfIngestionPipeline
+  -> markdown_parser.py / BlockBuilder
+  -> LLM/VLM 抽取
+  -> StagingPayload: staging/{kb_id}/{job_id}/payload.json
+  -> CommitWriter
+     -> MySQL kb_self_chunks staged
+     -> Milvus chunks_v2 invisible
+     -> MySQL visible
+     -> Milvus visible/entities_v2 + Redis BM25/metadata + NebulaGraph v2
+  -> completed 或 partial_success
 ```
 
-环境变量可调参数：
+## 9. 运维注意事项
 
-```bash
-INGEST_WORKER_POLL_INTERVAL=2      # 轮询间隔（秒），默认 2
-INGEST_WORKER_BATCH_SIZE=5         # 每批最大处理数，默认 5
-```
+| 项 | 当前实现 |
+| --- | --- |
+| 文件大小 | `/uploads/batch` 默认 5GB，可配置；管理端 `/knowledge_bases/{kb_id}/documents` 为 100MB |
+| 编码 | legacy `.md` 按 UTF-8 decode；self Markdown parser 也应使用 UTF-8 文本 |
+| Worker | `python -m backend.worker.ingest_worker` 或 `bash scripts/ingest_worker_service.sh start` |
+| 并发锁 | Redis `kb_ingest_lock:{file_id}`，TTL 7200 秒 |
+| blocked | self KB 未满足开关/白名单时 `status=3`，不会回退 legacy |
+| 删除 | 按文档 `ingestion_backend` 分流；self 删除清 MySQL 可见性、Redis BM25、Milvus，并 best-effort 处理 Nebula |

@@ -26,7 +26,7 @@ const ACCEPTED_TYPES = [
   'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/bmp', 'image/svg+xml',
   // 纯文本
   'text/plain', 'text/markdown', 'text/csv', 'application/json',
-  'text/html', 'text/xml', 'text/x-python',
+  'text/html', 'text/xml', 'text/x-python', 'application/vnd.google-earth.kml+xml', '.kml',
   // 富文档
   'application/pdf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',

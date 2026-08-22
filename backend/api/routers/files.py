@@ -5,12 +5,15 @@ from urllib.parse import quote, unquote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from minio import S3Error
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.routers.auth import get_current_user
 from backend.config import settings
+from backend.config.loggers import get_logger
 from backend.core.config import get_paths
+from backend.core.utils.client_ip import UNKNOWN_CLIENT_IP, resolve_client_ip
 from backend.db.connection import get_async_session
 from backend.db.models import User
 from backend.services.user_file_service import (
@@ -26,7 +29,14 @@ from backend.storage import (
 )
 from backend.storage.streaming import iter_minio_response
 
+
+def _minio_not_found(exc: Exception) -> bool:
+    """区分「对象真的不存在」与连接/超时等暂时性故障。"""
+    return isinstance(exc, S3Error) and exc.code in {"NoSuchKey", "NoSuchObject"}
+
+
 router = APIRouter(prefix="/files", tags=["文件中心"])
+logger = get_logger(__name__)
 
 _IMAGE_SUFFIXES = frozenset(
     {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
@@ -61,12 +71,33 @@ def _minio_image_object_candidates(object_name: str) -> list[str]:
 
 
 def _client_ip(request: Request) -> str | None:
-    xff = request.headers.get("X-Forwarded-For", "").strip()
-    if xff:
-        return xff.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return None
+    resolved = resolve_client_ip(request)
+    return None if resolved == UNKNOWN_CLIENT_IP else resolved
+
+
+_SAFE_ARTIFACT_MEDIA_TYPES = {
+    ".csv": "text/csv",
+    ".docx": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ),
+    ".json": "application/json",
+    ".md": "text/markdown",
+    ".pdf": "application/pdf",
+    ".pptx": (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    ),
+    ".txt": "text/plain",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+def _artifact_media_type(object_name: str) -> str:
+    """Derive the response type from the stored object, never from the request."""
+
+    suffix = Path(str(object_name or "")).suffix.lower()
+    if suffix in _IMAGE_SUFFIXES:
+        return mimetypes.guess_type(f"image{suffix}")[0] or "application/octet-stream"
+    return _SAFE_ARTIFACT_MEDIA_TYPES.get(suffix, "application/octet-stream")
 
 
 def _is_allowed_minio_artifact_object(object_name: str, user_id: str) -> bool:
@@ -113,7 +144,6 @@ async def download_minio_artifact(
     request: Request,
     object_name: str = Query(..., min_length=1),
     filename: str = Query(default="artifact"),
-    mime_type: str = Query(default="application/octet-stream"),
     user: User = Depends(get_current_user),
 ):
     normalized_object = object_name.strip().lstrip("/")
@@ -126,12 +156,24 @@ async def download_minio_artifact(
         response = await asyncio.to_thread(
             client.get_object, bucket, normalized_object
         )
-    except Exception:
-        raise HTTPException(status_code=404, detail="工件对象不存在")
+    except Exception as exc:
+        logger.warning(
+            "MinIO 工件下载失败: bucket=%s object=%s",
+            bucket,
+            normalized_object,
+            exc_info=True,
+        )
+        # 暂时性故障（连接/超时）不能伪装成 404，否则客户端会把对象
+        # 当成已删除处理。
+        if not _minio_not_found(exc):
+            raise HTTPException(status_code=502, detail="对象存储暂不可用，请稍后重试") from exc
+        raise HTTPException(status_code=404, detail="工件对象不存在") from exc
 
     display_name = Path(filename or "artifact").name or "artifact"
     try:
         display_name.encode("ascii")
+        # 引号/反斜杠会从 quoted-string 逃逸，伪造额外 filename 参数
+        display_name = display_name.replace('"', "'").replace("\\", "_")
         disposition = f'attachment; filename="{display_name}"'
     except UnicodeEncodeError:
         encoded = quote(display_name, safe="")
@@ -139,8 +181,14 @@ async def download_minio_artifact(
 
     return StreamingResponse(
         iter_minio_response(response),
-        media_type=mime_type or "application/octet-stream",
-        headers={"Content-Disposition": disposition},
+        # A caller-supplied content type would let a user turn their own stored
+        # bytes into browser-rendered HTML/SVG on this origin.  Derive it from
+        # the stored object name instead and always download.
+        media_type=_artifact_media_type(normalized_object),
+        headers={
+            "Content-Disposition": disposition,
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -164,14 +212,35 @@ async def get_kb_image(
     client = _get_minio_client()
     bucket = (settings.minio_bucket_name or "").strip("/")
     response = None
+    last_error: Exception | None = None
+    saw_transient = False
     for candidate in candidates:
         try:
             response = await asyncio.to_thread(client.get_object, bucket, candidate)
             break
-        except Exception:
+        except Exception as exc:
+            last_error = exc
+            if not _minio_not_found(exc):
+                saw_transient = True
             continue
     if response is None:
-        raise HTTPException(status_code=404, detail="图片对象不存在")
+        logger.warning(
+            "知识库图片对象读取失败: bucket=%s candidates=%s",
+            bucket,
+            candidates,
+            exc_info=(
+                (type(last_error), last_error, last_error.__traceback__)
+                if last_error is not None
+                else None
+            ),
+        )
+        # 候选中只要出现过暂时性故障（连接/超时）就按 502 处理：
+        # 按「最后一个错误」判定会把「A 连接错误、B 不存在」误判成 404。
+        if saw_transient:
+            raise HTTPException(
+                status_code=502, detail="对象存储暂不可用，请稍后重试"
+            ) from last_error
+        raise HTTPException(status_code=404, detail="图片对象不存在") from last_error
 
     media_type = mimetypes.guess_type(f"image{suffix}")[0] or "application/octet-stream"
     return StreamingResponse(
@@ -289,7 +358,8 @@ async def download_file(
 
     if file_row.local_abs_path:
         local_path = Path(file_row.local_abs_path)
-        if _is_allowed_local_user_file_path(
+        if await asyncio.to_thread(
+            _is_allowed_local_user_file_path,
             file_row.local_abs_path,
             file_row.owner_user_id,
         ):
@@ -302,6 +372,9 @@ async def download_file(
                 ip=_client_ip(request),
                 user_agent=request.headers.get("User-Agent"),
             )
+            # 审计走独立会话；提交本请求只读事务归还连接——文件流式传输
+            # 期间不钉住 MySQL 连接（commit 保持 file_row 可用）。
+            await session.commit()
             return FileResponse(
                 path=str(local_path),
                 media_type=media_type,
@@ -325,8 +398,17 @@ async def download_file(
             response = await asyncio.to_thread(
                 client.get_object, bucket, file_row.storage_object
             )
-        except Exception:
-            raise HTTPException(status_code=404, detail="文件对象不存在")
+        except Exception as exc:
+            logger.warning(
+                "用户文件对象下载失败: bucket=%s object=%s file_id=%s",
+                bucket,
+                file_row.storage_object,
+                file_id,
+                exc_info=True,
+            )
+            if not _minio_not_found(exc):
+                raise HTTPException(status_code=502, detail="对象存储暂不可用，请稍后重试") from exc
+            raise HTTPException(status_code=404, detail="文件对象不存在") from exc
 
         await write_download_audit(
             session=session,
@@ -352,6 +434,8 @@ async def download_file(
         headers = {
             "Content-Disposition": disposition,
         }
+        # 对象下载流期间不钉住 MySQL 连接（同本地路径：审计后提交只读事务）。
+        await session.commit()
         return StreamingResponse(
             iter_minio_response(response),
             media_type=media_type,

@@ -1,62 +1,404 @@
 @import "tailwindcss";
 @import "katex/dist/katex.min.css";
 
+/* 主题由 useThemePreference 写入 <html class="dark">，而非跟随系统媒体查询 */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
-  --color-primary: #3b82f6;
-  --color-primary-foreground: #ffffff;
   --font-family-sans: 'Inter', 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+
+  /* 中性面 */
+  --color-surface: #ffffff;
+  --color-surface-sunken: #f7f7f8;
+  --color-surface-raised: #ffffff;
+  --color-surface-hover: #f0f0f1;
+
+  --color-border-subtle: #e8e8ea;
+  --color-border-strong: #d4d4d8;
+
+  --color-text-primary: #1a1a1a;
+  --color-text-secondary: #5d5d66;
+  --color-text-tertiary: #8e8e99;
+
+  /* 强调色：仅用于主按钮、导航激活态、焦点环 */
+  --color-accent: #7c3aed;
+  --color-accent-hover: #6d28d9;
+  --color-accent-soft: #f4f0ff;
+  --color-accent-fg: #ffffff;
+
+  --color-primary: #7c3aed;
+  --color-primary-foreground: #ffffff;
+
+  /* 尺度 */
+  --sidebar-w: 16rem;
+  --topbar-h: 3rem;
+  --content-max: 48rem;
+  --panel-w: 26rem;
+
+  --radius-composer: 1.5rem;
+  --radius-bubble: 1rem;
+  --radius-control: 0.625rem;
+
+  --shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-panel: 0 1px 3px rgba(0, 0, 0, 0.04), 0 8px 24px -16px rgba(0, 0, 0, 0.12);
+
+  /* 容器查询断点：组件按自身可用宽度决策，不看视口 */
+  --container-compact: 30rem;
+  --container-cozy: 40rem;
+  --container-wide: 52rem;
+
+  /* 兼容既有引用的补充色阶 */
+  --color-indigo-550: #5850ec;
+  --color-indigo-650: #4c44d6;
+  --color-slate-150: #f1f5f9;
+  --color-slate-205: #cbd5e1;
+  --color-slate-350: #94a3b8;
+  --color-slate-450: #64748b;
+  --color-slate-455: #475569;
+  --color-slate-550: #334155;
+  --color-slate-750: #1e293b;
+  --color-slate-850: #0f172a;
 }
 
+/* 深色模式覆写同名变量，使 bg-surface / text-text-primary 等自动适配，
+   组件内无需再逐处书写 dark: 变体 */
 @layer base {
+  .dark {
+    --color-surface: #1a1a1c;
+    --color-surface-sunken: #131315;
+    --color-surface-raised: #202023;
+    --color-surface-hover: #27272b;
+
+    --color-border-subtle: #2e2e33;
+    --color-border-strong: #3f3f46;
+
+    --color-text-primary: #f2f2f3;
+    --color-text-secondary: #a8a8b3;
+    --color-text-tertiary: #74747f;
+
+    --color-accent: #8b5cf6;
+    --color-accent-hover: #a78bfa;
+    --color-accent-soft: #2a1f45;
+
+    --shadow-panel: 0 1px 3px rgba(0, 0, 0, 0.4), 0 8px 24px -16px rgba(0, 0, 0, 0.6);
+
+    /* 深色骨架高光调暗，避免扫光刺眼 */
+    --shimmer-highlight: rgba(255, 255, 255, 0.07);
+  }
+
   :root {
     --radius: 0.75rem;
-    --background: #f8fafc;
-    --foreground: #0f172a;
+  }
+
+  html,
+  body {
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
   }
 
   body {
-    @apply bg-slate-50 text-slate-900 antialiased;
+    @apply bg-surface text-text-primary antialiased;
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   }
 
-  /* Custom Scrollbar */
   ::-webkit-scrollbar {
-    @apply w-1.5 h-1.5;
+    @apply h-1.5 w-1.5;
   }
   ::-webkit-scrollbar-track {
     @apply bg-transparent;
   }
   ::-webkit-scrollbar-thumb {
-    @apply bg-slate-300 dark:bg-slate-700 rounded-full hover:bg-slate-400;
+    @apply rounded-full bg-border-strong;
   }
 
-  /* Global Transitions */
-  .fade-enter-active, .fade-leave-active {
-    @apply transition-opacity duration-300;
+  .fade-enter-active,
+  .fade-leave-active {
+    @apply transition-opacity duration-200;
   }
-  .fade-enter-from, .fade-leave-to {
+  .fade-enter-from,
+  .fade-leave-to {
     @apply opacity-0;
+  }
+
+  /* 全局按压反馈：按钮按下轻微缩小。
+     用独立 scale 属性对齐 Tailwind v4 的 scale-* 工具类（避免与 transform 叠乘），
+     :where() 压低特异性，组件级 active:scale-* 可自然覆盖本规则 */
+  button:where(:not(:disabled)):active {
+    scale: 0.97;
   }
 }
 
 @layer components {
-  /* Academic Prose Styling */
   .prose {
-    @apply max-w-none leading-relaxed text-slate-700 dark:text-slate-300;
+    @apply max-w-none leading-relaxed text-text-primary;
   }
-  .prose h1, .prose h2, .prose h3 {
-    @apply font-bold text-slate-900 dark:text-slate-100 mt-6 mb-4 tracking-tight;
+  .prose h1,
+  .prose h2,
+  .prose h3 {
+    @apply mt-6 mb-4 font-semibold tracking-tight text-text-primary;
   }
   .prose p {
     @apply mb-4;
   }
   .prose code {
-    @apply bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded text-sm font-mono text-indigo-600 dark:text-indigo-400;
+    @apply rounded bg-surface-sunken px-1.5 py-0.5 font-mono text-sm text-accent;
   }
   .prose pre {
-    @apply bg-slate-900 text-slate-100 p-4 rounded-xl my-4 overflow-x-auto;
+    @apply my-4 overflow-x-auto rounded-xl border border-border-subtle bg-surface-sunken p-4 text-[13px] leading-relaxed text-text-primary;
   }
   .prose pre code {
-    @apply bg-transparent p-0 text-slate-100;
+    @apply bg-transparent p-0 font-mono text-text-primary;
+  }
+}
+
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--color-border-strong) 70%, transparent) transparent;
+}
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-border-strong) 70%, transparent);
+  border-radius: 9999px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-strong);
+}
+
+.scrollbar-none {
+  scrollbar-width: none;
+}
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
+/* ===== Motion:入场动画工具类 =====
+   实现模板中已使用的 animate-in / fade-in / zoom-in / slide-in-from-* 子集,
+   语义对齐 tw-animate-css:duration-N 与 ease-N 修饰符通过 --tw-duration / --tw-ease 生效。 */
+@keyframes enter {
+  from {
+    opacity: var(--tw-enter-opacity, 1);
+    transform: translate3d(var(--tw-enter-translate-x, 0), var(--tw-enter-translate-y, 0), 0)
+      scale3d(var(--tw-enter-scale, 1), var(--tw-enter-scale, 1), var(--tw-enter-scale, 1));
+  }
+}
+
+@utility animate-in {
+  animation: enter var(--tw-duration, 150ms) var(--tw-ease, ease-out) both;
+}
+@utility fade-in {
+  --tw-enter-opacity: 0;
+}
+/* 裸 zoom-in 取 0.95:弹窗轻微放大入场,而非从 0 缩放的夸张效果 */
+@utility zoom-in {
+  --tw-enter-scale: 0.95;
+}
+@utility zoom-in-* {
+  --tw-enter-scale: calc(--value(integer) / 100);
+}
+@utility slide-in-from-top-* {
+  --tw-enter-translate-y: calc(var(--spacing) * --value(integer) * -1);
+}
+@utility slide-in-from-bottom-* {
+  --tw-enter-translate-y: calc(var(--spacing) * --value(integer));
+}
+@utility slide-in-from-left-* {
+  --tw-enter-translate-x: calc(var(--spacing) * --value(integer) * -1);
+}
+@utility slide-in-from-right-* {
+  --tw-enter-translate-x: calc(var(--spacing) * --value(integer));
+}
+
+/* 骨架占位:呼吸底色 + 高光扫过(比纯 pulse 更有质感) */
+@utility skeleton-shimmer {
+  position: relative;
+  overflow: hidden;
+  &::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    background: linear-gradient(90deg, transparent, var(--shimmer-highlight, rgba(255, 255, 255, 0.55)), transparent);
+    animation: shimmer-sweep 1.6s ease-in-out infinite;
+  }
+}
+@keyframes shimmer-sweep {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+/* ===== 共享 Vue <Transition> 词汇表 ===== */
+
+/* 右侧面板滑入(时长与 AppShell 栅格列动画一致) */
+.slide-panel-enter-active,
+.slide-panel-leave-active {
+  transition:
+    transform 200ms ease,
+    opacity 200ms ease;
+}
+.slide-panel-enter-from,
+.slide-panel-leave-to {
+  transform: translateX(100%);
+  opacity: 0.4;
+}
+
+/* 底部 Sheet:根节点(含遮罩)淡入淡出,面板(.sheet-panel)自底部上滑 */
+.sheet-enter-active,
+.sheet-leave-active {
+  transition: opacity 260ms ease;
+}
+.sheet-enter-active .sheet-panel,
+.sheet-leave-active .sheet-panel {
+  transition: transform 260ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.sheet-enter-from,
+.sheet-leave-to {
+  opacity: 0;
+}
+.sheet-enter-from .sheet-panel,
+.sheet-leave-to .sheet-panel {
+  transform: translateY(100%);
+}
+
+/* 弹窗:根节点淡入淡出,面板(.pop-panel)缩放位移 */
+.pop-enter-active,
+.pop-leave-active {
+  transition: opacity 200ms ease;
+}
+.pop-enter-active .pop-panel,
+.pop-leave-active .pop-panel {
+  transition:
+    transform 200ms ease,
+    opacity 200ms ease;
+}
+.pop-enter-from,
+.pop-leave-to {
+  opacity: 0;
+}
+.pop-enter-from .pop-panel,
+.pop-leave-to .pop-panel {
+  transform: translateY(10px) scale(0.97);
+}
+
+/* 高度展开/收起:外层网格行 0fr→1fr 过渡,配合 [data-open] 使用 */
+.collapse-rows {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 200ms ease;
+}
+.collapse-rows[data-open='true'] {
+  grid-template-rows: 1fr;
+}
+.collapse-rows > * {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* 列表项增删/重排(TransitionGroup 通用):
+   离场项脱离布局,兄弟项由 move 过渡平滑补位;父容器需 position:relative */
+.list-fade-enter-active {
+  transition:
+    opacity 200ms ease,
+    transform 200ms ease;
+}
+.list-fade-leave-active {
+  position: absolute;
+  width: 100%;
+  transition:
+    opacity 150ms ease,
+    transform 150ms ease;
+}
+.list-fade-move {
+  transition: transform 250ms ease;
+}
+.list-fade-enter-from {
+  opacity: 0;
+  transform: translateY(4px);
+}
+.list-fade-leave-to {
+  opacity: 0;
+  transform: translateY(-4px) scale(0.98);
+}
+
+/* 页面路由切换:出快进慢,入场轻微上移 */
+.page-enter-active {
+  transition:
+    opacity 180ms ease-out,
+    transform 180ms ease-out;
+}
+.page-leave-active {
+  transition: opacity 120ms ease-in;
+}
+.page-enter-from {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.page-leave-to {
+  opacity: 0;
+}
+
+/* ===== 响应式表格:窄容器下折叠为标签+值卡片 =====
+   用法:滚动容器加 .stack-table-wrap,<table> 加 .stack-table,
+   每个 <td> 加 data-label="列名";无 data-label 的单元格独占整行。 */
+.stack-table-wrap {
+  container: stacktable / inline-size;
+}
+@container stacktable (width < 48rem) {
+  .stack-table {
+    display: block;
+    min-width: 0;
+  }
+  .stack-table thead {
+    display: none;
+  }
+  .stack-table tbody {
+    display: grid;
+    gap: 0.75rem;
+    padding: 0.75rem;
+  }
+  .stack-table tr {
+    display: grid;
+    align-content: start;
+    gap: 0.375rem;
+    border: 1px solid var(--color-border-subtle);
+    border-radius: 1rem;
+    background: var(--color-surface);
+    padding: 0.875rem 1rem;
+  }
+  .stack-table td {
+    display: grid;
+    grid-template-columns: 6.5rem minmax(0, 1fr);
+    align-items: start;
+    gap: 0.75rem;
+    border: 0;
+    padding: 0;
+  }
+  .stack-table td::before {
+    content: attr(data-label);
+    color: var(--color-text-tertiary);
+    font-weight: 600;
+  }
+  .stack-table td:not([data-label]) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .stack-table td:not([data-label])::before {
+    content: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

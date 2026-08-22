@@ -434,6 +434,16 @@ def _bind_message_metadata(
     window_id: str,
     payload: Mapping[str, Any],
 ) -> list[Any]:
+    # The summary message content already IS the summary text. Copying the
+    # full summary into additional_kwargs doubled its token cost on every
+    # later count (count_message_tokens charges kwargs) and doubled the
+    # checkpoint footprint, while the compaction-benefit check in
+    # HistoryCompactor._build_result never saw that extra weight. Recovery
+    # paths re-derive the summary from message content when the payload
+    # lacks it (_find_compaction_summary / _restore_compaction_state).
+    message_payload = {
+        key: value for key, value in payload.items() if key != "summary"
+    }
     bound: list[Any] = []
     for message in messages:
         metadata = getattr(message, "additional_kwargs", None)
@@ -451,7 +461,7 @@ def _bind_message_metadata(
                 update={
                     "additional_kwargs": {
                         **dict(metadata),
-                        "context_compaction": dict(payload),
+                        "context_compaction": dict(message_payload),
                     }
                 }
             )

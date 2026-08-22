@@ -1,6 +1,5 @@
 """LLM 模型配置 ORM 定义"""
 
-import enum
 from datetime import datetime
 
 from sqlalchemy import (
@@ -9,21 +8,21 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 
-from backend.db.models import Base
+from backend.db.models.base import Base
 
 
-class ModelProvider(enum.Enum):
-    """模型服务商"""
-    DEEPSEEK = "deepseek"
-    QWEN = "qwen"
-    MINIMAX = "minimax"
-    ZHIPU = "zhipu"
-    OPENAI = "openai"
-    CUSTOM = "custom"
+MODEL_USAGE_SCOPES = (
+    "chat",
+    "image_analysis",
+    "ingestion",
+    "asr",
+    "embedding",
+    "rerank",
+)
 
 
 class LlmModel(Base):
-    """LLM 模型配置表（本期仅读写 usage_scope=chat；其他 scope 预留给知识库等）"""
+    """LLM 模型配置表；用途域是运行时能力隔离边界。"""
     __tablename__ = "llm_models"
     __table_args__ = (
         UniqueConstraint("name", "usage_scope", name="uk_name_scope"),
@@ -35,7 +34,7 @@ class LlmModel(Base):
         String(32),
         nullable=False,
         default="chat",
-        comment="用途域：chat=对话；预留 kb_chat/embedding/rerank",
+        comment="用途域：chat/image_analysis/ingestion/asr/embedding/rerank",
     )
 
     # 基础信息

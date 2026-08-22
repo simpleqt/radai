@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import hashlib
+import logging
+import os
+import threading
 import time
+import weakref
 from collections import OrderedDict
 from typing import Any
 
@@ -18,9 +21,21 @@ logger = logging.getLogger(__name__)
 
 _SUMMARY_CACHE_MAX = 256
 _SUMMARY_CACHE_TTL_SECONDS = 3600
+_SUMMARY_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("AGENT_LARGE_RESULT_SUMMARY_TIMEOUT_SECONDS", "60") or "60"),
+)
 _SUMMARY_PROMPT_VERSION = "large-result-v2"
+# The result cache is shared across event loops (and therefore threads);
+# in-flight tasks stay loop-local because tasks cannot cross loops.
 _SUMMARY_CACHE: OrderedDict[str, tuple[float, str]] = OrderedDict()
-_SUMMARY_INFLIGHT: dict[tuple[int, str], asyncio.Task[str]] = {}
+_SUMMARY_CACHE_LOCK = threading.Lock()
+# 单飞表按循环对象弱引用键控(项目约定:绝不用 id(loop)——一次性循环销毁后
+# id 可被复用,残留条目会让新循环 await 一个死循环上的 Task 而永久挂起)。
+_SUMMARY_INFLIGHT: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Task[str]]]" = (
+    weakref.WeakKeyDictionary()
+)
+_SUMMARY_INFLIGHT_LOCK = threading.Lock()
 
 
 def _message_text(content: Any) -> str:
@@ -56,6 +71,7 @@ class LargeResultSummarizer:
         max_input_chars: int | None = None,
         cache_ttl_seconds: int = _SUMMARY_CACHE_TTL_SECONDS,
         cache_max_entries: int = _SUMMARY_CACHE_MAX,
+        timeout_seconds: float = _SUMMARY_TIMEOUT_SECONDS,
     ):
         self._model_name = model_name
         self._max_output_chars = max(600, max_output_chars)
@@ -63,20 +79,25 @@ class LargeResultSummarizer:
         self._max_input_chars = max(self._max_output_chars * 2, configured_input_limit)
         self._cache_ttl_seconds = max(0, int(cache_ttl_seconds))
         self._cache_max_entries = max(1, int(cache_max_entries))
+        self._timeout_seconds = max(1.0, float(timeout_seconds))
         self._model: Any | None = None
+        self._model_lock = threading.Lock()
 
     def _get_model(self) -> Any:
-        if self._model is None:
-            self._model = create_chat_model(
-                name=self._model_name,
-                thinking_enabled=False,
-            ).with_config(
-                tags=["large-result-subagent"],
-                metadata={
-                    "purpose": "large_result_summarization",
-                    "subagent_type": "result-summarizer",
-                },
-            )
+        if self._model is not None:
+            return self._model
+        with self._model_lock:
+            if self._model is None:
+                self._model = create_chat_model(
+                    name=self._model_name,
+                    thinking_enabled=False,
+                ).with_config(
+                    tags=["large-result-subagent"],
+                    metadata={
+                        "purpose": "large_result_summarization",
+                        "subagent_type": "result-summarizer",
+                    },
+                )
         return self._model
 
     async def summarize(
@@ -95,15 +116,26 @@ class LargeResultSummarizer:
             max_output_chars=self._max_output_chars,
             prompt_version=_SUMMARY_PROMPT_VERSION,
         )
-        cached = _SUMMARY_CACHE.get(cache_key)
         now = time.monotonic()
-        if cached is not None and now - cached[0] <= self._cache_ttl_seconds:
-            _SUMMARY_CACHE.move_to_end(cache_key)
-            return cached[1]
-        if cached is not None:
-            _SUMMARY_CACHE.pop(cache_key, None)
-        loop_key = (id(asyncio.get_running_loop()), cache_key)
-        inflight = _SUMMARY_INFLIGHT.get(loop_key)
+        with _SUMMARY_CACHE_LOCK:
+            cached = _SUMMARY_CACHE.get(cache_key)
+            if cached is not None and now - cached[0] <= self._cache_ttl_seconds:
+                _SUMMARY_CACHE.move_to_end(cache_key)
+                return cached[1]
+            if cached is not None:
+                _SUMMARY_CACHE.pop(cache_key, None)
+        loop = asyncio.get_running_loop()
+        with _SUMMARY_INFLIGHT_LOCK:
+            # 已关闭循环的条目因任务持有对循环的强引用无法靠弱引用回收,主动清扫。
+            for dead in [
+                item for item in _SUMMARY_INFLIGHT.keys() if item.is_closed()
+            ]:
+                _SUMMARY_INFLIGHT.pop(dead, None)
+            per_loop = _SUMMARY_INFLIGHT.get(loop)
+            if per_loop is None:
+                per_loop = {}
+                _SUMMARY_INFLIGHT[loop] = per_loop
+            inflight = per_loop.get(cache_key)
         if inflight is not None:
             return await asyncio.shield(inflight)
         task = asyncio.create_task(
@@ -114,11 +146,13 @@ class LargeResultSummarizer:
                 user_query=user_query,
             )
         )
-        _SUMMARY_INFLIGHT[loop_key] = task
+        with _SUMMARY_INFLIGHT_LOCK:
+            per_loop[cache_key] = task
 
         def clear_inflight(done: asyncio.Task[str]) -> None:
-            if _SUMMARY_INFLIGHT.get(loop_key) is done:
-                _SUMMARY_INFLIGHT.pop(loop_key, None)
+            with _SUMMARY_INFLIGHT_LOCK:
+                if per_loop.get(cache_key) is done:
+                    per_loop.pop(cache_key, None)
 
         task.add_done_callback(clear_inflight)
         return await asyncio.shield(task)
@@ -137,10 +171,11 @@ class LargeResultSummarizer:
             user_query=user_query,
         )
         if result and self._cache_ttl_seconds > 0:
-            _SUMMARY_CACHE[cache_key] = (time.monotonic(), result)
-            _SUMMARY_CACHE.move_to_end(cache_key)
-            while len(_SUMMARY_CACHE) > self._cache_max_entries:
-                _SUMMARY_CACHE.popitem(last=False)
+            with _SUMMARY_CACHE_LOCK:
+                _SUMMARY_CACHE[cache_key] = (time.monotonic(), result)
+                _SUMMARY_CACHE.move_to_end(cache_key)
+                while len(_SUMMARY_CACHE) > self._cache_max_entries:
+                    _SUMMARY_CACHE.popitem(last=False)
         return result
 
     async def _summarize_uncached(
@@ -170,11 +205,15 @@ class LargeResultSummarizer:
             f"<tool_result>\n{bounded_content}\n</tool_result>"
         )
         try:
-            response = await self._get_model().ainvoke(
-                [
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=prompt),
-                ]
+            model = await asyncio.to_thread(self._get_model)
+            response = await asyncio.wait_for(
+                model.ainvoke(
+                    [
+                        SystemMessage(content=system_prompt),
+                        HumanMessage(content=prompt),
+                    ]
+                ),
+                timeout=self._timeout_seconds,
             )
             summary = _message_text(getattr(response, "content", response))
         except Exception:

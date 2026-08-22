@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from backend.application.skills.domain_policy import skill_domain_matches
 from backend.application.skills.manifest_loader import SkillManifestLoader
+from backend.application.tools.assembler import shared_default_tool_registry
 from backend.application.tools.registry import ToolRegistry
 from backend.domain.agents.profile import AgentProfile
 from backend.domain.agents.workflows import normalize_workflow_name
@@ -23,7 +25,9 @@ class PublicSkillCatalog:
         skill_loader: SkillManifestLoader | None = None,
         tool_registry: ToolRegistry | None = None,
     ) -> None:
-        self._tool_registry = tool_registry or ToolRegistry()
+        self._tool_registry = (
+            tool_registry or shared_default_tool_registry()
+        )
         self._skill_loader = skill_loader or SkillManifestLoader(
             tool_registry=self._tool_registry,
             validate_tools=False,
@@ -137,13 +141,11 @@ class PublicSkillCatalog:
 
     @staticmethod
     def _domain_matches(manifest: SkillManifest, profile: AgentProfile) -> bool:
-        domain = str(manifest.domain or "").strip().lower()
-        return domain in {
-            "*",
-            "general",
-            profile.code.strip().lower(),
-            profile.domain.strip().lower(),
-        }
+        return skill_domain_matches(
+            manifest.domain,
+            agent_code=profile.code,
+            agent_domain=profile.domain,
+        )
 
     @staticmethod
     def _dependency_closure(

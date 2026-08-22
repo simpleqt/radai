@@ -1,6 +1,6 @@
 # Excel 实验数据智能分析工具 — 详细设计与实现文档
 
-> **版本**：v1.0 · **状态**：已全部实现 · **最后更新**：2026-05-31（预览参数与 `datasets.py` 一致：`rows` 默认 20）
+> **版本**：v1.1 · **状态**：已全部实现 · **最后更新**：2026-07-09（对齐 `datasets.py`、`dataset_crud.py`、Skill 管理与 Agent 运行时）
 
 ---
 
@@ -47,8 +47,8 @@
 
 | 数据集 | 编码 | 规模 | 绑定智能体 |
 |--------|------|------|-----------|
-| 生物炭制备条件与反应体系条件对污染物降解性能的影响 | `biochar_degradation` | 365 行 × 47 列 | `csh` |
-| 不同污染物与羟基自由基的反应速率 | `hydroxyl_radical_rates` | 823 行 × 9 列 | `csh` |
+| 生物炭制备条件与反应体系条件对污染物降解性能的影响 | `biochar_degradation` | 365 行 × 47 列 | `csh`（初始化表中仍写 `csh_full_feature`，CRUD 会做别名兼容） |
+| 不同污染物与羟基自由基的反应速率 | `hydroxyl_radical_rates` | 823 行 × 9 列 | `csh`（同上） |
 
 ---
 
@@ -78,7 +78,7 @@
 └──────────┬─────────────────────────────────────────────────────────────┘
            │ Agent 调用工具
 ┌──────────▼─────────────────────────────────────────────────────────────┐
-│                  分析工具层 (backend/custom/tools/)                      │
+│                  分析工具层 (backend/application/tools/providers/)          │
 │                                                                         │
 │  list_experiment_datasets  ──→  MySQL 查询（按 agent_codes 过滤）        │
 │  inspect_excel_data        ──→  ExcelQueryEngine.get_schema()           │
@@ -104,7 +104,7 @@
            ┌───────────────────┼──────────────────────┐
            ▼                   ▼                      ▼
 ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────────────┐
-│  MySQL          │  │  MinIO :<minio_port>     │  │  本地目录（降级）          │
+│  MySQL          │  │  MinIO :9004     │  │  本地目录（降级）          │
 │  experiment_    │  │  user-files/     │  │  backend/data/charts/    │
 │  datasets       │  │  charts/{uid}/   │  │  {user_id}/{chart_id}.png│
 │  (元数据+绑定)  │  │  {chart_id}.png  │  │                          │
@@ -160,8 +160,9 @@ CREATE TABLE experiment_datasets (
 
 ```json
 []                                          // 全局可见（所有 Agent 均可使用）
-["csh"]                                     // 仅 CSH-AI profile
-["csh", "ne"]                               // CSH + NE 两个 profile
+["csh"]                                     // 仅 CSH-AI runtime profile
+["csh_full_feature"]                        // 旧编码，DatasetCRUD 会映射到 csh
+["csh", "ne"]                               // CSH + NE 两个 runtime profile
 ```
 
 设计与 `agent_kb_bindings` 表对齐——空数组表示通用，非空表示专属。通过 `PUT /api/v1/datasets/{id}/agents` 随时修改，无需重启服务。
@@ -188,9 +189,11 @@ await conn.execute(text(
 如服务未重启，直接对线上数据库执行：
 ```sql
 ALTER TABLE experiment_datasets ADD COLUMN agent_codes JSON;
-UPDATE experiment_datasets SET agent_codes = '["csh"]'
+UPDATE experiment_datasets SET agent_codes = '["csh_full_feature"]'
 WHERE code IN ('biochar_degradation', 'hydroxyl_radical_rates');
 ```
+
+`DatasetCRUD._agent_code_aliases()` 会把 `csh` 与 `csh_full_feature`、`ne` 与 `ne_full_feature` 互相映射；新数据建议直接写运行时编码 `csh` / `ne`，存量预置数据保持兼容。
 
 ---
 
@@ -198,7 +201,7 @@ WHERE code IN ('biochar_degradation', 'hydroxyl_radical_rates');
 
 ### 4.1 DuckDB 查询引擎（`excel_engine.py`）
 
-**文件**：`backend/custom/tools/excel_engine.py`（524 行）
+**文件**：`backend/application/tools/providers/excel_engine.py`（629 行）
 
 #### 4.1.1 数据加载与清洗流程
 
@@ -296,7 +299,7 @@ def _resolve_local_path(file_path) -> str
 
 ### 4.2 可视化图表生成器（`excel_chart_generator.py`）
 
-**文件**：`backend/custom/tools/excel_chart_generator.py`（468 行）
+**文件**：`backend/application/tools/providers/excel_chart_generator.py`（525 行）
 
 #### 4.2.1 支持的图表类型
 
@@ -348,12 +351,12 @@ async def save_chart(png_bytes, *, user_id=None, chart_id=None) -> str:
     1. 上传到 MinIO: charts/{user_id}/{chart_id}.png（5s 超时）
     2. MinIO 失败降级本地: backend/data/charts/{user_id}/{chart_id}.png
     
-    返回 URL: /api/v1/charts/{user_id}/{chart_id}
+    返回带时效签名的 URL: /api/v1/charts/{user_id}/{chart_id}?exp=...&sig=...
     （由 FastAPI 代理，不暴露 MinIO 地址和端口）
     """
 ```
 
-> **为何不用 MinIO presigned URL**：MinIO 端口（9004）在生产环境中仅内网可达，浏览器 `<img>` 标签直接请求 `<minio_server_ip>:<minio_port>` 会失败。改为通过 API Server（8082）代理后，URL 始终可访问。
+> **为何不用 MinIO presigned URL**：MinIO 端口（9004）在生产环境中仅内网可达，浏览器 `<img>` 标签直接请求 `202.115.138.101:9004` 会失败。改为通过 API Server（8082）代理后，URL 始终可访问。
 
 ---
 
@@ -367,14 +370,14 @@ async def save_chart(png_bytes, *, user_id=None, chart_id=None) -> str:
 GET /api/v1/charts/{user_id}/{chart_id}
 ```
 
-- **认证**：无需（UUID 作为 capability token，图表内容非敏感）
+- **访问控制**：无需 Bearer Token，但必须携带未过期的 `exp` 与 HMAC `sig`；签名密钥取 `INTERNAL_API_SECRET`，缺省回退 `MINIO_SECRET_KEY`
 - **缓存**：`Cache-Control: public, max-age=86400`（1 天）
 - **响应**：`image/png` 字节流，支持浏览器 `<img>` 标签直接嵌入
 
 #### 4.3.2 取图逻辑
 
 ```
-请求 GET /api/v1/charts/test_user/abc123
+请求 GET /api/v1/charts/test_user/abc123?exp=<unix_ts>&sig=<hmac>
     │
     ├─→ MinIO: client.get_object("user-files", "charts/test_user/abc123.png")
     │   ✅ 返回 image/png
@@ -397,7 +400,7 @@ def _safe_id(s: str) -> bool:
 
 ### 4.4 Agent 分析工具集（`excel_data_analysis_tool.py`）
 
-**文件**：`backend/custom/tools/excel_data_analysis_tool.py`（588 行）
+**文件**：`backend/application/tools/providers/excel_data_analysis_tool.py`（708 行）
 
 #### 4.4.1 五个 LangChain 工具
 
@@ -419,6 +422,7 @@ async def list_experiment_datasets(
 **过滤规则**：
 - `agent_codes = []`（空数组）→ 全局可见，**任何 agent_code 都能看到**
 - `agent_codes = ["csh"]` → 只有 `agent_code="csh"` 时才返回
+- `agent_codes = ["csh_full_feature"]` → `agent_code="csh"` 或旧编码 `csh_full_feature` 都能返回（`DatasetCRUD._agent_code_aliases()` 兼容）
 
 ---
 
@@ -563,7 +567,7 @@ async def _resolve_multi_file_paths(dataset_codes) -> (file_paths, prefixes, err
 
 ## 5. Skill 定义
 
-**文件**：`backend/skills/public/excel-experiment-analysis/SKILL.md`（216 行）
+**文件**：`backend/skills/public/excel-experiment-analysis/SKILL.md`
 
 ### YAML Front Matter
 
@@ -601,56 +605,49 @@ Skill(
 
 ## 6. Tool 注入机制
 
-**文件**：`backend/application/tools/tool_assembly_pipeline.py`
+**文件**：`backend/application/tools/tool_assembly_pipeline.py`、`backend/application/skills/runtime_resolver.py`
 
 ### 注入流程
 
 ```
 用户请求携带 selected_skills=["excel-experiment-analysis"]
     │
-    ▼ ToolAssemblyPipeline.assemble()
+    ▼ SkillRuntimeResolver.resolve()
+        │   └─ 校验 Agent-Skill 绑定、Skill ACL、domain、allowed_workflows
+        ▼ ToolAssemblyPipeline.assemble()
         │
-        ├─→ get_available_tools()              # 基础工具
+        ├─→ PolicyToolAssembler.resolve_specs() # 策略允许的基础工具
         ├─→ multi_kb_search                    # KB 检索工具
         ├─→ ScopedSkillsProvider.get_available_skills_for_user(
         │       selected_skills={"excel-experiment-analysis"}
         │   )
         │   → [Skill(name="excel-experiment-analysis", tool_names=[...])]
         │
-        └─→ _inject_declared_skill_tools(skills)
-                └─→ for tool_name in skill.tool_names:
-                        result = _load_declared_skill_tool(tool_name)
-                        # tool_name in excel 工具集 → get_excel_analysis_tools()
-                        # 返回列表 [list_..., inspect_..., query_..., summarize_..., visualize_...]
-                        for tool in result:
-                            tools_by_name[tool.name] = tool
+        └─→ _validate_skill_tool_declarations(skills)
+                └─→ 校验 Skill 声明工具已由策略装配或动态 provider 提供
 ```
 
-### `_load_declared_skill_tool` 关键逻辑
+### Tool provider 关键逻辑
 
 ```python
-def _load_declared_skill_tool(self, tool_name: str):
-    # ... 其他 skill 工具 ...
-    if tool_name in (
-        "list_experiment_datasets",
-        "inspect_excel_data",
-        "query_excel_data",
-        "summarize_excel_data",
-        "visualize_excel_data",
-        "excel_data_analysis",
-    ):
-        from backend.custom.tools.excel_data_analysis_tool import get_excel_analysis_tools
-        return get_excel_analysis_tools()  # 返回工具列表
-    return None
+class ToolProviderLoader:
+    def load(self, spec: ToolSpec):
+        module_name, _, attr_name = spec.provider.partition(":")
+        module = importlib.import_module(module_name)
+        return getattr(module, attr_name)
+
+# registry.yaml
+list_experiment_datasets:
+  provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
 ```
 
-> **注意**：`_inject_declared_skill_tools` 已扩展为支持工具列表返回（原版只支持单个工具），以处理一个 Skill 声明名注入多个工具的场景。
+> **注意**：`get_excel_analysis_tools()` 可以返回工具列表；`PolicyToolAssembler.materialize_spec()` 只保留与当前 `ToolSpec.name` 匹配的工具，再由策略装配进入本次会话。
 
 ---
 
 ## 7. 数据集管理 REST API
 
-**文件**：`backend/api/routers/datasets.py`（526 行）
+**文件**：`backend/api/routers/datasets.py`
 
 **路由前缀**：`/api/v1`，标签：`实验数据集`
 
@@ -659,7 +656,7 @@ def _load_declared_skill_tool(self, tool_name: str):
 | 方法 | 路径 | 功能 | 关键逻辑 |
 |------|------|------|---------|
 | `GET` | `/datasets` | 列出数据集 | 支持 `domain`、`agent_code` 过滤；admin 可见全部，普通用户只见 `is_public=true` |
-| `GET` | `/datasets/by-agent/{code}` | 指定 Agent 可见的数据集 | `DatasetCRUD.list_all(agent_code=code)` |
+| `GET` | `/datasets/by-agent/{agent_code}` | 指定 Agent 可见的数据集 | `DatasetCRUD.list_all(agent_code=agent_code)`，兼容运行时/旧编码 |
 | `GET` | `/datasets/{id}` | 数据集详情 | 含完整 `column_schema` |
 | `POST` | `/datasets` | 注册已有文件 | 适用于管理员注册本地文件，自动解析 schema |
 | `POST` | `/datasets/upload` | 上传并注册 | 优先 MinIO，失败降级本地；`agent_codes` 从 Form 参数传入 |
@@ -680,7 +677,7 @@ name:         数据集名称
 description:  描述（可选）
 domain:       领域（可选，如 environmental）
 tags:         JSON 数组字符串（如 '["生物炭","AOPs"]'）
-agent_codes:  JSON 数组字符串（如 '["csh"]'）
+agent_codes:  JSON 数组字符串（如 '["csh"]'；旧值 '["csh_full_feature"]' 仍可被 csh 查询到）
 is_public:    true/false
 ```
 
@@ -700,18 +697,18 @@ is_public:    true/false
 
 ```bash
 # 将数据集绑定到 CSH 智能体
-curl -X PUT http://<api_host>:<api_port>/api/v1/datasets/{id}/agents \
+curl -X PUT http://localhost:8082/api/v1/datasets/{id}/agents \
   -H "X-API-Key: ..." \
   -H "Content-Type: application/json" \
   -d '{"agent_codes": ["csh"]}'
 
 # 设为全局可见（两个 Agent 均可用）
-curl -X PUT http://<api_host>:<api_port>/api/v1/datasets/{id}/agents \
+curl -X PUT http://localhost:8082/api/v1/datasets/{id}/agents \
   -H "X-API-Key: ..." \
   -d '{"agent_codes": []}'
 
 # 查看 CSH 智能体可用的全部数据集
-curl http://<api_host>:<api_port>/api/v1/datasets/by-agent/csh \
+curl http://localhost:8082/api/v1/datasets/by-agent/csh \
   -H "X-API-Key: ..."
 ```
 
@@ -735,7 +732,7 @@ const availableSkills = ref([
 ])
 ```
 
-Skill 列表当前为**硬编码**（前端未接入后端 `/api/v2/csh_agent/skills` 动态接口）。
+Skill 列表当前应从 `/api/v2/agent-runtime/profiles/{agent_code}/info` 的 `available_skills` 初始化，并可通过 `/api/v2/agent-runtime/skill-manifests?agent_code=...` 获取 manifest；不要再接入旧 CSH 专属 Skill 接口。
 
 ### 8.2 请求体传递
 
@@ -752,12 +749,12 @@ selected_skills: list[str] | None
 Agent 返回的图表通过 Markdown 内联图片格式嵌入：
 
 ```markdown
-![热解温度与污染物降解效率的相关性](/api/v1/charts/public/a1b2c3d4e5f67890)
+![热解温度与污染物降解效率的相关性](/api/v1/charts/user_123/a1b2c3d4e5f67890?exp=<unix_ts>&sig=<hmac>)
 ```
 
 前端消息渲染器遇到图片 Markdown 时，`<img>` 标签的 `src` 指向 `{API_BASE}/api/v1/charts/...`，由 FastAPI 代理从 MinIO 取回字节流。
 
-> **已知问题**：当前 `user_id` 默认为 `"public"`（工具层无法获取当前用户 ID）。待实现：通过 `InjectedToolCallId` 注入 `thread_id`，再从 checkpoint 中解析 `user_id`。
+> 当前工具通过请求级访问上下文读取 `user_id`；只有兼容旧调用或缺少访问上下文时才回退到 `public` 命名空间。`store_chart()` 总是返回带过期时间和 HMAC 的签名 URL。
 
 ---
 
@@ -773,13 +770,13 @@ Agent 返回的图表通过 Markdown 内联图片格式嵌入：
 | 全局可见 | 无记录 = 全局 | `[]` 空数组 = 全局 |
 | 专属绑定 | 有记录 = 专属 | 非空数组 = 专属 |
 | 修改方式 | `PUT /api/v1/agents/{code}/kbs` | `PUT /api/v1/datasets/{id}/agents` |
-| 运行时查询 | `get_by_agent_code()` | `DatasetCRUD.list_all(agent_code=...)` |
+| 运行时查询 | `get_runtime_agent_kb_ids()` 解析知识库绑定 | `DatasetCRUD.list_all(agent_code=...)` 按智能体过滤数据集 |
 
-两个预置数据集均绑定到 `csh`：
+两个预置数据集在初始化脚本中仍以旧编码绑定到 `csh_full_feature`，运行时通过别名对 `csh` 可见：
 
 ```
-biochar_degradation      → agent_codes: ["csh"]
-hydroxyl_radical_rates   → agent_codes: ["csh"]
+biochar_degradation      → agent_codes: ["csh_full_feature"]
+hydroxyl_radical_rates   → agent_codes: ["csh_full_feature"]
 ```
 
 ### 9.2 工具层过滤
@@ -787,7 +784,7 @@ hydroxyl_radical_rates   → agent_codes: ["csh"]
 ```python
 # list_experiment_datasets 工具调用示例
 await list_experiment_datasets(agent_code="csh")
-# → 返回 agent_codes 包含 "csh" 或为空数组的数据集
+# → 返回 agent_codes 包含 "csh"、"csh_full_feature" 或为空数组的数据集
 
 await list_experiment_datasets(agent_code="ne")
 # → 返回 agent_codes 为空数组的数据集（目前为 0 条，因两个都绑了 CSH）
@@ -938,7 +935,7 @@ WHERE code IN ('biochar_degradation', 'hydroxyl_radical_rates');
 
 ### 13.3 图表 URL 不可访问（已修复）
 
-**现象**：`http://<minio_server_ip>:<minio_port>/user-files/charts/chart_xxx.png` 浏览器无法访问。
+**现象**：`http://202.115.138.101:9004/user-files/charts/chart_xxx.png` 浏览器无法访问。
 
 **原因**：MinIO 端口（9004）仅内网可达，bucket 无公开访问策略，presigned URL 因 MinIO 内网地址问题也无效。
 
@@ -963,9 +960,9 @@ WHERE code IN ('biochar_degradation', 'hydroxyl_radical_rates');
 | `backend/db/models/dataset.py` | 95 | `ExperimentDataset` ORM 模型 |
 | `backend/db/crud/dataset_crud.py` | 146 | CRUD + agent_code 过滤 + set_agent_codes |
 | `backend/db/init_datasets.py` | 260 | 建表 + MinIO 上传 + 预注册两个数据集 |
-| `backend/custom/tools/excel_engine.py` | 524 | DuckDB 查询引擎（单/多文件、清洗、缓存） |
-| `backend/custom/tools/excel_chart_generator.py` | 468 | matplotlib+seaborn 图表生成（10 种类型） |
-| `backend/custom/tools/excel_data_analysis_tool.py` | 588 | 5 个 LangChain 工具 |
+| `backend/application/tools/providers/excel_engine.py` | 629 | DuckDB 查询引擎（单/多文件、清洗、缓存） |
+| `backend/application/tools/providers/excel_chart_generator.py` | 525 | matplotlib+seaborn 图表生成（10 种类型） |
+| `backend/application/tools/providers/excel_data_analysis_tool.py` | 708 | 5 个 LangChain 工具 |
 | `backend/api/routers/datasets.py` | 526 | 9 个数据集管理端点 |
 | `backend/api/routers/chart_images.py` | 142 | 图表图片代理端点 |
 | `backend/skills/public/excel-experiment-analysis/SKILL.md` | 216 | Skill 定义（含 JOIN 示例） |
@@ -1025,7 +1022,7 @@ Round 4: visualize_excel_data(
     title="不同热解温度下的平均降解率（±标准差）"
 )
 → 生成柱状图 PNG → 上传 MinIO/本地
-→ 返回: ![不同热解温度下的平均降解率](/api/v1/charts/public/a1b2c3d4e5f67890)
+→ 返回: ![不同热解温度下的平均降解率](/api/v1/charts/user_123/a1b2c3d4e5f67890?exp=<unix_ts>&sig=<hmac>)
 
 Round 5: 综合分析 → 文字结论
 "根据数据分析：热解温度为 500°C 时降解率最高（均值 0.33），
@@ -1078,7 +1075,7 @@ visualize_excel_data(
 
 ```bash
 # 上传新数据集并绑定到 CSH 智能体
-curl -X POST http://<api_host>:<api_port>/api/v1/datasets/upload \
+curl -X POST http://localhost:8082/api/v1/datasets/upload \
   -H "X-API-Key: your_api_key" \
   -F "file=@/path/to/new_experiment.xlsx" \
   -F "code=new_experiment" \
@@ -1087,17 +1084,17 @@ curl -X POST http://<api_host>:<api_port>/api/v1/datasets/upload \
   -F "domain=environmental"
 
 # 查看某数据集前 20 行
-curl http://<api_host>:<api_port>/api/v1/datasets/{id}/preview?rows=20 \
+curl http://localhost:8082/api/v1/datasets/{id}/preview?rows=20 \
   -H "X-API-Key: your_api_key"
 
 # 将数据集开放给两个智能体
-curl -X PUT http://<api_host>:<api_port>/api/v1/datasets/{id}/agents \
+curl -X PUT http://localhost:8082/api/v1/datasets/{id}/agents \
   -H "X-API-Key: your_api_key" \
   -H "Content-Type: application/json" \
   -d '{"agent_codes": ["csh", "ne"]}'
 
 # 刷新数据集 schema（文件更新后）
-curl -X POST http://<api_host>:<api_port>/api/v1/datasets/{id}/refresh \
+curl -X POST http://localhost:8082/api/v1/datasets/{id}/refresh \
   -H "X-API-Key: your_api_key"
 ```
 

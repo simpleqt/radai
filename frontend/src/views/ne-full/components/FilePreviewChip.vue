@@ -39,16 +39,21 @@ function chipColor(att: FileAttachment): string {
   if (att.status === 'error') return 'border-red-200 bg-red-50 dark:border-red-800 dark:bg-red-900/20';
   if (att.status === 'uploading') return 'border-amber-200 bg-amber-50 dark:border-amber-700 dark:bg-amber-900/20';
   if (att.status === 'ready') {
-    if (att.strategy === 'vision') return 'border-purple-200 bg-purple-50 dark:border-purple-700 dark:bg-purple-900/20';
+    if (att.strategy === 'vision') return 'border-accent/30 bg-accent-soft';
     if (att.strategy === 'indexed') return 'border-blue-200 bg-blue-50 dark:border-blue-700 dark:bg-blue-900/20';
     return 'border-emerald-200 bg-emerald-50 dark:border-emerald-700 dark:bg-emerald-900/20';
   }
-  return 'border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-800';
+  return 'border-border-subtle bg-surface-sunken';
 }
 </script>
 
 <template>
-  <div v-if="attachments.length > 0" class="flex flex-wrap gap-2 px-4 pt-2 pb-1">
+  <TransitionGroup
+    v-if="attachments.length > 0"
+    name="chip"
+    tag="div"
+    class="relative flex flex-wrap gap-2 px-4 pt-2 pb-1"
+  >
     <div
       v-for="att in attachments"
       :key="att.id"
@@ -67,15 +72,14 @@ function chipColor(att: FileAttachment): string {
 
       <!-- 文件信息 -->
       <div class="min-w-0 flex-1">
-        <div class="font-medium text-slate-700 dark:text-slate-200 truncate leading-tight">
+        <div class="font-medium text-text-secondary truncate leading-tight">
           {{ att.name }}
         </div>
         <div class="text-[10px] leading-tight mt-0.5"
-          :class="att.status === 'error'
-            ? 'text-red-500'
+          :class="att.status === 'error' ? 'text-red-500'
             : att.status === 'uploading'
             ? 'text-amber-600 dark:text-amber-400'
-            : 'text-slate-400 dark:text-slate-500'"
+            : 'text-text-tertiary'"
         >
           {{ strategyLabel(att) }}
           <span v-if="att.status !== 'uploading' && att.status !== 'error'" class="opacity-60"> · {{ formatSize(att.size) }}</span>
@@ -93,7 +97,7 @@ function chipColor(att: FileAttachment): string {
       <button
         v-if="!disabled && att.status !== 'uploading'"
         @click="emit('remove', att.id)"
-        class="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded-full hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+        class="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded-full hover:bg-surface-hover text-text-tertiary hover:text-text-secondary"
         title="移除附件"
       >
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -101,5 +105,27 @@ function chipColor(att: FileAttachment): string {
         </svg>
       </button>
     </div>
-  </div>
+  </TransitionGroup>
 </template>
+
+<style scoped>
+.chip-enter-active {
+  transition: opacity 200ms ease, transform 200ms cubic-bezier(0.34, 1.3, 0.64, 1);
+}
+.chip-leave-active {
+  /* 离场项原地脱离布局，兄弟 chip 由 move 过渡平滑补位 */
+  position: absolute;
+  transition: opacity 150ms ease, transform 150ms ease;
+}
+.chip-move {
+  transition: transform 250ms ease;
+}
+.chip-enter-from {
+  opacity: 0;
+  transform: translateY(6px) scale(0.9);
+}
+.chip-leave-to {
+  opacity: 0;
+  transform: scale(0.85);
+}
+</style>

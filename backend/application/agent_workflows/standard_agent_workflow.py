@@ -320,6 +320,7 @@ class StandardAgentWorkflow:
                     follow_up_stream,
                     context=context,
                     sequence=sequence + 1,
+                    force=True,
                 )
                 if follow_up_event is not None:
                     follow_up_suggestions = list(
@@ -452,10 +453,20 @@ class StandardAgentWorkflow:
             self._resolved_definition is not None
             and self._resolved_definition.runtime_scope is not None
         )
+        # One request fans out into parallel coordination units, each with its
+        # own executor and capability ledger. internal_thread_id is unique per
+        # unit, so this key lets the ledger registry distinguish them while
+        # plain request_id stays the request-wide identifier.
+        context_scope_id = (
+            f"{context.request_id}::{context.internal_thread_id}"
+            if (context.request_id or context.internal_thread_id)
+            else ""
+        )
         return {
             "model_name": context.model_name,
             "subagent_enabled": context.subagent_enabled,
             "use_search": context.use_search,
+            "deep_retrieval": getattr(context, "deep_retrieval", False),
             "kb_ids": context.kb_ids,
             "selected_skills": context.selected_skills,
             "managed_skills": managed_skills,
@@ -491,6 +502,7 @@ class StandardAgentWorkflow:
             "request_metadata": {
                 **dict(context.request_metadata),
                 "_request_id": context.request_id,
+                "_context_scope_id": context_scope_id,
                 "_agent_code": context.agent_profile.code,
                 "_domain": context.agent_profile.domain,
                 "_tool_policy": tool_policy,
@@ -512,6 +524,7 @@ class StandardAgentWorkflow:
                 time_context=context.time_context,
                 request_metadata=dict(context.request_metadata),
                 domain_context=dict(context.domain_context),
+                context_scope_id=context_scope_id,
             ),
         }
 

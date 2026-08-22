@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -75,6 +76,31 @@ def _hash_tool_calls(tool_calls: list[dict[str, Any]]) -> str:
     return hashlib.sha256(_stable_json(normalized).encode()).hexdigest()[:16]
 
 
+# 只屏蔽明确的逐次生成噪声:带时间分量的 ISO 时间戳与 UUID。日期字面量
+# (无时间部分)、普通数字等真实数据保持原样,避免把不同数据误判为无进展。
+_VOLATILE_ISO_TIMESTAMP_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
+)
+_VOLATILE_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+
+
+def _mask_volatile_identifiers(serialized: str) -> str:
+    """Mask run-variant identifiers so they cannot fake tool-result progress.
+
+    Tool payloads commonly embed generated-at timestamps and trace/request
+    UUIDs.  Two results that differ only in those fields carry no new
+    information, yet their distinct hashes previously counted as progress and
+    let a repeating loop bypass the no-progress streak until the recursion
+    limit was exhausted.
+    """
+
+    masked = _VOLATILE_ISO_TIMESTAMP_RE.sub("<ts>", serialized)
+    return _VOLATILE_UUID_RE.sub("<uuid>", masked)
+
+
 def _hash_tool_result(message: Any, originating_call_hash: str = "") -> str:
     """Hash the meaningful result, deliberately excluding per-call identifiers."""
 
@@ -85,7 +111,8 @@ def _hash_tool_result(message: Any, originating_call_hash: str = "") -> str:
         "content": _message_value(message, "content", None),
         "artifact": _message_value(message, "artifact", None),
     }
-    return hashlib.sha256(_stable_json(payload).encode()).hexdigest()[:16]
+    serialized = _mask_volatile_identifiers(_stable_json(payload))
+    return hashlib.sha256(serialized.encode()).hexdigest()[:16]
 
 
 def _hash_progress(result_hashes: set[str]) -> str:

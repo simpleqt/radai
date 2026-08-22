@@ -296,6 +296,8 @@ def make_process_event(
     summary: str | None = None,
     metadata: dict[str, Any] | None = None,
     event_key: str | None = None,
+    phase: str | None = None,
+    display: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # `detail` is intentionally concise and can be identical for multiple
     # concurrent invocations (for example, every web search may report
@@ -329,6 +331,17 @@ def make_process_event(
         event["summary"] = summary
     if metadata:
         event["metadata"] = metadata
+    if phase:
+        event["phase"] = phase
+    if display:
+        # 上限校验放在唯一出口，手工构造的展示载荷同样受约束。
+        from backend.application.agent_executors.tool_presenters.types import (
+            normalize_display_payload,
+        )
+
+        normalized = normalize_display_payload(display, tool_name=str(tool or ""))
+        if normalized:
+            event["display"] = normalized
     return event
 
 

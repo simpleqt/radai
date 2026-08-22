@@ -1,4 +1,4 @@
-import { reactive, ref, computed } from 'vue';
+import { ref, computed } from 'vue';
 import { ExploreAPI, type ExploreNode } from '@/api/explore';
 import { AgentAPI, type KbOption } from '@/api/agent-v2';
 import { clearExploreNodeCaches } from './exploreNodeCache';
@@ -16,6 +16,16 @@ export interface MapNode {
 }
 
 const DRAFT_KEY_PREFIX = 'explore_draft_';
+const INVALID_NODE_TITLES = new Set(['子知识点', '子节点', '知识点', '节点', '主题名', '标题', 'title']);
+
+function isValidNodeTitle(title: unknown): title is string {
+  const normalized = String(title || '').trim().replace(/[\s:：,，.。;；、\-_/\\|]+/g, '').toLowerCase();
+  return Boolean(normalized) && !INVALID_NODE_TITLES.has(normalized);
+}
+
+function usableExploreNodes(nodes: ExploreNode[] | undefined): ExploreNode[] {
+  return (nodes || []).filter((node) => isValidNodeTitle(node?.title));
+}
 
 function toMapNode(n: ExploreNode, depth: number): MapNode {
   return {
@@ -31,17 +41,38 @@ function toMapNode(n: ExploreNode, depth: number): MapNode {
   };
 }
 
+function normalizeDraftNode(raw: any, depth = 0): MapNode | null {
+  if (!raw || !isValidNodeTitle(raw.title)) return null;
+  const children = Array.isArray(raw.children)
+    ? raw.children
+        .map((child: any) => normalizeDraftNode(child, depth + 1))
+        .filter((child: MapNode | null): child is MapNode => Boolean(child))
+    : [];
+  return {
+    id: String(raw.id || `n_${Math.random().toString(36).slice(2, 10)}`),
+    title: String(raw.title),
+    summary: raw.summary,
+    expandable: raw.expandable !== false,
+    children,
+    expanded: Boolean(raw.expanded),
+    loading: false,
+    depth,
+    loaded: Boolean(raw.loaded || children.length > 0),
+  };
+}
+
 export function useExploreSession() {
   const view = ref<'galaxy' | 'map'>('galaxy');
   const currentTopic = ref('');
   const kbId = ref<string>('');
+  const boundKbIds = ref<string[]>([]);
   const availableKbs = ref<KbOption[]>([]);
   const root = ref<MapNode | null>(null);
   const selectedNodeId = ref<string | null>(null);
   const loadingMap = ref(false);
   const errorMsg = ref('');
 
-  const kbIds = computed(() => (kbId.value ? [kbId.value] : []));
+  const kbIds = computed(() => (kbId.value ? [kbId.value] : [...boundKbIds.value]));
 
   const selectedNode = computed<MapNode | null>(() => {
     if (!selectedNodeId.value || !root.value) return null;
@@ -77,8 +108,11 @@ export function useExploreSession() {
     try {
       const info = await AgentAPI.getInfo();
       availableKbs.value = info.available_kbs || [];
-      if (!kbId.value && availableKbs.value.length > 0) {
-        kbId.value = availableKbs.value[0].id;
+      const availableIds = new Set(availableKbs.value.map((kb) => kb.id));
+      boundKbIds.value = (info.kb_ids || []).filter((id) => availableIds.has(id));
+      const preferredKbId = boundKbIds.value[0] || availableKbs.value[0]?.id || '';
+      if (!kbId.value || !availableIds.has(kbId.value)) {
+        kbId.value = preferredKbId;
       }
     } catch (e) {
       console.warn('[Explore] 加载智能体信息失败', e);
@@ -101,7 +135,7 @@ export function useExploreSession() {
         title: data.root.title || t,
         summary: data.root.summary,
         expandable: true,
-        children: (data.children || []).map((c) => toMapNode(c, 1)),
+        children: usableExploreNodes(data.children).map((c) => toMapNode(c, 1)),
         expanded: true,
         loading: false,
         depth: 0,
@@ -124,16 +158,22 @@ export function useExploreSession() {
     }
     if (!node.expandable || node.loading) return;
     node.loading = true;
+    errorMsg.value = '';
     try {
       const path = getPath(node.id);
       const data = await ExploreAPI.expand(node.title, path, kbIds.value);
-      node.children = (data.children || []).map((c) => toMapNode(c, node.depth + 1));
+      node.children = usableExploreNodes(data.children).map((c) => toMapNode(c, node.depth + 1));
       node.loaded = true;
       node.expanded = true;
-      if (node.children.length === 0) node.expandable = false;
-      saveDraft();
-    } catch (e) {
+      if (node.children.length === 0) {
+        node.expandable = false;
+        errorMsg.value = '该节点暂未生成可用子知识点';
+      } else {
+        saveDraft();
+      }
+    } catch (e: any) {
       console.warn('[Explore] 展开节点失败', e);
+      errorMsg.value = e?.message || '展开节点失败，请稍后重试';
     } finally {
       node.loading = false;
     }
@@ -180,7 +220,12 @@ export function useExploreSession() {
       if (!raw) return false;
       const data = JSON.parse(raw);
       if (data?.root) {
-        root.value = data.root;
+        const restored = normalizeDraftNode(data.root);
+        if (!restored) {
+          clearDraft();
+          return false;
+        }
+        root.value = restored;
         currentTopic.value = data.topic || '';
         view.value = 'map';
         return true;

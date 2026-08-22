@@ -12,11 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
-import uuid
+import threading
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
+from contextlib import contextmanager
+from typing import override
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware, SummarizationMiddleware
@@ -25,43 +25,82 @@ from langchain.agents.middleware.types import (
     ModelRequest,
     ModelResponse,
 )
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.prebuilt.tool_node import ToolCallRequest
 from langgraph.runtime import Runtime
 from langgraph.types import Command
-from typing_extensions import override
 
 from backend.core.agents.context import (
+    CapabilityLedger,
     CompactionCheckpointCoordinator,
     ContextEngine,
     ContextPolicy,
-    DEFAULT_PROJECT_EVIDENCE_TOOLS,
-    DEFAULT_SEMANTIC_SUMMARY_SKIP_TOOLS,
     LargeResultSummarizer,
 )
-from backend.core.agents.context.history_compactor import (
-    HistoryCompactionAttempt,
-    HistoryCompactionResult,
-)
-from backend.core.agents.context.policy import context_env_int
-from backend.core.agents.context.structured_result import compact_structured_result
+from backend.core.agents.context.history_compactor import HistoryCompactionResult
+from backend.core.agents.context.ledger import ContextLedger
 from backend.core.agents.context.types import ContextPack
 from backend.core.agents.features import Prev
 
+from backend.core.agents.middlewares.context_pruning_elevation import (  # noqa: F401  (含测试兼容 re-export)
+    PROJECT_EVIDENCE_TOOLS,
+    RESULT_SUMMARY_SKIP_TOOLS,
+)
+from backend.core.agents.middlewares.context_pruning_projection import (  # noqa: F401  (含测试兼容 re-export)
+    JIT_MAX_EVIDENCE_BLOCKS,
+    JIT_MAX_EVIDENCE_CHARS,
+    JIT_MAX_PROJECT_EVIDENCE_BLOCKS,
+    JIT_MAX_PROJECT_EVIDENCE_CHARS,
+)
+from backend.core.agents.middlewares.context_pruning_projection import (
+    _context_records_for_request as _impl_context_records_for_request,
+    _compile_jit_request as _impl_compile_jit_request,
+    _collect_projection_objects as _impl_collect_projection_objects,
+    _project_jit_pack as _impl_project_jit_pack,
+    _select_projection_objects as _impl_select_projection_objects,
+    _compose_context_accounting as _impl_compose_context_accounting,
+    _assemble_jit_system_message as _impl_assemble_jit_system_message,
+)
+from backend.core.agents.middlewares.context_pruning_elevation import (
+    _apply_context_object_path as _impl_apply_context_object_path,
+    _fallback_legacy_externalize as _impl_fallback_legacy_externalize,
+    _record_context_accounting as _impl_record_context_accounting,
+    _summarize_large_results as _impl_summarize_large_results,
+    _process_state_elevation as _impl_process_state_elevation,
+    _capture_tool_message_before_checkpoint as _impl_capture_tool_message_before_checkpoint,
+    _capture_tool_result_before_checkpoint as _impl_capture_tool_result_before_checkpoint,
+)
+from backend.core.agents.middlewares.context_pruning_compaction import (
+    _ensure_capability_ledger as _impl_ensure_capability_ledger,
+    _temporary_capability_ledger as _impl_temporary_capability_ledger,
+    _release_capability_ledger as _impl_release_capability_ledger,
+    _messages_after_elevation as _impl_messages_after_elevation,
+    _early_compaction_threshold as _impl_early_compaction_threshold,
+    _ensure_session_memory_loaded as _impl_ensure_session_memory_loaded,
+    _session_memory_block as _impl_session_memory_block,
+    _persist_session_memory as _impl_persist_session_memory,
+    _save_session_memory as _impl_save_session_memory,
+    _maybe_compact_history_async as _impl_maybe_compact_history_async,
+    _maybe_compact_history_sync as _impl_maybe_compact_history_sync,
+    _apply_compaction_result as _impl_apply_compaction_result,
+    _before_history_compaction as _impl_before_history_compaction,
+    _after_history_compaction as _impl_after_history_compaction,
+    _restore_compaction_state as _impl_restore_compaction_state,
+    _record_context_pack_trace as _impl_record_context_pack_trace,
+    _record_compaction_trace as _impl_record_compaction_trace,
+    _record_compaction_attempt_trace as _impl_record_compaction_attempt_trace,
+    _request_fixed_tokens as _impl_request_fixed_tokens,
+    _observe_request_compaction_attempt as _impl_observe_request_compaction_attempt,
+    _compact_request_sync as _impl_compact_request_sync,
+    _compact_request_async as _impl_compact_request_async,
+    _finalize_model_call_result as _impl_finalize_model_call_result,
+    _estimated_request_tokens as _impl_estimated_request_tokens,
+    _observe_response_input_tokens as _impl_observe_response_input_tokens,
+    _prepare_model_request as _impl_prepare_model_request,
+)
+
 logger = logging.getLogger(__name__)
 
-# Compatibility exports for diagnostics/tests. Runtime code reads the resolved
-# ContextPolicy instance so every execution path uses the same values.
-JIT_MAX_EVIDENCE_BLOCKS = context_env_int("JIT_MAX_EVIDENCE_BLOCKS", 2, minimum=1)
-JIT_MAX_EVIDENCE_CHARS = context_env_int("JIT_MAX_EVIDENCE_CHARS", 14000, minimum=2000)
-JIT_MAX_PROJECT_EVIDENCE_BLOCKS = context_env_int(
-    "JIT_MAX_PROJECT_EVIDENCE_BLOCKS", 4, minimum=1
-)
-JIT_MAX_PROJECT_EVIDENCE_CHARS = context_env_int(
-    "JIT_MAX_PROJECT_EVIDENCE_CHARS", 12000, minimum=2000
-)
-PROJECT_EVIDENCE_TOOLS = set(DEFAULT_PROJECT_EVIDENCE_TOOLS)
-RESULT_SUMMARY_SKIP_TOOLS = set(DEFAULT_SEMANTIC_SUMMARY_SKIP_TOOLS)
 
 @Prev(SummarizationMiddleware)
 class ContextPruningMiddleware(AgentMiddleware[AgentState]):
@@ -75,10 +114,10 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
     def __init__(
         self,
         char_threshold: int | None = None,
-        keep_latest_n: int = 1,
         thread_id: str | None = None,
         model_name: str | None = None,
         user_id: str | None = None,
+        request_id: str | None = None,
         policy: ContextPolicy | None = None,
         checkpointer: object | None = None,
         checkpoint_ns: str = "",
@@ -94,9 +133,9 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
         )
         self._policy = self._context_engine.policy
         self.char_threshold = self._policy.large_result_threshold_chars
-        self.keep_latest_n = keep_latest_n
         self._thread_id = thread_id
         self._user_id = str(user_id or "").strip() or None
+        self._request_id = str(request_id or "").strip() or None
         self._model_name = model_name or self._policy.model_name
         self._large_result_summarizer = LargeResultSummarizer(
             model_name=self._model_name,
@@ -108,7 +147,43 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
         self._result_sink = self._context_engine.result_sink
         self._capture_registry = self._context_engine.capture_registry
         self._context_ledger = self._context_engine.ledger
+        self._context_object_mode = self._context_engine.context_object_mode
+        self._object_store = self._context_engine.object_store
+        self._projection_compiler = self._context_engine.projection_compiler
+        self._segmenter_registry = self._context_engine.segmenter_registry
+        self._fresh_context_oids: set[str] = set()
+        # Request-scoped CJK n-gram term sets for activation scoring; sids are
+        # content-addressed so entries stay valid across JIT projections.
+        self._activation_term_cache: dict[str, list[str]] = {}
+        self._capability_ledger: CapabilityLedger | None = None
+        self._ledger_install_token: object | None = None
+        self._ledger_scope_depth = 0
+        # Tool captures run on worker threads (awrap_tool_call -> to_thread);
+        # without this lock two concurrent first captures could both create and
+        # install a ledger, leaking one install token and splitting the
+        # request's authorization table across two ledgers.
+        self._ledger_create_lock = threading.Lock()
         self._history_compactor = self._context_engine.history_compactor
+        # System prompt + tool schemas measured on the previous model call in
+        # this request. before_model has no compiled request yet, so this is
+        # the best available estimate for its compaction trigger; without it
+        # the hook systematically under-counted and compacted too late.
+        self._last_request_fixed_tokens = 0
+        # Model rounds completed in this request (middleware instances are
+        # request-scoped). From the second round on, before_model may compact
+        # at compaction_early_ratio × trigger: the LLM summary then runs
+        # inside a tool-round gap (user already waiting on tools) instead of
+        # on the first, latency-critical call of a new turn.
+        self._request_model_calls = 0
+        # Persistent session memory (agent_memory) loaded once per request on
+        # the async path and injected as a stable system-prefix block; new
+        # compaction summaries are persisted back fire-and-forget.
+        self._session_memory_loaded = False
+        self._session_memory_text = ""
+        self._session_memory_tasks: set[asyncio.Task] = set()
+        # Chains fire-and-forget memory saves so an earlier compaction's save
+        # can never complete after (and overwrite) a later one.
+        self._session_memory_chain: asyncio.Task | None = None
         self._compaction_checkpoints = checkpoint_coordinator or (
             CompactionCheckpointCoordinator(
                 checkpointer=checkpointer,
@@ -118,8 +193,9 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
         )
         logger.info(
             f"[ContextPruningMiddleware] Initialized with State Elevation & JIT Assembly: "
-            f"char_threshold={self.char_threshold}, keep_latest_n={keep_latest_n}, "
-            f"model_name={self._model_name}, input_budget={self._context_ledger.token_budget}"
+            f"char_threshold={self.char_threshold}, "
+            f"model_name={self._model_name}, input_budget={self._context_ledger.token_budget}, "
+            f"context_object_mode={self._context_object_mode}"
         )
 
     @property
@@ -131,398 +207,64 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
     @staticmethod
     def _latest_user_query(messages: list) -> str:
         for message in reversed(messages):
-            if isinstance(message, HumanMessage):
+            if ContextLedger._is_regular_user_message(message):
                 return str(message.content or "")
         return ""
 
-    async def _summarize_large_results(self, state: AgentState) -> dict[str, str]:
-        messages = list(state.get("messages") or [])
-        user_query = self._latest_user_query(messages)
-        candidates: list[tuple[str, str, str]] = []
-        for message in messages:
-            if not isinstance(message, ToolMessage):
-                continue
-            content = str(message.content or "")
-            tool_name = str(message.name or "unknown")
-            if (
-                len(content) <= self.char_threshold
-                or tool_name in self._context_engine.semantic_summary_skip_tools
-                or getattr(message, "status", None) == "error"
-                or content.startswith(
-                    (
-                        "[State Elevation:",
-                        "[Context Isolation:",
-                        "[Result Capture:",
-                        "[Result Summarizer Handoff:",
-                        "[Structured Result Compaction:",
-                        "[Context Artifact Read:",
-                        "[System Notification:",
-                    )
-                )
-            ):
-                continue
-            candidates.append((str(message.tool_call_id or ""), tool_name, content))
-            if len(candidates) >= self._policy.result_summary_max_concurrent:
-                break
-        if not candidates:
-            return {}
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _ensure_capability_ledger = _impl_ensure_capability_ledger
 
-        async def _run(tool_call_id: str, tool_name: str, content: str):
-            summary = compact_structured_result(
-                content,
-                max_chars=self._policy.result_summary_output_chars,
-            )
-            deterministic = summary is not None
-            if summary is None:
-                summary = await asyncio.wait_for(
-                    self._large_result_summarizer.summarize(
-                        source_tool=tool_name,
-                        content=content,
-                        user_query=user_query,
-                    ),
-                    timeout=self._policy.result_summary_timeout_seconds,
-                )
-            return tool_call_id, tool_name, summary, deterministic
+    @contextmanager
+    def capability_scope(self):
+        """Bind this middleware's request ledger for one executor stream.
 
-        results = await asyncio.gather(
-            *[_run(*candidate) for candidate in candidates],
-            return_exceptions=True,
-        )
-        summaries: dict[str, str] = {}
-        for result in results:
-            if isinstance(result, BaseException):
-                logger.warning(
-                    "[ResultSummarizer] child summarizer failed: %s",
-                    result,
-                )
-                continue
-            tool_call_id, tool_name, summary, deterministic = result
-            if not summary:
-                continue
-            if deterministic:
-                summaries[tool_call_id] = (
-                    f"[Structured Result Compaction: source_tool={tool_name}; "
-                    "the existing JSON rows were compacted deterministically and "
-                    "no model or tool was called.]\n"
-                    f"{summary}"
-                )
-            else:
-                summaries[tool_call_id] = (
-                    f"[Result Summarizer Handoff: source_tool={tool_name}; "
-                    "the child agent summarized an already completed tool result and "
-                    "did not perform another query.]\n"
-                    f"{summary}"
-                )
-        return summaries
+        The ledger is created once per request; nested scopes on the same
+        middleware only bump the depth counter, and the outermost exit
+        uninstalls it, restoring any previously registered outer ledger.
+        """
 
-    def _process_state_elevation(
-        self,
-        state: AgentState,
-        *,
-        summary_overrides: dict[str, str] | None = None,
-    ) -> dict | None:
-        """Build reducer-friendly state updates for elevated content and pruned messages."""
-        messages = state.get("messages") or []
-        if not messages:
-            return None
+        if self._capability_ledger is None:
+            self._ensure_capability_ledger()
+        self._ledger_scope_depth += 1
+        try:
+            yield
+        finally:
+            self._ledger_scope_depth = max(0, self._ledger_scope_depth - 1)
+            if self._ledger_scope_depth == 0:
+                self._release_capability_ledger()
 
-        loaded_skills: dict[str, str] = {}
-        project_bootstrap: dict | None = None
-        context_records: list[dict] = []
-        message_updates = []
-        thread_id = self._thread_id or self._resolve_thread_id(state)
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _temporary_capability_ledger = _impl_temporary_capability_ledger
 
-        # Build ID mapping from AI messages to find matching tool arguments
-        ai_tool_calls_map = {}
-        for msg in messages:
-            if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
-                for tc in msg.tool_calls:
-                    tc_id = tc.get("id")
-                    if tc_id:
-                        ai_tool_calls_map[tc_id] = tc
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _release_capability_ledger = _impl_release_capability_ledger
 
-        for msg in messages:
-            if isinstance(msg, ToolMessage):
-                content_str = str(msg.content or "")
+    # 实现在 context_pruning_elevation.py(模块级函数,self 经 descriptor 绑定)
+    _apply_context_object_path = _impl_apply_context_object_path
 
-                # Check if it has already been pruned / elevated
-                is_already_processed = (
-                    content_str.startswith("[State Elevation:")
-                    or content_str.startswith("[Context Isolation:")
-                    or content_str.startswith("[Result Capture:")
-                    or content_str.startswith("[Result Summarizer Handoff:")
-                    or content_str.startswith("[Structured Result Compaction:")
-                    or content_str.startswith("[Context Artifact Read:")
-                    or content_str.startswith("[System Notification:")
-                )
+    # 实现在 context_pruning_elevation.py(模块级函数,self 经 descriptor 绑定)
+    _fallback_legacy_externalize = _impl_fallback_legacy_externalize
 
-                if is_already_processed or getattr(msg, "status", None) == "error":
-                    if getattr(msg, "artifact", None) is not None:
-                        message_updates.append(
-                            msg.model_copy(update={"artifact": None})
-                        )
-                    continue
-                if str(msg.name or "") == "query_project_tables":
-                    try:
-                        query_payload = json.loads(content_str)
-                    except (TypeError, json.JSONDecodeError):
-                        query_payload = {}
-                    if (
-                        isinstance(query_payload, dict)
-                        and query_payload.get("counts_toward_query_budget") is False
-                    ):
-                        message_updates.append(
-                            msg.model_copy(
-                                update={
-                                    "content": (
-                                        "[System Notification: This schema lookup or rejected SQL "
-                                        "was not project evidence and did not consume query budget.]"
-                                    ),
-                                    "artifact": None,
-                                }
-                            )
-                        )
-                        continue
-                matching_tc = ai_tool_calls_map.get(msg.tool_call_id, {})
-                args = matching_tc.get("args", {})
-                if not isinstance(args, dict):
-                    args = {"skill_name": args}
-                try:
-                    captured = self._capture_registry.capture(
-                        tool_name=str(msg.name or "unknown"),
-                        content=content_str,
-                        tool_args=args,
-                        thread_id=thread_id,
-                        artifact=getattr(msg, "artifact", None),
-                    )
-                except Exception:
-                    logger.exception(
-                        "[ContextCapture] Failed to capture tool result: tool=%s",
-                        msg.name,
-                    )
-                    continue
-                if captured is None:
-                    continue
-                active_turn_id = self._context_ledger._active_turn_id(list(messages))
-                retrieval_seq = next(
-                    (
-                        index
-                        for index, candidate in enumerate(messages)
-                        if candidate is msg
-                    ),
-                    0,
-                )
-                for record in captured.context_records:
-                    if not str(record.get("turn_id") or "").strip():
-                        record["turn_id"] = active_turn_id or None
-                    if str(record.get("category") or "") == "retrieval":
-                        if not int(record.get("retrieval_seq") or 0):
-                            record["retrieval_seq"] = retrieval_seq
-                semantic_summary = (summary_overrides or {}).get(
-                    str(msg.tool_call_id or "")
-                )
-                if semantic_summary:
-                    captured.replacement = semantic_summary
-                    for record in captured.context_records:
-                        record["claim"] = semantic_summary
-                        record["content"] = semantic_summary
-                        is_subagent_summary = semantic_summary.startswith(
-                            "[Result Summarizer Handoff:"
-                        )
-                        if is_subagent_summary:
-                            record["category"] = "handoff"
-                            record["kind"] = "subagent_result"
-                        record["tags"] = list(
-                            dict.fromkeys(
-                                [
-                                    *(record.get("tags") or []),
-                                    (
-                                        "subagent_summary"
-                                        if is_subagent_summary
-                                        else "structured_result_compaction"
-                                    ),
-                                ]
-                            )
-                        )
-                loaded_skills.update(captured.loaded_skills)
-                if captured.project_bootstrap:
-                    project_bootstrap = captured.project_bootstrap
-                context_records.extend(captured.context_records)
-                message_updates.append(
-                    msg.model_copy(
-                        update={"content": captured.replacement, "artifact": None}
-                    )
-                )
-                logger.info(
-                    "[ContextCapture] Captured tool result: tool=%s records=%d",
-                    msg.name,
-                    len(captured.context_records),
-                )
+    # 实现在 context_pruning_elevation.py(模块级函数,self 经 descriptor 绑定)
+    _record_context_accounting = _impl_record_context_accounting
 
-        updates: dict = {}
-        if message_updates:
-            updates["messages"] = message_updates
-        if loaded_skills:
-            updates["loaded_skills"] = loaded_skills
-        if project_bootstrap:
-            updates["project_bootstrap"] = project_bootstrap
-        if context_records:
-            updates["context_records"] = context_records
-        return updates or None
+    # 实现在 context_pruning_elevation.py(模块级函数,self 经 descriptor 绑定)
+    _summarize_large_results = _impl_summarize_large_results
+
+    # 实现在 context_pruning_elevation.py(模块级函数,self 经 descriptor 绑定)
+    _process_state_elevation = _impl_process_state_elevation
 
     @staticmethod
     def _is_captured_tool_content(content: str) -> bool:
-        return content.startswith(
-            (
-                "[State Elevation:",
-                "[Context Isolation:",
-                "[Result Capture:",
-                "[Result Summarizer Handoff:",
-                "[Structured Result Compaction:",
-                "[Context Artifact Read:",
-                "[System Notification:",
-            )
-        )
+        from backend.core.agents.context.summary import CAPTURED_CONTENT_PREFIXES
 
-    def _capture_tool_message_before_checkpoint(
-        self,
-        request: ToolCallRequest,
-        message: ToolMessage,
-    ) -> tuple[ToolMessage, dict]:
-        """Externalize one tool result before ToolNode writes graph state."""
+        return content.startswith(CAPTURED_CONTENT_PREFIXES)
 
-        content = str(message.content or "")
-        if not content or getattr(message, "status", None) == "error":
-            if getattr(message, "artifact", None) is not None:
-                return message.model_copy(update={"artifact": None}), {}
-            return message, {}
-        if self._is_captured_tool_content(content):
-            if getattr(message, "artifact", None) is not None:
-                return message.model_copy(update={"artifact": None}), {}
-            return message, {}
-        tool_name = str(message.name or request.tool_call.get("name") or "unknown")
-        if tool_name == "query_project_tables":
-            try:
-                payload = json.loads(content)
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
-            if isinstance(payload, dict) and payload.get("counts_toward_query_budget") is False:
-                replacement = message.model_copy(
-                    update={
-                        "content": (
-                            "[System Notification: This schema lookup or rejected SQL "
-                            "was not project evidence and did not consume query budget.]"
-                        ),
-                        "artifact": None,
-                    }
-                )
-                return replacement, {}
+    # 实现在 context_pruning_elevation.py(模块级函数,self 经 descriptor 绑定)
+    _capture_tool_message_before_checkpoint = _impl_capture_tool_message_before_checkpoint
 
-        state = request.state if isinstance(request.state, dict) else {}
-        messages = list(state.get("messages") or [])
-        thread_id = self._thread_id or self._resolve_thread_id(state)
-        tool_args = request.tool_call.get("args") or {}
-        if not isinstance(tool_args, dict):
-            tool_args = {"value": tool_args}
-        try:
-            captured = self._capture_registry.capture(
-                tool_name=tool_name,
-                content=content,
-                tool_args=tool_args,
-                thread_id=thread_id,
-                artifact=getattr(message, "artifact", None),
-            )
-        except Exception:
-            logger.exception(
-                "[ContextCapture] Failed before checkpoint: tool=%s",
-                tool_name,
-            )
-            return message, {}
-        if captured is None:
-            return message, {}
-
-        turn_id = self._context_ledger._active_turn_id(messages)
-        retrieval_seq = len(messages)
-        for record in captured.context_records:
-            if not str(record.get("turn_id") or "").strip():
-                record["turn_id"] = turn_id or None
-            if str(record.get("category") or "") == "retrieval":
-                if not int(record.get("retrieval_seq") or 0):
-                    record["retrieval_seq"] = retrieval_seq
-        # The structured artifact is consumed by the capture adapter above. It
-        # must not survive on the replacement ToolMessage because messages are
-        # checkpointed by ToolNode before the next model request.
-        replacement = message.model_copy(
-            update={"content": captured.replacement, "artifact": None}
-        )
-        updates: dict = {}
-        if captured.context_records:
-            updates["context_records"] = list(captured.context_records)
-        if captured.loaded_skills:
-            updates["loaded_skills"] = dict(captured.loaded_skills)
-        if captured.project_bootstrap:
-            updates["project_bootstrap"] = dict(captured.project_bootstrap)
-        return replacement, updates
-
-    def _capture_tool_result_before_checkpoint(
-        self,
-        request: ToolCallRequest,
-        result: ToolMessage | Command,
-    ) -> ToolMessage | Command:
-        if isinstance(result, ToolMessage):
-            replacement, updates = self._capture_tool_message_before_checkpoint(
-                request,
-                result,
-            )
-            if not updates and replacement is result:
-                return result
-            return Command(update={"messages": [replacement], **updates})
-        if not isinstance(result, Command) or not isinstance(result.update, dict):
-            return result
-
-        original_update = dict(result.update)
-        raw_messages = original_update.get("messages")
-        if not isinstance(raw_messages, (list, tuple)):
-            return result
-        replacements: list = []
-        accumulated: dict[str, object] = {}
-        changed = False
-        for candidate in raw_messages:
-            if not isinstance(candidate, ToolMessage):
-                replacements.append(candidate)
-                continue
-            replacement, updates = self._capture_tool_message_before_checkpoint(
-                request,
-                candidate,
-            )
-            replacements.append(replacement)
-            changed = changed or replacement is not candidate or bool(updates)
-            for key, value in updates.items():
-                if isinstance(value, list):
-                    accumulated.setdefault(key, [])
-                    accumulated[key].extend(value)  # type: ignore[union-attr]
-                elif isinstance(value, dict):
-                    accumulated.setdefault(key, {})
-                    accumulated[key].update(value)  # type: ignore[union-attr]
-                else:
-                    accumulated[key] = value
-        if not changed:
-            return result
-        original_update["messages"] = replacements
-        for key, value in accumulated.items():
-            existing = original_update.get(key)
-            if isinstance(existing, list) and isinstance(value, list):
-                original_update[key] = [*existing, *value]
-            elif isinstance(existing, dict) and isinstance(value, dict):
-                original_update[key] = {**existing, **value}
-            else:
-                original_update[key] = value
-        return Command(
-            graph=result.graph,
-            update=original_update,
-            resume=result.resume,
-            goto=result.goto,
-        )
+    # 实现在 context_pruning_elevation.py(模块级函数,self 经 descriptor 绑定)
+    _capture_tool_result_before_checkpoint = _impl_capture_tool_result_before_checkpoint
 
     @override
     def wrap_tool_call(
@@ -545,95 +287,38 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
             result,
         )
 
-    def _messages_after_elevation(self, state: AgentState, updates: dict | None) -> list:
-        messages = list(state.get("messages") or [])
-        if not updates or not updates.get("messages"):
-            return messages
-        replacements = {
-            getattr(message, "id", None): message
-            for message in updates.get("messages") or []
-            if getattr(message, "id", None)
-        }
-        if not replacements:
-            return messages
-        merged = []
-        for message in messages:
-            message_id = getattr(message, "id", None)
-            merged.append(replacements.get(message_id, message))
-        return merged
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _messages_after_elevation = _impl_messages_after_elevation
 
-    async def _maybe_compact_history_async(
-        self,
-        state: AgentState,
-        updates: dict | None,
-        *,
-        trigger: str = "auto",
-    ) -> dict | None:
-        messages = self._messages_after_elevation(state, updates)
-        attempt = await self._history_compactor.acompact_attempt(
-            messages,
-            previous_window_id=self._previous_window_id(state, messages),
-            trigger=trigger,
-        )
-        if attempt.threshold_reached and attempt.result is None:
-            self._record_compaction_attempt_trace(state, attempt)
-        return self._apply_compaction_result(state, updates, attempt.result)
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _early_compaction_threshold = _impl_early_compaction_threshold
 
-    def _maybe_compact_history_sync(
-        self,
-        state: AgentState,
-        updates: dict | None,
-        *,
-        trigger: str = "auto",
-    ) -> dict | None:
-        messages = self._messages_after_elevation(state, updates)
-        attempt = self._history_compactor.compact_deterministic_attempt(
-            messages,
-            previous_window_id=self._previous_window_id(state, messages),
-            trigger=trigger,
-        )
-        if attempt.threshold_reached and attempt.result is None:
-            self._record_compaction_attempt_trace(state, attempt)
-        return self._apply_compaction_result(state, updates, attempt.result)
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _ensure_session_memory_loaded = _impl_ensure_session_memory_loaded
 
-    def _apply_compaction_result(
-        self,
-        state: AgentState,
-        updates: dict | None,
-        result: HistoryCompactionResult | None,
-    ) -> dict | None:
-        if result is None:
-            return updates
-        self._before_history_compaction(state, result)
-        binding = self._compaction_checkpoints.bind(result, state=state)
-        merged = dict(updates or {})
-        merged["messages"] = binding.messages
-        merged["context_window_id"] = result.window_id
-        compaction_state = binding.state_payload
-        merged["context_compaction"] = compaction_state
-        if binding.reference is not None:
-            merged["context_checkpoint_ref"] = binding.reference.as_dict()
-        merged["context_compaction_history"] = [
-            self._compaction_history_entry(compaction_state)
-        ]
-        self._record_compaction_trace(state, result)
-        logger.info(
-            "[HistoryCompaction] Compacted context window: tokens %d→%d, removed=%d, retained_user=%d",
-            result.tokens_before,
-            result.tokens_after,
-            result.removed_messages,
-            result.retained_user_messages,
-        )
-        self._after_history_compaction(state, result, merged)
-        return merged
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _session_memory_block = _impl_session_memory_block
+
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _persist_session_memory = _impl_persist_session_memory
+
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _save_session_memory = _impl_save_session_memory
+
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _maybe_compact_history_async = _impl_maybe_compact_history_async
+
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _maybe_compact_history_sync = _impl_maybe_compact_history_sync
+
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _apply_compaction_result = _impl_apply_compaction_result
 
     @staticmethod
     def _compaction_history_entry(compaction_state: dict) -> dict:
         summary = str(compaction_state.get("summary") or "")
         compact = {
-            key: value
-            for key, value in compaction_state.items()
-            if key != "summary"
+            key: value for key, value in compaction_state.items() if key != "summary"
         }
         if summary:
             compact["summary_preview"] = summary[:1000]
@@ -659,274 +344,44 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
                 return window_id
         return None
 
-    def _before_history_compaction(
-        self,
-        state: AgentState,
-        result: HistoryCompactionResult,
-    ) -> None:
-        """Hook for subclasses/integrations that need to observe compaction."""
-        del state, result
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _before_history_compaction = _impl_before_history_compaction
 
-    def _after_history_compaction(
-        self,
-        state: AgentState,
-        result: HistoryCompactionResult,
-        updates: dict,
-    ) -> None:
-        """Hook for subclasses/integrations after replacement history is built."""
-        del state, result, updates
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _after_history_compaction = _impl_after_history_compaction
 
-    def _restore_compaction_state(self, state: AgentState) -> dict | None:
-        """Recover request-stage compaction metadata after messages are reduced."""
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _restore_compaction_state = _impl_restore_compaction_state
 
-        current_window_id = str(state.get("context_window_id") or "").strip()
-        for message in reversed(list(state.get("messages") or [])):
-            additional_kwargs = getattr(message, "additional_kwargs", None)
-            if not isinstance(additional_kwargs, dict):
-                continue
-            raw_metadata = additional_kwargs.get("context_compaction")
-            if not isinstance(raw_metadata, dict):
-                continue
-            metadata = dict(raw_metadata)
-            window_id = str(metadata.get("window_id") or "").strip()
-            if not window_id or window_id == current_window_id:
-                return None
-            metadata["window_id"] = window_id
-            metadata["summary"] = str(getattr(message, "content", "") or "")
-            updates = {
-                "context_window_id": window_id,
-                "context_compaction": metadata,
-                "context_compaction_history": [
-                    self._compaction_history_entry(metadata)
-                ],
-            }
-            checkpoint_ref = metadata.get("checkpoint_ref")
-            if isinstance(checkpoint_ref, dict):
-                updates["context_checkpoint_ref"] = dict(checkpoint_ref)
-            return updates
-        return None
+    # 实现在 context_pruning_projection.py(模块级函数,self 经 descriptor 绑定)
+    _context_records_for_request = _impl_context_records_for_request
 
-    def _context_records_for_request(self, state: AgentState) -> list[dict]:
-        """Normalize graph state through the single migration boundary."""
+    # 实现在 context_pruning_projection.py(模块级函数,self 经 descriptor 绑定)
+    _compile_jit_request = _impl_compile_jit_request
 
-        return [
-            dict(record)
-            for record in self._context_engine.records_from_state(dict(state))
-        ]
+    # 实现在 context_pruning_projection.py(模块级函数,self 经 descriptor 绑定)
+    _collect_projection_objects = _impl_collect_projection_objects
 
-    def _compile_jit_request(
-        self,
-        system_message: SystemMessage | None,
-        state: AgentState,
-        *,
-        messages: list,
-        request_overhead: object | None = None,
-    ) -> tuple[list, SystemMessage | None, bool, ContextPack]:
-        """Compile history and JIT evidence through the shared exact-budget path."""
+    # 实现在 context_pruning_projection.py(模块级函数,self 经 descriptor 绑定)
+    _project_jit_pack = _impl_project_jit_pack
 
-        compiled = self._context_ledger.compile_request(
-            self._context_records_for_request(state),
-            messages=messages,
-            system_content=system_message.content if system_message is not None else None,
-            request_overhead=request_overhead,
-        )
-        pack = compiled.get("pack") or ContextPack()
-        # The rendered pack is request-scoped and is rebuilt on every model
-        # call.  Keep only accounting/selection metadata in durable graph
-        # state so a large JIT payload is not checkpointed and replayed.
-        state["context_pack"] = {
-            **pack,
-            "rendered": "",
-        }
-        state["context_budget"] = pack.get("budget")
-        if pack.get("rendered"):
-            self._record_context_pack_trace(state, pack)
+    # 实现在 context_pruning_projection.py(模块级函数,self 经 descriptor 绑定)
+    _select_projection_objects = _impl_select_projection_objects
 
-        compiled_system = compiled.get("system_content")
-        compiled_system_message = None
-        if compiled_system is not None:
-            if (
-                system_message is not None
-                and compiled_system == system_message.content
-            ):
-                compiled_system_message = system_message
-            elif system_message is not None:
-                compiled_system_message = system_message.model_copy(
-                    update={"content": compiled_system}
-                )
-            else:
-                compiled_system_message = SystemMessage(content=compiled_system)
-        logger.info(
-            "[ContextCompiler] request compiled: tokens=%d/%d, items=%d/%d, history_pruned=%s",
-            int(compiled.get("final_tokens") or 0),
-            self._context_ledger.token_budget,
-            int((pack.get("budget") or {}).get("items_injected") or 0),
-            int(pack.get("total_records") or 0),
-            bool(compiled.get("history_pruned")),
-        )
-        return (
-            list(compiled.get("messages") or []),
-            compiled_system_message,
-            bool(compiled.get("history_pruned")),
-            pack,
-        )
+    # 实现在 context_pruning_projection.py(模块级函数,self 经 descriptor 绑定)
+    _compose_context_accounting = _impl_compose_context_accounting
 
-    def _assemble_jit_system_message(
-        self,
-        system_message: SystemMessage | None,
-        state: AgentState,
-        *,
-        messages: list | None = None,
-        request_overhead: object | None = None,
-    ) -> SystemMessage | None:
-        """Compatibility helper returning only the compiled system message."""
+    # 实现在 context_pruning_projection.py(模块级函数,self 经 descriptor 绑定)
+    _assemble_jit_system_message = _impl_assemble_jit_system_message
 
-        _, compiled_system, _, _ = self._compile_jit_request(
-            system_message,
-            state,
-            messages=list(
-                messages if messages is not None else state.get("messages") or []
-            ),
-            request_overhead=request_overhead,
-        )
-        return compiled_system
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _record_context_pack_trace = _impl_record_context_pack_trace
 
-    def _record_context_pack_trace(self, state: AgentState, pack: ContextPack) -> None:
-        trace_context = state.get("trace_context") or {}
-        if not isinstance(trace_context, dict) or not trace_context.get("enabled"):
-            return
-        run_id = str(trace_context.get("run_id") or "").strip()
-        if not run_id:
-            return
-        try:
-            from backend.application.agent_trace import AgentTraceRecorder, AgentTraceStore
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _record_compaction_trace = _impl_record_compaction_trace
 
-            model_call_index = int(state.get("context_pack_trace_index") or 0) + 1
-            state["context_pack_trace_index"] = model_call_index
-            budget = pack.get("budget") or {}
-            trace_root = trace_context.get("trace_root")
-            recorder = AgentTraceRecorder(
-                run_id=run_id,
-                workflow_name=str(trace_context.get("workflow_name") or "full"),
-                enabled=True,
-                store=AgentTraceStore(trace_root) if trace_root else None,
-            )
-            recorder.record_context_pack(
-                pack_id=f"context-pack-{uuid.uuid4().hex[:12]}",
-                unit_id=(
-                    str(trace_context.get("unit_id"))
-                    if trace_context.get("unit_id") is not None
-                    else None
-                ),
-                model_call_index=model_call_index,
-                base_tokens=int(budget.get("base_tokens") or 0),
-                dynamic_token_budget=int(budget.get("dynamic_token_budget") or 0),
-                dynamic_tokens_used=int(budget.get("dynamic_tokens_used") or 0),
-                items_total=int(pack.get("total_records") or budget.get("items_total") or 0),
-                items_injected=int(budget.get("items_injected") or 0),
-                selected_context_ids=list(pack.get("selected_ids") or []),
-                usage_by_category={
-                    str(key): int(value)
-                    for key, value in dict(pack.get("usage_by_category") or {}).items()
-                },
-            )
-        except Exception:
-            logger.debug("[JITAssembly] context pack trace write failed", exc_info=True)
-
-    def _record_compaction_trace(
-        self,
-        state: AgentState,
-        result: HistoryCompactionResult,
-    ) -> None:
-        trace_context = state.get("trace_context") or {}
-        if not isinstance(trace_context, dict) or not trace_context.get("enabled"):
-            return
-        run_id = str(trace_context.get("run_id") or "").strip()
-        if not run_id:
-            return
-        try:
-            from backend.application.agent_trace import AgentTraceRecorder, AgentTraceStore
-
-            model_call_index = int(state.get("context_pack_trace_index") or 0)
-            trace_root = trace_context.get("trace_root")
-            recorder = AgentTraceRecorder(
-                run_id=run_id,
-                workflow_name=str(trace_context.get("workflow_name") or "full"),
-                enabled=True,
-                store=AgentTraceStore(trace_root) if trace_root else None,
-            )
-            recorder.record_compaction(
-                compaction_id=f"compaction-{uuid.uuid4().hex[:12]}",
-                unit_id=(
-                    str(trace_context.get("unit_id"))
-                    if trace_context.get("unit_id") is not None
-                    else None
-                ),
-                model_call_index=model_call_index,
-                trigger=result.trigger,
-                window_id=result.window_id,
-                previous_window_id=result.previous_window_id,
-                tokens_before=result.tokens_before,
-                tokens_after=result.tokens_after,
-                summary_tokens=result.summary_tokens,
-                retained_user_messages=result.retained_user_messages,
-                removed_messages=result.removed_messages,
-                threshold_tokens=result.threshold_tokens,
-                fixed_request_tokens=result.fixed_request_tokens,
-                summary_preview=result.summary[:1000],
-            )
-        except Exception:
-            logger.debug("[HistoryCompaction] trace write failed", exc_info=True)
-
-    def _record_compaction_attempt_trace(
-        self,
-        state: AgentState,
-        attempt: HistoryCompactionAttempt,
-    ) -> None:
-        if not attempt.threshold_reached or attempt.result is not None:
-            return
-        trace_context = state.get("trace_context") or {}
-        if not isinstance(trace_context, dict) or not trace_context.get("enabled"):
-            return
-        run_id = str(trace_context.get("run_id") or "").strip()
-        if not run_id:
-            return
-        try:
-            from backend.application.agent_trace import AgentTraceRecorder, AgentTraceStore
-
-            trace_root = trace_context.get("trace_root")
-            recorder = AgentTraceRecorder(
-                run_id=run_id,
-                workflow_name=str(trace_context.get("workflow_name") or "full"),
-                enabled=True,
-                store=AgentTraceStore(trace_root) if trace_root else None,
-            )
-            recorder.record_compaction(
-                compaction_id=f"compaction-{uuid.uuid4().hex[:12]}",
-                unit_id=(
-                    str(trace_context.get("unit_id"))
-                    if trace_context.get("unit_id") is not None
-                    else None
-                ),
-                model_call_index=int(state.get("context_pack_trace_index") or 0),
-                trigger=attempt.trigger,
-                window_id=attempt.previous_window_id or "",
-                previous_window_id=attempt.previous_window_id,
-                tokens_before=attempt.tokens_before,
-                tokens_after=attempt.tokens_before,
-                summary_tokens=0,
-                retained_user_messages=0,
-                removed_messages=0,
-                threshold_tokens=attempt.threshold_tokens,
-                fixed_request_tokens=attempt.fixed_request_tokens,
-                status="skipped",
-                error=attempt.skip_reason or "unknown",
-            )
-        except Exception:
-            logger.debug(
-                "[HistoryCompaction] skipped-attempt trace write failed",
-                exc_info=True,
-            )
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _record_compaction_attempt_trace = _impl_record_compaction_attempt_trace
 
     @staticmethod
     def _resolve_thread_id(state: AgentState) -> str | None:
@@ -938,81 +393,17 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
                     return str(value)
         return None
 
-    def _request_fixed_tokens(
-        self,
-        request: ModelRequest,
-        request_overhead: object,
-    ) -> int:
-        return self._context_ledger.count_base_tokens(
-            messages=[],
-            system_content=(
-                request.system_message.content
-                if request.system_message is not None
-                else None
-            ),
-            request_overhead=request_overhead,
-        )
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _request_fixed_tokens = _impl_request_fixed_tokens
 
-    def _observe_request_compaction_attempt(
-        self,
-        state: AgentState,
-        attempt: HistoryCompactionAttempt,
-    ) -> HistoryCompactionResult | None:
-        result = attempt.result
-        if result is None:
-            if attempt.threshold_reached:
-                self._record_compaction_attempt_trace(state, attempt)
-            return None
-        self._before_history_compaction(state, result)
-        self._record_compaction_trace(state, result)
-        binding = self._compaction_checkpoints.bind(result, state=state)
-        hook_updates = {
-            "messages": binding.messages,
-            "context_window_id": result.window_id,
-            "context_compaction": binding.state_payload,
-        }
-        if binding.reference is not None:
-            hook_updates["context_checkpoint_ref"] = binding.reference.as_dict()
-        self._after_history_compaction(state, result, hook_updates)
-        logger.info(
-            "[HistoryCompaction] Request budget compacted context window: "
-            "tokens %d→%d, fixed_request=%d, removed=%d",
-            result.tokens_before,
-            result.tokens_after,
-            result.fixed_request_tokens,
-            result.removed_messages,
-        )
-        return replace(result, messages=binding.messages)
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _observe_request_compaction_attempt = _impl_observe_request_compaction_attempt
 
-    def _compact_request_sync(
-        self,
-        request: ModelRequest,
-        request_overhead: object,
-    ) -> HistoryCompactionResult | None:
-        messages = list(request.messages or [])
-        attempt = self._history_compactor.compact_deterministic_attempt(
-            messages,
-            previous_window_id=self._previous_window_id(request.state, messages),
-            trigger="request_budget",
-            additional_tokens=self._request_fixed_tokens(request, request_overhead),
-            threshold_tokens=self._context_ledger.history_token_budget,
-        )
-        return self._observe_request_compaction_attempt(request.state, attempt)
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _compact_request_sync = _impl_compact_request_sync
 
-    async def _compact_request_async(
-        self,
-        request: ModelRequest,
-        request_overhead: object,
-    ) -> HistoryCompactionResult | None:
-        messages = list(request.messages or [])
-        attempt = await self._history_compactor.acompact_attempt(
-            messages,
-            previous_window_id=self._previous_window_id(request.state, messages),
-            trigger="request_budget",
-            additional_tokens=self._request_fixed_tokens(request, request_overhead),
-            threshold_tokens=self._context_ledger.history_token_budget,
-        )
-        return self._observe_request_compaction_attempt(request.state, attempt)
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _compact_request_async = _impl_compact_request_async
 
     @staticmethod
     def _persist_request_compaction(
@@ -1081,6 +472,7 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
 
     @override
     async def abefore_model(self, state: AgentState, runtime: Runtime) -> dict | None:
+        await self._ensure_session_memory_loaded()
         summaries = await self._summarize_large_results(state)
         updates = await asyncio.to_thread(
             self._process_state_elevation,
@@ -1103,12 +495,15 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
     ) -> ModelCallResult:
+        self._request_model_calls += 1
         request_overhead = self._request_overhead(request)
         compaction_result = self._compact_request_sync(request, request_overhead)
-        compiled_request, persisted_messages = self._prepare_model_request(
-            request,
-            compaction_result,
-            request_overhead,
+        compiled_request, persisted_messages, state_updates = (
+            self._prepare_model_request(
+                request,
+                compaction_result,
+                request_overhead,
+            )
         )
         estimated_tokens = self._estimated_request_tokens(
             compiled_request,
@@ -1124,10 +519,15 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
                 "raising safety factor and recompiling once"
             )
             self._context_ledger.note_provider_context_overflow()
-            compiled_request, persisted_messages = self._prepare_model_request(
-                request,
-                compaction_result,
-                request_overhead,
+            compiled_request, persisted_messages, state_updates = (
+                self._prepare_model_request(
+                    request,
+                    compaction_result,
+                    request_overhead,
+                    # Same logical model call: a second trace entry with the
+                    # same index would be a duplicate.
+                    record_trace=False,
+                )
             )
             estimated_tokens = self._estimated_request_tokens(
                 compiled_request,
@@ -1135,10 +535,11 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
             )
             response = handler(compiled_request)
         self._observe_response_input_tokens(response, estimated_tokens)
-        return self._persist_request_compaction(
+        return self._finalize_model_call_result(
             response,
             compaction_result,
             persisted_messages,
+            state_updates,
         )
 
     @override
@@ -1147,9 +548,11 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelCallResult:
+        self._request_model_calls += 1
         request_overhead = self._request_overhead(request)
         compaction_result = await self._compact_request_async(request, request_overhead)
-        compiled_request, persisted_messages = self._prepare_model_request(
+        compiled_request, persisted_messages, state_updates = await asyncio.to_thread(
+            self._prepare_model_request,
             request,
             compaction_result,
             request_overhead,
@@ -1168,10 +571,16 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
                 "raising safety factor and recompiling once"
             )
             self._context_ledger.note_provider_context_overflow()
-            compiled_request, persisted_messages = self._prepare_model_request(
-                request,
-                compaction_result,
-                request_overhead,
+            compiled_request, persisted_messages, state_updates = (
+                await asyncio.to_thread(
+                    self._prepare_model_request,
+                    request,
+                    compaction_result,
+                    request_overhead,
+                    # Same logical model call: a second trace entry with the
+                    # same index would be a duplicate.
+                    record_trace=False,
+                )
             )
             estimated_tokens = self._estimated_request_tokens(
                 compiled_request,
@@ -1179,42 +588,39 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
             )
             response = await handler(compiled_request)
         self._observe_response_input_tokens(response, estimated_tokens)
-        return self._persist_request_compaction(
+        return self._finalize_model_call_result(
             response,
             compaction_result,
             persisted_messages,
+            state_updates,
         )
 
-    def _estimated_request_tokens(
-        self,
-        request: ModelRequest,
-        request_overhead: object,
-    ) -> int:
-        system_content = (
-            request.system_message.content
-            if request.system_message is not None
-            else None
-        )
-        return self._context_ledger.count_base_tokens(
-            messages=list(request.messages or []),
-            system_content=system_content,
-            request_overhead=request_overhead,
-        )
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _finalize_model_call_result = _impl_finalize_model_call_result
+
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _estimated_request_tokens = _impl_estimated_request_tokens
 
     @staticmethod
     def _is_provider_context_overflow(exc: Exception) -> bool:
         detail = str(exc).lower()
-        return any(
-            marker in detail
-            for marker in (
-                "context_length_exceeded",
-                "maximum context length",
-                "context window",
-                "too many tokens",
-                "prompt is too long",
-                "input token limit",
-            )
+        markers = [
+            "context_length_exceeded",
+            "maximum context length",
+            "context window",
+            "too many tokens",
+            "prompt is too long",
+            "input token limit",
+        ]
+        # Gateways word this error differently; let operators extend the
+        # match list without a deployment (comma-separated, case-insensitive).
+        import os
+
+        extra = os.getenv("AGENT_CONTEXT_OVERFLOW_MARKERS", "")
+        markers.extend(
+            part.strip().lower() for part in extra.split(",") if part.strip()
         )
+        return any(marker in detail for marker in markers)
 
     @staticmethod
     def _response_input_tokens(response: ModelCallResult) -> int:
@@ -1241,61 +647,51 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
                             return max(0, value)
         return 0
 
-    def _observe_response_input_tokens(
-        self,
-        response: ModelCallResult,
-        estimated_tokens: int,
-    ) -> None:
-        actual_tokens = self._response_input_tokens(response)
-        if actual_tokens:
-            self._context_ledger.observe_actual_input_tokens(
-                actual_tokens,
-                estimated_tokens=estimated_tokens,
-            )
+    @staticmethod
+    def _response_cached_input_tokens(response: ModelCallResult) -> int:
+        """Read gateway-reported prefix-cache hits from response usage.
 
-    def _prepare_model_request(
-        self,
-        request: ModelRequest,
-        compaction_result: HistoryCompactionResult | None,
-        request_overhead: object,
-    ) -> tuple[ModelRequest, list]:
-        """Apply the common post-compaction compiler path for sync and async calls."""
+        LangChain normalizes OpenAI ``prompt_tokens_details.cached_tokens``
+        into ``usage_metadata.input_token_details.cache_read``; raw gateway
+        payloads may still carry the OpenAI shape, so both are checked.
+        """
 
-        request_messages = (
-            compaction_result.model_messages
-            if compaction_result is not None
-            else list(request.messages or [])
-        )
-        model_messages, model_system_message, compaction_internalized = (
-            self._internalize_compaction_summary(
-                request.system_message,
-                request_messages,
-            )
-        )
-        model_messages, system_message, compiler_pruned, pack = self._compile_jit_request(
-            model_system_message,
-            request.state,
-            messages=model_messages,
-            request_overhead=request_overhead,
-        )
-        history_changed = compiler_pruned or compaction_internalized
-        if (
-            system_message is not request.system_message
-            or history_changed
-            or compaction_result is not None
-        ):
-            request = request.override(
-                system_message=system_message,
-                messages=model_messages,
-            )
-        request = self._scope_context_artifact_tool(request, pack)
-        persisted_messages = self._messages_for_compaction_persistence(
-            compaction_result,
-            request_messages,
-            model_messages,
-            final_pruned=compiler_pruned,
-        )
-        return request, persisted_messages
+        if not isinstance(response, ModelResponse):
+            return 0
+        for message in reversed(list(response.result or [])):
+            mappings = [
+                getattr(message, "usage_metadata", None),
+                getattr(message, "response_metadata", None),
+                getattr(message, "additional_kwargs", None),
+            ]
+            for mapping in mappings:
+                if not isinstance(mapping, Mapping):
+                    continue
+                nested_mappings = [mapping]
+                for key in ("usage", "token_usage"):
+                    nested = mapping.get(key)
+                    if isinstance(nested, Mapping):
+                        nested_mappings.append(nested)
+                for candidate in nested_mappings:
+                    details = None
+                    for key in ("input_token_details", "prompt_tokens_details"):
+                        nested = candidate.get(key)
+                        if isinstance(nested, Mapping):
+                            details = nested
+                            break
+                    if details is None:
+                        continue
+                    for key in ("cache_read", "cached_tokens"):
+                        value = details.get(key)
+                        if isinstance(value, int) and not isinstance(value, bool):
+                            return max(0, value)
+        return 0
+
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _observe_response_input_tokens = _impl_observe_response_input_tokens
+
+    # 实现在 context_pruning_compaction.py(模块级函数,self 经 descriptor 绑定)
+    _prepare_model_request = _impl_prepare_model_request
 
     @staticmethod
     def _scope_context_artifact_tool(
@@ -1304,22 +700,43 @@ class ContextPruningMiddleware(AgentMiddleware[AgentState]):
     ) -> ModelRequest:
         """Expose the artifact reader only for structured selected references."""
 
-        if ContextEngine.requires_artifact_reader(pack):
-            return request
+        capabilities = dict(pack.get("capabilities") or {})
+        context_handles = list(capabilities.get("context_handles") or [])
         tools = list(request.tools or [])
-        available = [
+        without_context_read = [
             tool
             for tool in tools
+            if ContextPruningMiddleware._request_tool_name(tool) != "context_read"
+        ]
+        if context_handles and len(without_context_read) != len(tools):
+            # Handles exist for this request, so the navigator stays visible.
+            without_context_read = tools
+        if ContextEngine.requires_artifact_reader(pack):
+            if len(without_context_read) == len(tools):
+                return request
+            tool_choice = request.tool_choice
+            if (
+                ContextPruningMiddleware._request_tool_name(tool_choice)
+                == "context_read"
+            ):
+                tool_choice = None
+            return request.override(
+                tools=without_context_read,
+                tool_choice=tool_choice,
+            )
+        available = [
+            tool
+            for tool in without_context_read
             if ContextPruningMiddleware._request_tool_name(tool)
             != "read_context_artifact"
         ]
         if len(available) == len(tools):
             return request
         tool_choice = request.tool_choice
-        if (
-            ContextPruningMiddleware._request_tool_name(tool_choice)
-            == "read_context_artifact"
-        ):
+        if ContextPruningMiddleware._request_tool_name(tool_choice) in {
+            "read_context_artifact",
+            "context_read",
+        }:
             tool_choice = None
         return request.override(tools=available, tool_choice=tool_choice)
 

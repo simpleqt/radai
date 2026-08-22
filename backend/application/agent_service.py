@@ -68,6 +68,22 @@ def _request_trace_enabled(request: AgentRequest) -> bool:
 
 
 class AgentService:
+    @staticmethod
+    def _derive_auth_role_for_request(*, user_id: str | None, auth_role: str | None) -> str:
+        """运行时身份归一：入口漏传/传错时兜底。
+
+        访客主体（guest_* 用户键）无论 auth_role 传什么一律归一为
+        guest——写工具守卫（tool_write_requires_authenticated_user）
+        按此身份拒绝 risk_level=write 工具。
+        """
+        derived = str(auth_role or "user").strip().lower() or "user"
+        if str(user_id or "").startswith("guest_") and derived not in {
+            "guest",
+            "anonymous",
+        }:
+            derived = "guest"
+        return derived
+
     def __init__(
         self,
         *,
@@ -136,7 +152,13 @@ class AgentService:
                 question=request.question,
                 agent_code=context.agent_profile.code,
                 workflow_name=context.workflow_name,
-                metadata=request.metadata,
+                metadata={
+                    key: value
+                    for key, value in dict(request.metadata or {}).items()
+                    # `_` 前缀为 in-process 私有键（图片上下文、上传文件清单等），
+                    # 只供本轮 prompt 使用，不进持久化会话 metadata。
+                    if not str(key).startswith("_")
+                },
             )
         except ConversationStateError as exc:
             logger.warning(
@@ -201,17 +223,37 @@ class AgentService:
         # execution crossed an async task/context boundary.
         image_registry = get_registry()
         try:
+            load_images = getattr(
+                self._conversation_store, "get_registered_images", None
+            )
+            registered_images = (
+                await load_images(
+                    user_id=context.user_id,
+                    thread_id=context.external_thread_id,
+                )
+                if callable(load_images)
+                else {}
+            )
+            image_registry.replace_persisted(registered_images)
+        except Exception:
+            # The conversation itself was already validated above.  A legacy
+            # catalog without image metadata must not block ordinary text QA.
+            logger.warning(
+                "[AgentService] Failed to restore conversation image registry: "
+                "user_id=%s thread_id=%s",
+                context.user_id,
+                context.external_thread_id,
+                exc_info=True,
+            )
+            image_registry.replace_persisted({})
+        try:
             async for event in workflow.run(request, context):
                 yield event
         finally:
             try:
                 if not image_registry.is_empty():
                     images_dict = {
-                        token: {
-                            "url": entry.url,
-                            "caption": entry.caption,
-                            "index": entry.index,
-                        }
+                        token: entry.to_metadata()
                         for token, entry in image_registry.iter_entries()
                     }
                     await self._conversation_store.update_conversation_images(
@@ -304,6 +346,11 @@ class AgentService:
             )
         effective_selected = resolution.selected_skills if resolution else selected
         managed_skills = bool(resolution and resolution.managed)
+        required_skills = (
+            {item.name for item in resolution.available_skills if item.required}
+            if managed_skills and resolution is not None
+            else set(profile_default_skills)
+        )
         if definition is not None and not managed_skills:
             effective_selected = self._resolve_unmanaged_skill_closure(
                 definition,
@@ -327,6 +374,7 @@ class AgentService:
         metadata["_skills_resolved"] = True
         metadata["_managed_skills_resolved"] = managed_skills
         metadata["_skills_requested_for_workflow"] = resolved_skills_control_workflow
+        metadata["_required_skills"] = sorted(required_skills)
         return replace(
             request,
             selected_skills=effective_selected,
@@ -358,7 +406,10 @@ class AgentService:
             raise ValueError(
                 f"Workflow {context.workflow_name} does not expose an executor"
             )
-        return build_executor(request, context)
+        # Executor construction compiles the graph, assembles tools, and reads
+        # prompt/skill files; keep that blocking work off the event loop, the
+        # same way the streaming workflow path does.
+        return await run_blocking(build_executor, request, context)
 
     def _resolve_workflow(self, request: AgentRequest):
         definition = (
@@ -402,14 +453,17 @@ class AgentService:
         # Carry the authenticated role as server-side runtime state.  This is
         # deliberately not taken from request metadata so tools can enforce
         # role-aware ACLs without trusting model-controlled arguments.
-        permissions["auth_role"] = (
-            str(request.auth_role or "user").strip().lower() or "user"
+        permissions["auth_role"] = self._derive_auth_role_for_request(
+            user_id=request.user_id, auth_role=request.auth_role
         )
         permissions["managed_skills_resolved"] = request.managed_skills_resolved
+        preliminary_workflow_name = (
+            request.requested_workflow or profile.default_workflow
+        )
         initial_context = self._build_context(
             request,
             profile=profile,
-            workflow_name=request.requested_workflow or profile.default_workflow,
+            workflow_name=preliminary_workflow_name,
             request_id=request_id,
             external_thread_id=external_thread_id,
             domain_context=domain_context,
@@ -438,22 +492,27 @@ class AgentService:
                 selected_skills=unresolved_selection,
                 workflow_name=workflow_name,
             )
-        context = self._build_context(
-            request,
-            profile=profile,
-            workflow_name=workflow_name,
-            request_id=request_id,
-            external_thread_id=external_thread_id,
-            domain_context=domain_context,
-            kb_ids=policy_result.kb_ids,
-            permissions=permissions,
-            guardrail_instructions=policy_result.guardrail_instructions,
-            runtime_budget=runtime_budget,
-            agent_specs=agent_specs,
-            context_policy=context_policy,
-            agent_bindings=agent_bindings,
-            resolved_selected_skills=resolved_selected_skills,
-        )
+        if workflow_name == preliminary_workflow_name and resolved_selected_skills is None:
+            # 常见路径:名称解析结果与预解析一致且没有技能闭包重解析,
+            # 第一次构建的上下文即最终上下文,避免整套派生逻辑跑第二遍。
+            context = initial_context
+        else:
+            context = self._build_context(
+                request,
+                profile=profile,
+                workflow_name=workflow_name,
+                request_id=request_id,
+                external_thread_id=external_thread_id,
+                domain_context=domain_context,
+                kb_ids=policy_result.kb_ids,
+                permissions=permissions,
+                guardrail_instructions=policy_result.guardrail_instructions,
+                runtime_budget=runtime_budget,
+                agent_specs=agent_specs,
+                context_policy=context_policy,
+                agent_bindings=agent_bindings,
+                resolved_selected_skills=resolved_selected_skills,
+            )
         workflow = self._workflow_registry.resolve(
             request,
             context,
@@ -566,6 +625,7 @@ class AgentService:
                 or project_delegation_enabled
             ),
             thinking_enabled=request.thinking_enabled,
+            deep_retrieval=request.deep_retrieval,
             permissions=dict(permissions or {}),
             guardrail_instructions=guardrail_instructions,
             time_context=self._build_runtime_time_context(),

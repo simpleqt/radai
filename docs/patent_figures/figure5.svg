@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="550" viewBox="0 0 1100 550">
+  <defs><marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#000"/></marker></defs>
+  <rect width="1100" height="720" fill="#fff"/>
+  <g fill="#fff" stroke="#000" stroke-width="2">
+    <rect x="40" y="40" width="230" height="60"/><rect x="40" y="140" width="230" height="60"/>
+    <rect x="40" y="240" width="230" height="60"/><rect x="40" y="340" width="230" height="60"/>
+    <rect x="40" y="440" width="230" height="60"/><rect x="390" y="215" width="280" height="90"/>
+    <rect x="780" y="180" width="270" height="70"/><rect x="780" y="350" width="270" height="70"/>
+  </g>
+  <g font-family="sans-serif" font-size="23" text-anchor="middle" fill="#000">
+    <text x="155" y="77">501  查询类型</text><text x="155" y="177">502  有效候选数</text>
+    <text x="155" y="277">503  分数离散度</text><text x="155" y="377">504  交叉命中率</text>
+    <text x="155" y="477">505  约束通过率</text><text x="530" y="255">506  动态权重计算</text><text x="530" y="282">及归一化</text>
+    <text x="915" y="222">507  综合分数融合</text><text x="915" y="392">508  多样性排序</text>
+  </g>
+  <g stroke="#000" stroke-width="2" fill="none">
+    <path d="M270 70 H330"/><path d="M270 170 H330"/><path d="M270 270 H330"/>
+    <path d="M270 370 H330"/><path d="M270 470 H330"/><path d="M330 70 V470"/>
+  </g>
+  <g stroke="#000" stroke-width="2" fill="none" marker-end="url(#a)">
+    <path d="M330 260 H390"/><path d="M670 260 H725 V215 H780"/>
+    <path d="M915 250 V350"/>
+  </g>
+</svg>

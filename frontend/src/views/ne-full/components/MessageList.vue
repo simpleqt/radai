@@ -1,24 +1,84 @@
 <script setup lang="ts">
-import { nextTick, ref, watch, onMounted, onUnmounted, computed } from 'vue';
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, ref, watch } from 'vue';
+import {
+  Atom,
+  BadgeQuestionMark,
+  Box,
+  Building2,
+  ChartColumn,
+  ChartNoAxesColumn,
+  ChevronDown,
+  CircleHelp,
+  Clock3,
+  Cpu,
+  FileSearch,
+  Filter,
+  FlaskConical,
+  Landmark,
+  Minimize2,
+  ReceiptText,
+  Sparkles,
+  Workflow,
+} from 'lucide-vue-next';
 import { type ChatMessage } from '@/api/agent-v2';
 import type { ResearchPlanPayload } from '@/api/agent-v2';
-import WorkflowTimeline from './WorkflowTimeline.vue';
-import MarkdownRenderer from './MarkdownRenderer.vue';
+import ProcessPanel from '@/features/process/ProcessPanel.vue';
 import ResearchDraftCard from './ResearchDraftCard.vue';
 import ReasoningBlock from './ReasoningBlock.vue';
 import FollowUpSuggestions from './FollowUpSuggestions.vue';
+import FeedbackControls from './FeedbackControls.vue';
+import { feedbackKeysForMessages } from '@/api/feedback';
 import { authState } from '@/utils/request';
+
+const MarkdownRenderer = defineAsyncComponent(() => import('./MarkdownRenderer.vue'));
 
 interface Props {
   messages: ChatMessage[];
   isBusy?: boolean;
+  threadId?: string;
+  agentCode?: string;
+  modelName?: string;
+  emptyLogoSrc?: string;
+  emptyLogoAlt?: string;
+  emptyTitle?: string;
+  emptyDescription?: string;
+  emptySuggestions?: string[];
+  emptySuggestionStyle?: 'technical' | 'audit';
+  emptyLogoCompact?: boolean;
+  emptyLogoDarkInvert?: boolean;
+  showEmptyGreeting?: boolean;
 }
 
 const props = withDefaults(defineProps<Props>(), {
   isBusy: false,
+  threadId: '',
+  agentCode: '',
+  modelName: '',
+  emptyLogoSrc: '/log.png',
+  emptyLogoAlt: '核电子学智能体',
+  emptyTitle: '你好，我是核电子学智能助手',
+  emptyDescription: '我可以帮你解答专业问题、提供技术知识、辅助学习与研究',
+  emptySuggestions: () => [
+    '高纯锗探测器是什么？',
+    '中子探测器有哪些类型？',
+    '电制冷高纯锗探测器选型要看哪些参数？',
+    '核电子学系统的前端电路怎么设计？',
+    '闪烁体探测器的工作原理是什么？',
+    'γ射线谱仪的能量分辨率如何衡量？',
+    '核脉冲信号的幅度甄别怎么做？',
+    '多道分析器（MCA）怎么选型？',
+    '核仪表中的死时间如何修正？',
+    '半导体探测器与气体探测器如何选型？',
+    '液体闪烁计数器适用于哪些场景？',
+  ],
+  emptySuggestionStyle: 'technical',
+  emptyLogoCompact: false,
+  emptyLogoDarkInvert: true,
+  showEmptyGreeting: true,
 });
 const emit = defineEmits<{
   (e: 'edit-user-message', payload: { index: number; content: string }): void;
+  (e: 'regenerate-answer', payload: { index: number }): void;
   (e: 'research-draft-submit', payload: {
     question: string;
     draftId: string;
@@ -26,48 +86,96 @@ const emit = defineEmits<{
     researchPlan: ResearchPlanPayload;
   }): void;
   (e: 'select-suggestion', value: string): void;
+  (e: 'process-action-send', value: string): void;
+  (e: 'process-action-fill', value: string): void;
 }>();
-const listRef = ref<HTMLElement | null>(null);
-const copiedKey = ref<string | null>(null);
 
-const questionSuggestions = [
-  '高纯锗探测器是什么？',
-  '中子探测器有哪些类型？',
-  '电制冷高纯锗探测器选型要看哪些参数？',
-  '核电子学系统的前端电路怎么设计？',
-  '闪烁体探测器的工作原理是什么？',
-  'γ射线谱仪的能量分辨率如何衡量？',
-  '核脉冲信号的幅度甄别怎么做？',
-  '多道分析器（MCA）怎么选型？',
-  '核仪表中的死时间如何修正？',
-  '半导体探测器与气体探测器如何选型？',
-  '液体闪烁计数器适用于哪些场景？',
-];
+/** 该回答对应的用户问题（向前找最近一条 user 消息）。 */
+const questionForIndex = (index: number): string => {
+  for (let i = index - 1; i >= 0; i -= 1) {
+    const msg = props.messages[i];
+    if (msg?.role === 'user') return String(msg.content || '');
+  }
+  return '';
+};
 
-const isMobile = ref(false);
+// 反馈键从问题摘要派生：消息 id 在直播态是客户端时间戳、刷新后是服务端
+// uuid，用它当键会导致状态恢复不了并给同一条回答重复落行。
+const feedbackKeys = computed(() => feedbackKeysForMessages(props.messages || []));
 
-const updateScreenWidth = () => {
-  if (typeof window !== 'undefined') {
-    isMobile.value = window.innerWidth < 768;
+/** 该回答之后会被回滚一并删掉的用户轮次数（0 表示它就是最后一轮）。 */
+const droppedTurnsAfter = (index: number): number => {
+  let count = 0;
+  for (let i = index + 1; i < props.messages.length; i += 1) {
+    if (props.messages[i]?.role === 'user') count += 1;
+  }
+  return count;
+};
+
+const pendingRegenerateKey = ref<string | null>(null);
+let pendingRegenerateTimer: ReturnType<typeof setTimeout> | null = null;
+
+const resetPendingRegenerate = () => {
+  pendingRegenerateKey.value = null;
+  if (pendingRegenerateTimer) {
+    clearTimeout(pendingRegenerateTimer);
+    pendingRegenerateTimer = null;
   }
 };
 
-onMounted(() => {
-  updateScreenWidth();
-  window.addEventListener('resize', updateScreenWidth);
-});
-
-onUnmounted(() => {
-  window.removeEventListener('resize', updateScreenWidth);
-});
-
-const displayedSuggestions = computed(() => {
-  if (isMobile.value) {
-    // Show only the first 4 suggestions on mobile screens to keep it clean
-    return questionSuggestions.slice(0, 4);
+const regenerateHint = (index: number, messageId: string): string => {
+  const dropped = droppedTurnsAfter(index);
+  if (pendingRegenerateKey.value === messageId) {
+    return `再次点击确认：这条之后的 ${dropped} 轮问答会被删除且无法恢复`;
   }
-  return questionSuggestions;
-});
+  return dropped > 0
+    ? `重新生成（会删除之后的 ${dropped} 轮问答）`
+    : '重新生成（可先切换模型/知识库后再点）';
+};
+
+/**
+ * 重新生成会把该轮之后的问答一起回滚，服务端 checkpoint 同样截断且无法恢复。
+ * 最后一轮直接执行；更早的回答需要两步确认，4 秒内不再点就自动取消。
+ */
+const requestRegenerate = (index: number, messageId: string) => {
+  if (props.isBusy) return;
+  if (droppedTurnsAfter(index) === 0 || pendingRegenerateKey.value === messageId) {
+    resetPendingRegenerate();
+    emit('regenerate-answer', { index });
+    return;
+  }
+  pendingRegenerateKey.value = messageId;
+  if (pendingRegenerateTimer) clearTimeout(pendingRegenerateTimer);
+  pendingRegenerateTimer = setTimeout(resetPendingRegenerate, 4000);
+};
+
+onBeforeUnmount(resetPendingRegenerate);
+
+const listRef = ref<HTMLElement | null>(null);
+const copiedKey = ref<string | null>(null);
+
+const technicalSuggestionIcons = [
+  BadgeQuestionMark,
+  Atom,
+  Box,
+  Workflow,
+  Sparkles,
+  ChartColumn,
+  Filter,
+  ChartNoAxesColumn,
+  Clock3,
+  Cpu,
+  FlaskConical,
+];
+const auditSuggestionIcons = [Landmark, ReceiptText, Building2, FileSearch];
+const iconOf = (index: number) => (
+  props.emptySuggestionStyle === 'audit'
+    ? auditSuggestionIcons[index]
+    : technicalSuggestionIcons[index]
+) || CircleHelp;
+
+// 固定 4 条，列数交给容器查询决定，避免用 resize 监听驱动布局
+const displayedSuggestions = computed(() => props.emptySuggestions.slice(0, 4));
 
 const followUpEnabled = import.meta.env.VITE_FOLLOW_UP_SUGGESTIONS !== 'false';
 
@@ -102,6 +210,20 @@ const shouldShowFollowUp = (msg: ChatMessage) => {
   if (hasPendingResearchDraft(msg)) return false;
   if (hasClarificationPending(msg)) return false;
   return Boolean(msg.followUpSuggestions?.length || msg.suggestionsLoading);
+};
+
+const contextCompactionEvents = (msg: ChatMessage) => {
+  return (msg.processEvents || []).filter((event) => event.kind === 'context_compaction');
+};
+
+const contextCompactionSummary = (event: any) => String(event?.summary || '').trim();
+
+const contextCompactionTokens = (event: any) => {
+  const metadata = (event?.metadata || {}) as Record<string, unknown>;
+  const before = Number(metadata.tokens_before || 0);
+  const after = Number(metadata.tokens_after || 0);
+  if (!before || !after) return '';
+  return `${before.toLocaleString()} → ${after.toLocaleString()} tokens`;
 };
 
 const copyText = async (content: string, key: string) => {
@@ -178,6 +300,15 @@ const exportToPdf = (msg: ChatMessage) => {
             table, tr, img, .math-block, blockquote, pre {
               page-break-inside: avoid !important;
               break-inside: avoid !important;
+            }
+            /* 交互式图表：打印隐藏 ECharts 画布，显示 PNG 导出资产 */
+            .chart-echarts {
+              display: none !important;
+            }
+            img.chart-print-fallback {
+              display: block !important;
+              margin: 16px auto !important;
+              max-width: 100% !important;
             }
             @media print {
               body {
@@ -291,37 +422,36 @@ watch(() => props.messages, scrollToBottom, { deep: true });
 <template>
   <div 
     ref="listRef" 
-    class="flex-1 min-h-0 overflow-y-auto w-full custom-scrollbar"
-    :class="messages.length === 0 ? 'flex flex-col' : ''"
+    class="custom-scrollbar flex min-h-0 w-full flex-1 flex-col overflow-y-auto overscroll-contain"
+    :class="messages.length === 0 ? 'justify-center' : ''"
     @scroll="handleScroll"
   >
     <TransitionGroup 
       name="list" 
       tag="div"
-      class="w-full max-w-4xl mx-auto px-3 md:px-4 flex flex-col"
-      :class="messages.length === 0
-        ? 'flex-1 min-h-0'
-        : 'py-4 md:py-12 space-y-4 md:space-y-12'"
+      class="mx-auto flex w-full max-w-(--content-max) flex-col px-4 @cozy/main:px-6"
+      :class="messages.length === 0 ? 'py-6'
+        : 'space-y-6 py-6 @wide/main:space-y-8 @wide/main:py-8'"
     >
       <div 
         v-for="(msg, index) in messages" 
         :key="msg.id" 
-        class="flex flex-col animate-in fade-in slide-in-from-bottom-2 duration-300 transform transition-all"
+        class="flex flex-col"
       :class="[msg.role === 'user' ? 'items-end' : 'items-start']"
     >
       <!-- User Message -->
       <div v-if="msg.role === 'user'" class="max-w-[85%]">
-        <div class="bg-indigo-600 text-white px-6 py-3.5 rounded-2xl rounded-tr-none shadow-lg shadow-indigo-100/50 dark:shadow-none">
-          <p class="text-[15px] font-medium leading-relaxed whitespace-pre-wrap">{{ msg.content }}</p>
+        <div class="rounded-(--radius-bubble) bg-surface-sunken px-4 py-2.5">
+          <p class="whitespace-pre-wrap text-[15px] leading-relaxed text-text-primary">{{ msg.content }}</p>
         </div>
-        <div class="mt-2 flex justify-end gap-1">
+        <div class="mt-1.5 flex justify-end gap-1">
           <button
             type="button"
-            class="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            class="inline-flex h-7 w-7 items-center justify-center rounded-md text-text-tertiary transition-colors hover:bg-surface-hover hover:text-text-secondary"
             title="复制问题"
             @click="copyText(msg.content, `${msg.id}-question`)"
           >
-            <svg v-if="copiedKey === `${msg.id}-question`" xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <svg v-if="copiedKey === `${msg.id}-question`" class="animate-in fade-in zoom-in-50 duration-200" xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M20 6 9 17l-5-5"/>
             </svg>
             <svg v-else xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -330,7 +460,7 @@ watch(() => props.messages, scrollToBottom, { deep: true });
           </button>
           <button
             type="button"
-            class="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            class="inline-flex h-7 w-7 items-center justify-center rounded-md text-text-tertiary transition-colors hover:bg-surface-hover hover:text-text-secondary"
             title="编辑后重发"
             @click="emit('edit-user-message', { index, content: msg.content })"
           >
@@ -349,9 +479,41 @@ watch(() => props.messages, scrollToBottom, { deep: true });
           @submit="(payload) => emit('research-draft-submit', payload)"
         />
 
-        <WorkflowTimeline
-          v-if="(msg.processEvents && msg.processEvents.length > 0) || (msg.statusHistory && msg.statusHistory.length > 0)"
-          :message="msg"
+        <section
+          v-for="event in contextCompactionEvents(msg)"
+          :key="event.id || `${msg.id}-context-compaction`"
+          class="rounded-lg border border-teal-200 bg-teal-50/70 px-3 py-2.5 text-teal-950 dark:border-teal-900 dark:bg-teal-950/25 dark:text-teal-100 sm:px-4"
+        >
+          <div class="flex items-start gap-2.5">
+            <Minimize2 class="mt-0.5 size-4 shrink-0 text-teal-600 dark:text-teal-400" />
+            <div class="min-w-0 flex-1">
+              <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+                <p class="text-xs font-semibold sm:text-sm">{{ event.title || '上下文窗口已压缩' }}</p>
+                <span v-if="contextCompactionTokens(event)" class="text-[11px] text-teal-700 dark:text-teal-300">
+                  {{ contextCompactionTokens(event) }}
+                </span>
+              </div>
+              <p class="mt-1 text-xs leading-5 text-teal-800/80 dark:text-teal-200/80">{{ event.detail }}</p>
+              <details v-if="contextCompactionSummary(event)" class="group mt-2 border-t border-teal-200 pt-2 dark:border-teal-900">
+                <summary class="flex cursor-pointer list-none items-center gap-1.5 text-xs font-medium text-teal-700 dark:text-teal-300">
+                  <ChevronDown class="size-3.5 transition-transform group-open:rotate-180" />
+                  续接摘要
+                </summary>
+                <div class="mt-2 max-h-72 overflow-y-auto text-xs leading-5 text-text-secondary">
+                  <MarkdownRenderer :content="contextCompactionSummary(event)" :is-streaming="false" />
+                </div>
+              </details>
+            </div>
+          </div>
+        </section>
+
+        <ProcessPanel
+          :message-id="msg.id"
+          :events="msg.processEvents"
+          :status-history="msg.statusHistory"
+          :is-streaming="msg.isStreaming"
+          @action-send="(value) => emit('process-action-send', value)"
+          @action-fill="(value) => emit('process-action-fill', value)"
         />
 
         <ReasoningBlock
@@ -361,37 +523,29 @@ watch(() => props.messages, scrollToBottom, { deep: true });
           :has-answer="Boolean(msg.content)"
         />
 
-        <div 
-          v-if="msg.content" 
-          class="overflow-hidden rounded-[32px] border border-slate-200/80 bg-white/90 shadow-[0_18px_60px_-32px_rgba(15,23,42,0.28)] backdrop-blur-sm transition-all hover:shadow-[0_22px_72px_-28px_rgba(15,23,42,0.34)] dark:border-slate-800/80 dark:bg-slate-900/60 dark:hover:shadow-none"
-        >
-          <div class="flex items-center justify-between border-b border-slate-200/70 px-6 py-4 dark:border-slate-800/70">
-            <div class="space-y-1">
-              <p class="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-400 dark:text-slate-500">最终输出</p>
-              <h3 class="text-sm font-semibold text-slate-900 dark:text-slate-100">回答内容</h3>
-            </div>
-            <div 
-              v-if="msg.isStreaming"
-              class="inline-flex items-center gap-2 rounded-full border border-indigo-200/70 bg-indigo-50 px-2.5 py-1 text-[11px] font-medium text-indigo-600 dark:border-indigo-800/60 dark:bg-indigo-950/30 dark:text-indigo-300"
-            >
-              <div class="h-1.5 w-1.5 animate-pulse rounded-full bg-indigo-500"></div>
-              流式输出中
-            </div>
-          </div>
-          <div :id="`msg-content-${msg.id}`" class="px-4 py-5 md:px-8 md:py-8 overflow-x-hidden bg-white dark:bg-slate-900">
+        <div v-if="msg.content">
+          <p
+            v-if="msg.isStreaming"
+            class="mb-2 inline-flex items-center gap-1.5 text-xs text-text-tertiary"
+          >
+            <span class="size-1.5 animate-pulse rounded-full bg-accent" />
+            流式输出中
+          </p>
+          <div :id="`msg-content-${msg.id}`" class="overflow-x-hidden">
             <MarkdownRenderer :content="msg.content" :is-streaming="msg.isStreaming" />
           </div>
         </div>
 
-        <div v-if="msg.content" class="-mt-2 flex justify-end gap-1.5">
+        <!-- 操作按钮：流式结束后导出按钮柔和出现 -->
+        <div v-if="msg.content" class="animate-in fade-in flex justify-end gap-1.5 duration-300">
           <!-- 复制按钮 -->
           <button
             type="button"
-            class="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            class="inline-flex h-7 w-7 items-center justify-center rounded-md text-text-tertiary transition-colors hover:bg-surface-hover hover:text-text-secondary"
             title="复制回答"
             @click="copyText(msg.content, `${msg.id}-answer`)"
           >
-            <svg v-if="copiedKey === `${msg.id}-answer`" xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <svg v-if="copiedKey === `${msg.id}-answer`" class="animate-in fade-in zoom-in-50 duration-200" xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M20 6 9 17l-5-5"/>
             </svg>
             <svg v-else xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -403,7 +557,7 @@ watch(() => props.messages, scrollToBottom, { deep: true });
           <button
             v-if="!msg.isStreaming"
             type="button"
-            class="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            class="animate-in fade-in inline-flex h-7 w-7 items-center justify-center rounded-md text-text-tertiary transition-colors duration-300 hover:bg-surface-hover hover:text-text-secondary"
             title="导出为 PDF"
             @click="exportToPdf(msg)"
           >
@@ -420,7 +574,7 @@ watch(() => props.messages, scrollToBottom, { deep: true });
           <button
             v-if="!msg.isStreaming"
             type="button"
-            class="inline-flex h-7 w-7 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            class="animate-in fade-in inline-flex h-7 w-7 items-center justify-center rounded-md text-text-tertiary transition-colors duration-300 hover:bg-surface-hover hover:text-text-secondary"
             title="导出为 Word"
             @click="exportToDocx(msg)"
           >
@@ -432,6 +586,40 @@ watch(() => props.messages, scrollToBottom, { deep: true });
               <path d="M12 17h4"/>
             </svg>
           </button>
+
+          <!-- 重新生成：回滚到该问题并按当前 composer 设置重答（可先换模型） -->
+          <button
+            v-if="!msg.isStreaming"
+            type="button"
+            class="animate-in fade-in inline-flex h-7 min-w-7 items-center justify-center gap-1 rounded-md px-1 transition-colors duration-300 hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
+            :class="pendingRegenerateKey === msg.id
+              ? 'text-amber-600 dark:text-amber-400'
+              : 'text-text-tertiary hover:text-text-secondary'"
+            :title="regenerateHint(index, msg.id)"
+            :aria-label="regenerateHint(index, msg.id)"
+            :disabled="isBusy"
+            @click="requestRegenerate(index, msg.id)"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
+              <path d="M21 3v5h-5"/>
+              <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
+              <path d="M8 16H3v5"/>
+            </svg>
+            <span v-if="pendingRegenerateKey === msg.id" class="text-xs font-medium">确认</span>
+          </button>
+
+          <!-- 赞/踩反馈（仅登录态渲染） -->
+          <FeedbackControls
+            v-if="!msg.isStreaming"
+            :thread-id="threadId"
+            :agent-code="agentCode"
+            :message-key="feedbackKeys[index] || ''"
+            :question="questionForIndex(index)"
+            :answer="msg.content"
+            :model-name="modelName"
+            :disabled="isBusy"
+          />
         </div>
 
         <FollowUpSuggestions
@@ -444,43 +632,54 @@ watch(() => props.messages, scrollToBottom, { deep: true });
 
         <!-- Streaming Indicator -->
         <div v-if="msg.isStreaming && !msg.content" class="flex items-center space-x-2 pl-8 opacity-40">
-          <div class="h-1.5 w-1.5 bg-indigo-400 rounded-full animate-bounce [animation-delay:0ms]"></div>
-          <div class="h-1.5 w-1.5 bg-indigo-400 rounded-full animate-bounce [animation-delay:200ms]"></div>
-          <div class="h-1.5 w-1.5 bg-indigo-400 rounded-full animate-bounce [animation-delay:400ms]"></div>
+          <div class="h-1.5 w-1.5 bg-accent rounded-full animate-bounce [animation-delay:0ms]"></div>
+          <div class="h-1.5 w-1.5 bg-accent rounded-full animate-bounce [animation-delay:200ms]"></div>
+          <div class="h-1.5 w-1.5 bg-accent rounded-full animate-bounce [animation-delay:400ms]"></div>
         </div>
       </div>
     </div>
 
-    <!-- Empty State：品牌 logo + 豆包式胶囊云布局 -->
+    <!-- Empty State：品牌 logo + 豆包式胶囊云布局，元素错峰入场 -->
     <div
       v-if="messages.length === 0"
-      class="flex w-full flex-1 flex-col items-center justify-center gap-4 pb-6 text-center md:gap-6 md:pb-0"
+      key="empty-state"
+      class="flex w-full flex-col items-center gap-5 text-center"
     >
-      <div class="flex w-full max-w-md justify-center px-4 pt-1 md:max-w-2xl">
-        <img
-          src="/log.png"
-          alt="核电子学智能体"
-          class="mx-auto max-h-[18vh] w-auto max-w-[min(200px,50vw)] object-contain md:max-h-none md:w-full md:max-w-xl mix-blend-multiply contrast-[1.05] brightness-[1.05] dark:invert dark:mix-blend-screen"
-        />
+      <img
+        :src="emptyLogoSrc"
+        :alt="emptyLogoAlt"
+        class="animate-in fade-in zoom-in-95 object-contain duration-500"
+        :class="emptyLogoDarkInvert && 'dark:invert'"
+        :style="emptyLogoCompact
+          ? 'width: clamp(5rem, 10cqw, 7rem); height: clamp(5rem, 10cqw, 7rem)'
+          : 'width: clamp(10rem, 22cqw, 18rem); height: auto; max-height: min(26vh, 16rem)'"
+      />
+
+      <div v-if="showEmptyGreeting" class="animate-in fade-in slide-in-from-bottom-2 space-y-1.5 duration-500" style="animation-delay: 80ms">
+        <h2
+          class="font-semibold tracking-tight text-text-primary"
+          style="font-size: clamp(1.125rem, 2.4vh, 1.5rem)"
+        >
+          {{ emptyTitle }}
+        </h2>
+        <p class="text-sm text-text-secondary">
+          {{ emptyDescription }}
+        </p>
       </div>
 
-      <h2 class="px-4 text-lg font-semibold tracking-tight text-slate-900 md:text-2xl dark:text-slate-100">
-        你好，我是核电子学智能助手
-      </h2>
-
-      <div class="w-full max-w-3xl px-4 md:max-w-4xl md:px-6">
-        <div class="flex flex-wrap justify-center gap-2.5 md:gap-3">
+      <div class="grid w-full grid-cols-1 gap-2 @cozy/main:grid-cols-2">
           <button
-            v-for="suggestion in displayedSuggestions"
+            v-for="(suggestion, index) in displayedSuggestions"
             :key="suggestion"
             type="button"
             :disabled="isBusy"
-            class="rounded-xl bg-slate-100 px-3.5 py-2 text-[12px] leading-snug text-slate-800 transition-colors hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-50 md:rounded-2xl md:px-5 md:py-3 md:text-[14px] dark:bg-slate-800/80 dark:text-slate-200 dark:hover:bg-slate-700"
+            class="animate-in fade-in slide-in-from-bottom-2 group flex min-h-11 items-center gap-2 rounded-xl border border-border-subtle bg-surface px-3.5 py-2.5 text-left text-sm text-text-secondary transition-colors duration-400 hover:border-border-strong hover:bg-surface-hover hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-50"
+            :style="{ animationDelay: `${160 + index * 60}ms` }"
             @click="emit('select-suggestion', suggestion)"
           >
-            {{ suggestion }}
+            <component :is="iconOf(index)" class="size-4 shrink-0 text-accent" />
+            <span class="min-w-0 flex-1 line-clamp-2">{{ suggestion }}</span>
           </button>
-        </div>
       </div>
     </div>
     </TransitionGroup>
@@ -490,14 +689,19 @@ watch(() => props.messages, scrollToBottom, { deep: true });
 <style scoped>
 .list-enter-active,
 .list-leave-active {
-  transition: all 0.4s ease;
+  transition:
+    opacity 0.3s ease,
+    transform 0.3s ease;
+}
+.list-move {
+  transition: transform 0.3s ease;
 }
 .list-enter-from {
   opacity: 0;
-  transform: translateY(20px);
+  transform: translateY(12px);
 }
 .list-leave-to {
   opacity: 0;
-  transform: scale(0.95);
+  transform: scale(0.97);
 }
 </style>

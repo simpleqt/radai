@@ -12,6 +12,7 @@ from typing import Any
 
 from langchain_core.tools import BaseTool
 
+from backend.application.tools.assembler import shared_default_tool_registry
 from backend.application.tools.registry import ToolRegistry
 from backend.config.loggers import get_logger
 from backend.domain.tools.spec import ToolSpec
@@ -83,7 +84,7 @@ def descriptors_for_policy(
 ) -> list[McpToolDescriptor]:
     """Resolve policy-visible tools as MCP-like descriptors."""
 
-    tool_registry = registry or ToolRegistry()
+    tool_registry = registry or shared_default_tool_registry()
     specs = tool_registry.resolve_policy_tools(
         policy_name=policy_name,
         domain=domain,

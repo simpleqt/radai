@@ -1,6 +1,6 @@
-.PHONY: help install install-dev install-all clean test test-cov test-unit test-integration lint format format-check check run-api run-worker run-all docker-up docker-down docker-logs docker-build init-db migrate seed pre-commit-install pre-commit-run docs-build docs-serve deps-update deps-check setup version
+.PHONY: help install install-dev install-all clean test test-cov test-unit test-integration lint format format-check check run-api run-guest-api run-guest-api-daemon docker-up docker-down docker-logs docker-build init-db migrate seed pre-commit-install pre-commit-run docs-build docs-serve deps-update deps-check deps-verify setup version
 
-PYTHON ?= python
+PYTHON ?= venv314/bin/python
 PIP ?= $(PYTHON) -m pip
 
 help: ## 显示帮助信息
@@ -9,6 +9,7 @@ help: ## 显示帮助信息
 
 install: ## 安装核心依赖
 	$(PIP) install -r requirements.txt
+	$(PYTHON) -m backend.config.dependency_versions
 
 install-dev: ## 安装开发依赖
 	$(PIP) install -r requirements-dev.txt
@@ -63,19 +64,14 @@ run-guest-api: ## 启动访客专用 API（8083，前台调试）
 run-guest-api-daemon: ## 守护进程启动访客 API（关闭终端不中断）
 	bash scripts/guest_backend_service.sh start
 
-run-worker: ## 启动 Worker
-	$(PYTHON) -m backend.worker.task_worker
+check-imports: ## 校验内部导入闭包(拆分完整性)
+	$(PYTHON) tools/check_imports.py . backend
 
-run-ingest-worker: ## 启动入库 Worker
-        $(PYTHON) -m backend.worker.ingest_worker
+docker-up: ## 启动 Docker Compose 服务
+	docker-compose up -d
 
-run-all: ## 启动所有服务（API + Worker + Ingest Worker）
-        @echo "启动 API 服务..."
-        @$(PYTHON) -m backend.api.http_server &
-        @echo "启动 Worker..."
-        @$(PYTHON) -m backend.worker.task_worker &
-        @echo "启动 Ingest Worker..."
-        @$(PYTHON) -m backend.worker.ingest_worker
+docker-down: ## 停止 Docker Compose 服务
+	docker-compose down
 
 docker-logs: ## 查看 Docker 日志
 	docker-compose logs -f
@@ -98,10 +94,12 @@ pre-commit-install: ## 安装 pre-commit hooks
 pre-commit-run: ## 运行 pre-commit 检查
 	pre-commit run --all-files
 
-docs-build: ## 构建文档
+docs-build: ## 构建文档（需要仓库根目录 mkdocs.yml；当前以 docs/*.md 为准）
+	@if [ ! -f mkdocs.yml ]; then echo "缺少 mkdocs.yml，请直接阅读 docs/README.md"; exit 1; fi
 	mkdocs build
 
-docs-serve: ## 启动文档服务器
+docs-serve: ## 启动文档服务器（需要仓库根目录 mkdocs.yml；当前以 docs/*.md 为准）
+	@if [ ! -f mkdocs.yml ]; then echo "缺少 mkdocs.yml，请直接阅读 docs/README.md"; exit 1; fi
 	mkdocs serve
 
 deps-update: ## 更新依赖到最新版本
@@ -114,6 +112,9 @@ deps-check: ## 检查依赖安全性
 	pip-audit
 	safety check
 
+deps-verify: ## 校验项目锁定的运行时依赖
+	$(PYTHON) -m backend.config.dependency_versions
+
 setup: ## 初始化开发环境
 	$(PIP) install -e ".[dev]"
 	pre-commit install
@@ -124,6 +125,7 @@ setup: ## 初始化开发环境
 version: ## 显示版本信息
 	@echo "Python 版本:"
 	@$(PYTHON) --version
+	@$(PYTHON) -m backend.config.dependency_versions
 	@echo ""
 	@echo "核心依赖版本:"
 	@$(PYTHON) -m pip show langchain | grep Version

@@ -10,8 +10,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from backend.config.loggers import get_logger
 from backend.core.utils.normalization import normalize_unique_strings
 from backend.domain.agents.profile import AgentProfile
+
+logger = get_logger(__name__)
 
 
 class KnowledgeBaseAccessError(PermissionError):
@@ -261,9 +264,18 @@ class KnowledgeBaseAccessPolicy:
                 )
             ).all()
             return {str(row.kb_id) for row in rows}
-        except SQLAlchemyError:
+        except SQLAlchemyError as exc:
             # Older databases may not have the ACL migration yet.  Fail closed:
             # owners/public KBs continue to work, grants do not.
+            missing_table = "doesn't exist" in str(exc) or getattr(
+                getattr(exc, "orig", None), "args", [None]
+            )[0] == 1146
+            logger.warning(
+                "读取知识库授权记录失败，按无授权处理: user_id=%s err=%s",
+                user_id,
+                exc,
+                exc_info=not missing_table,
+            )
             return set()
         finally:
             session.close()
@@ -273,7 +285,7 @@ class KnowledgeBaseAccessPolicy:
         from sqlalchemy import select
 
         from backend.db.connection import get_session
-        from backend.db.models.agent import Agent, AgentKnowledgeBase
+        from backend.db.models.agent import AgentKnowledgeBase
         from backend.domain.agents.bindings import agent_binding_codes
 
         session = get_session()
@@ -286,11 +298,7 @@ class KnowledgeBaseAccessPolicy:
                     AgentKnowledgeBase.agent_code,
                     AgentKnowledgeBase.kb_id,
                 )
-                .join(Agent, Agent.agent_code == AgentKnowledgeBase.agent_code)
-                .where(
-                    AgentKnowledgeBase.agent_code.in_(agent_codes),
-                    Agent.is_active.is_(True),
-                )
+                .where(AgentKnowledgeBase.agent_code.in_(agent_codes))
                 .order_by(
                     AgentKnowledgeBase.sort_order,
                     AgentKnowledgeBase.id,

@@ -15,7 +15,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 
-from backend.db.models import Base
+from backend.db.models.base import Base
 
 
 class Agent(Base):

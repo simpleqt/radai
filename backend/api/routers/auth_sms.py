@@ -10,7 +10,7 @@ from datetime import datetime
 import httpx
 import shortuuid
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,12 +36,33 @@ from backend.db.connection import get_async_session
 from backend.db.models import User
 from backend.db.redis import get_redis_client
 
+logger = get_logger(__name__)
+
+# 比较并删除必须在 Redis 端原子执行：网关调用可能挂满锁 TTL，超时后
+# 锁被后继请求抢得，前任的迟到 DELETE 会误删后继的锁，绕过重发间隔。
+_RELEASE_SMS_LOCK_IF_OWNER_LUA = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+end
+return 0
+"""
+
+
+async def _release_sms_lock(redis_client, lock_key: str, owner: str) -> None:
+    try:
+        await redis_client.eval(
+            _RELEASE_SMS_LOCK_IF_OWNER_LUA, 1, lock_key, owner
+        )
+    except Exception:
+        pass
+
+
 try:
     from dotenv import load_dotenv
 
     load_dotenv(ENV_FILE, override=False)
 except Exception:
-    pass
+    logger.warning("短信认证环境变量文件加载失败: %s", ENV_FILE, exc_info=True)
 
 # 配置
 SCHOOL_SMS_CONFIG_KEYS = (
@@ -67,7 +88,7 @@ def _school_sms_config() -> tuple[dict[str, str], list[str]]:
 
 
 CAPTCHA_TTL_SECONDS = 300
-CAPTCHA_MAX_ATTEMPTS = 5
+CAPTCHA_MAX_ATTEMPTS = 3
 SMS_CODE_TTL_SECONDS = 300
 SMS_CODE_MAX_ATTEMPTS = 5
 SMS_RESEND_SECONDS = 60
@@ -79,7 +100,6 @@ PHONE_NOT_REGISTERED_MESSAGE = "该手机号未注册"
 PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
 
 router = APIRouter(prefix="", tags=["短信认证"])
-logger = get_logger(__name__)
 
 
 class SmsCaptchaResponse(BaseModel):
@@ -89,30 +109,31 @@ class SmsCaptchaResponse(BaseModel):
 
 
 class SendSmsRequest(BaseModel):
-    telephone: str
-    type: str = "register"
-    captcha_id: str | None = None
-    captcha_answer: str | None = None
+    telephone: str = Field(min_length=1, max_length=32)
+    type: str = Field(default="register", max_length=32)
+    captcha_id: str | None = Field(default=None, max_length=64)
+    captcha_answer: str | None = Field(default=None, max_length=32)
 
 
 class RegisterRequest(BaseModel):
-    telephone: str
-    code: str
-    username: str
-    password: str
-    confirmPassword: str
+    telephone: str = Field(min_length=1, max_length=32)
+    code: str = Field(min_length=1, max_length=16)
+    # username 与 users.username String(50) 对齐，超长原先是 DB 异常 500。
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=6, max_length=256)
+    confirmPassword: str = Field(min_length=6, max_length=256)
 
 
 class ForgotPasswordRequest(BaseModel):
-    telephone: str
-    code: str
-    newPassword: str
-    confirmPassword: str
+    telephone: str = Field(min_length=1, max_length=32)
+    code: str = Field(min_length=1, max_length=16)
+    newPassword: str = Field(min_length=6, max_length=256)
+    confirmPassword: str = Field(min_length=6, max_length=256)
 
 
 class SmsLoginRequest(BaseModel):
-    telephone: str
-    code: str
+    telephone: str = Field(min_length=1, max_length=32)
+    code: str = Field(min_length=1, max_length=16)
 
 
 def is_strong_password(password: str) -> bool:
@@ -143,11 +164,23 @@ def _guest_username(telephone: str) -> str:
     return f"guest_{telephone}"
 
 
+def _has_usable_password(user: User) -> bool:
+    """Whether the account can authenticate by password (non-empty hash)."""
+    return bool(str(getattr(user, "password", "") or "").strip())
+
+
 async def _find_user_by_telephone(
     session: AsyncSession,
     telephone: str,
 ) -> User | None:
-    """按绑定手机号查找用户，兼容历史「用户名=手机号」及访客短信账户。"""
+    """按绑定手机号查找用户，兼容历史「用户名=手机号」及访客短信账户。
+
+    安全约束(R4-RT-1):`username == 手机号` 的历史回退**只对无口令的短信
+    来源账户**生效。口令账户(尤其管理员)绝不经此命中——否则任何控制该号码
+    短信的人,只要某账户的用户名恰好等于该号码(但并未把该号码绑定到
+    telephone 字段),即可免口令登入或重置其口令,构成接管/提权。telephone
+    字段精确绑定是权威匹配(绑定本身证明拥有该号码),不受此限制。
+    """
     result = await session.execute(select(User).where(User.telephone == telephone))
     user = result.scalars().first()
     if user is not None:
@@ -156,7 +189,13 @@ async def _find_user_by_telephone(
     result = await session.execute(select(User).where(User.username == telephone))
     user = result.scalars().first()
     if user is not None:
-        return user
+        if not _has_usable_password(user):
+            return user
+        logger.warning(
+            "[SMS] 拒绝短信通道命中口令账户(用户名恰为手机号但未绑定 telephone): "
+            "user_id=%s",
+            user.user_id,
+        )
 
     result = await session.execute(
         select(User).where(User.username == _guest_username(telephone))
@@ -329,9 +368,10 @@ async def send_sms_code(
         }
 
     lock_key = _sms_send_lock_key(telephone)
+    lock_owner = secrets.token_urlsafe(16)
     acquired = await redis_client.set(
         lock_key,
-        "1",
+        lock_owner,
         ex=SMS_RESEND_SECONDS,
         nx=True,
     )
@@ -345,12 +385,12 @@ async def send_sms_code(
         max_requests=SMS_IP_RATE_MAX_REQUESTS,
     )
     if not allowed:
-        await redis_client.delete(lock_key)
+        await _release_sms_lock(redis_client, lock_key, lock_owner)
         return _sms_rate_limited_response(retry_after)
 
     sms_config, missing_config = _school_sms_config()
     if missing_config:
-        await redis_client.delete(lock_key)
+        await _release_sms_lock(redis_client, lock_key, lock_owner)
         logger.error(
             "学校短信网关配置不完整: missing=%s",
             ",".join(missing_config),
@@ -364,7 +404,7 @@ async def send_sms_code(
     code = "".join(str(secrets.randbelow(10)) for _ in range(6))
 
     try:
-        async with httpx.AsyncClient(trust_env=False) as client:
+        async with httpx.AsyncClient(trust_env=False, timeout=15) as client:
             # 外部接口 getChannels 报错提示缺少参数，且该步骤通常仅为获取类型。
             # 直接使用 sms 作为默认值以确保核心发送逻辑能够运行。
             channel_encode = "sms"
@@ -408,7 +448,7 @@ async def send_sms_code(
                     "retry_after": SMS_RESEND_SECONDS,
                 }
             else:
-                await redis_client.delete(lock_key)
+                await _release_sms_lock(redis_client, lock_key, lock_owner)
                 logger.warning(
                     "学校短信网关返回失败: phone=%s status=%s body=%r",
                     f"{telephone[:3]}****{telephone[-4:]}",
@@ -421,7 +461,7 @@ async def send_sms_code(
                     "refresh_captcha": True,
                 }
     except Exception as exc:
-        await redis_client.delete(lock_key)
+        await _release_sms_lock(redis_client, lock_key, lock_owner)
         logger.exception(
             "学校短信网关调用异常: phone=%s error=%s",
             f"{telephone[:3]}****{telephone[-4:]}",

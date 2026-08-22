@@ -46,6 +46,11 @@ class SkillPackageStorage:
         except Exception as exc:
             raise SkillPackageStorageError("Skill 包从 MinIO 下载失败") from exc
 
-    def presigned_download(self, *, bucket: str, object_name: str) -> str | None:
-        return get_presigned_url(object_name, expiry_seconds=600, bucket_name=bucket)
+    async def presigned_download(self, *, bucket: str, object_name: str) -> str | None:
+        # presign 本身是本地计算,但 get_presigned_url 内部取客户端时的首次
+        # 惰性初始化会做 bucket_exists/make_bucket 网络往返;调用方在异步
+        # 路径,整体离线到线程(R4-SV-15)。
+        return await asyncio.to_thread(
+            get_presigned_url, object_name, expiry_seconds=600, bucket_name=bucket
+        )
 

@@ -1,6 +1,0 @@
-data: {"type": "status", "status": "深度研究已启动"}
-
-data: {"type": "chunk", "content": "段落"}
-
-data: [DONE]
-

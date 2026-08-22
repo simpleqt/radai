@@ -1,0 +1,16 @@
+code: audit
+name: 高校审计智能助手
+domain: university-audit
+description: 面向高校内部审计制度检索、证据核验、风险分析和整改问答的专用智能体
+default_model: null
+default_kb_ids: []
+default_skills: []
+default_workflow: full
+allowed_workflows:
+  - lightweight
+  - full
+prompt_profile: audit
+tool_policy: audit_default
+kb_policy: bound_only
+guardrail_policy: university_audit_scope
+ui_profile: audit_qa_only

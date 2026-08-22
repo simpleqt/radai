@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
-import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -180,12 +178,21 @@ async def upload_groundwater_project_package(
     try:
         service = GroundwaterProjectService()
 
+        # spool 到磁盘时强制字节上限：无界 copyfileobj 可把磁盘填满
+        #（run_blocking 内同步读，但磁盘是真实消耗）。
+        max_package_bytes = 2 * 1024 * 1024 * 1024  # 2 GiB
+
         def import_package():
+            from backend.api.upload_utils import spool_file_with_limit
+
             context = service.resolve(auth.user_id, project_id, is_admin=True)
-            with tempfile.NamedTemporaryFile(suffix=".zip") as temp_file:
-                shutil.copyfileobj(file.file, temp_file)
-                temp_file.flush()
-                return service.import_zip(context, Path(temp_file.name))
+            temp_path, _size, _sha = spool_file_with_limit(
+                file.file, max_package_bytes, suffix=".zip"
+            )
+            try:
+                return service.import_zip(context, Path(temp_path))
+            finally:
+                Path(temp_path).unlink(missing_ok=True)
 
         updated = await run_blocking(import_package)
         return {

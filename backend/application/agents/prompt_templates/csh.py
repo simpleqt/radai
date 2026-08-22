@@ -82,6 +82,8 @@ ANSWER_FORMAT_PROMPT = """
   - [绝对禁止] 输出裸露的 `^` / `_` 或 HTML 上下标标签（如 `<sup>` / `<sub>`）。
 - **图片规范**: 
   - 引用可用图片白名单中的标识符时，必须使用块级 Markdown（前后各空一行）：`![图片说明]([IMAGE:xxx])`，其下方紧跟图注 `*图n：图名*`。
+  - 历史对话中已经出现且仍保留的 `[IMAGE:xxx]` 可以在后续轮次原样复用；禁止自行改号或构造标识符。
+  - 禁止把图片标识、URL 或路径放入 Markdown 表格；多张图片必须按独立图文段落展示。
   - 严禁引用白名单之外的任何图片。
 </answer_structure_and_math_policy>
 """
@@ -126,11 +128,12 @@ CSH_LIGHTWEIGHT_ANSWER_TEMPLATE_PROMPT = """\
 ---
 
 ## 二、 图片引用与排版规则（强制要求）
-- **仅限使用检索到的图片**：严禁伪造、虚构或从外部互联网引用任何未在当前上下文中提供的图片。你只能使用上下文中明确列出的 `[IMAGE:xxx]` 标识符。无标识符时绝对禁止产出图片。
+- **仅限使用已登记图片**：严禁伪造、虚构或从外部互联网引用未登记图片。你只能使用当前上下文白名单，或历史对话中已经出现且仍保留的 `[IMAGE:xxx]` 标识符；服务端会校验历史标识并刷新访问签名。没有这两类标识符时绝对禁止产出图片。
 - **插入格式**：只能使用标准 Markdown 语法 `![图片描述]([IMAGE:xxx])`，严禁输出图片 URL、`/files/` 路径、MinIO 地址或代理地址。
 - **整合原则**：图片必须与上下文相关，但必须使用块级展示，不得与正文在同一行混排。
 - **换行硬约束**：图片前后各保留 1 个空行，且图片语法单独占一行。
 - **禁止行内图片**：禁止输出“……如图所示![图]([IMAGE:xxx])……”或“（![图]([IMAGE:xxx])）”这类写法。
+- **禁止图片标识表格**：不得把 `[IMAGE:xxx]`、图片 URL 或路径作为“图片标识”列输出；多张图片按独立图文段落依次展示。
 - **图下注释**：每张图片下方必须紧跟一行图名/图注，格式为 `*图n：图名*`（例如 `*图1：渗透试验曲线示意图*`）。
 - **图注编号一致性**：图注编号必须与文中引用一致，禁止编号跳跃或重复。
 - **上下文关联**：每张图片前必须有至少 1-2 句文字说明，解释图片内容及其与当前论述的关系。
@@ -196,7 +199,9 @@ def build_system_prompt(
         )
         return (
             LIGHTWEIGHT_BUSINESS_CAPABILITIES_PROMPT
-            + KNOWLEDGE_RETRIEVAL_POLICY_LIGHTWEIGHT.format(kb_binding_note=kb_binding_note)
+            + KNOWLEDGE_RETRIEVAL_POLICY_LIGHTWEIGHT.format(
+                kb_binding_note=kb_binding_note
+            )
             + f"\n<network_search_policy>{search_note}</network_search_policy>\n"
         )
 

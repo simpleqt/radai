@@ -75,6 +75,7 @@ class SSEEncoder:
             maxsize=self._queue_maxsize
         )
         last_event: AgentEvent | None = None
+        terminal_marker_emitted = False
         # Seed the ContextVar before spawning the producer. The upstream runtime
         # resets and populates the same registry object, while this consumer uses
         # it to resolve message.replace payloads before they reach the browser.
@@ -129,6 +130,12 @@ class SSEEncoder:
                     return
                 if item_type == "error":
                     assert isinstance(payload, BaseException)
+                    if terminal_marker_emitted:
+                        logger.error(
+                            "SSE 上游在 done 事件后的收尾阶段失败",
+                            exc_info=(type(payload), payload, payload.__traceback__),
+                        )
+                        continue
                     public_message, error_code = public_agent_error(payload)
                     error_event = AgentEvent(
                         type="error",
@@ -164,6 +171,8 @@ class SSEEncoder:
                 if event is None:
                     continue
                 if event.type == "done":
+                    if terminal_marker_emitted:
+                        continue
                     flushed = chunk_image_resolver.flush()
                     if flushed:
                         flush_event = replace(
@@ -177,7 +186,13 @@ class SSEEncoder:
                     self._record_sse_event(event)
                     yield self.encode(event)
                     yield "data: [DONE]\n\n"
-                    return
+                    # Do not return yet. The upstream async generator performs
+                    # persistence (including the conversation image registry)
+                    # after yielding its terminal event. Keep consuming until
+                    # it naturally finishes so its ``finally`` block is not
+                    # cancelled before that state is committed.
+                    terminal_marker_emitted = True
+                    continue
                 last_event = event
                 self._record_sse_event(event)
                 yield self.encode(event)

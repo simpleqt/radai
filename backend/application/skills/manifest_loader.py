@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from backend.application.tools.assembler import shared_default_tool_registry
 from backend.application.tools.registry import ToolRegistry
 from backend.core.utils.normalization import normalize_string_list
 from backend.domain.agents.workflows import SUPPORTED_WORKFLOWS
@@ -30,7 +31,10 @@ class SkillManifestLoader:
             if skills_root is not None
             else [default_root, default_root.parent / "data" / "managed_skills"]
         )
-        self._tool_registry = tool_registry or ToolRegistry()
+        # 共享进程级只读注册表：默认构造会每次读盘解析两份 YAML。
+        self._tool_registry = (
+            tool_registry or shared_default_tool_registry()
+        )
         self._validate_tools = validate_tools
 
     @property

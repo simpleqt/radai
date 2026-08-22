@@ -224,7 +224,7 @@ function onWheel(e: WheelEvent) {
 
 <template>
   <div
-    class="relative w-full h-full overflow-hidden bg-slate-50/60 dark:bg-slate-900/40 touch-none"
+    class="relative w-full h-full overflow-hidden bg-surface-sunken touch-none"
     @pointerdown="onPointerDown"
     @pointermove="onPointerMove"
     @pointerup="onPointerUp"
@@ -232,7 +232,8 @@ function onWheel(e: WheelEvent) {
     @wheel="onWheel"
     :class="dragging || nodeDragging ? 'cursor-grabbing' : 'cursor-grab'"
   >
-    <div class="absolute inset-0 bg-[radial-gradient(circle,#cbd5e122_1px,transparent_1px)] dark:bg-[radial-gradient(circle,#33415533_1px,transparent_1px)] bg-[length:24px_24px] pointer-events-none" />
+    <div class="absolute inset-0 pointer-events-none bg-[radial-gradient(circle,rgba(124,58,237,0.13)_1px,transparent_1px)] bg-[length:22px_22px] dark:bg-[radial-gradient(circle,#33415533_1px,transparent_1px)]" />
+    <div class="absolute inset-0 pointer-events-none bg-[radial-gradient(ellipse_70%_58%_at_50%_42%,rgba(139,92,246,0.14),transparent_62%)]" />
 
     <div
       class="absolute origin-top-left"
@@ -249,7 +250,7 @@ function onWheel(e: WheelEvent) {
           :d="edgePath(e)"
           fill="none"
           stroke="currentColor"
-          class="text-indigo-300/70 dark:text-indigo-500/40"
+          class="text-accent/80"
           stroke-width="2"
         />
       </svg>
@@ -269,12 +270,12 @@ function onWheel(e: WheelEvent) {
       />
     </div>
 
-    <div class="absolute bottom-4 left-4 flex items-center gap-1 bg-white/90 dark:bg-slate-800/90 backdrop-blur rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm p-1">
-      <button type="button" class="w-8 h-8 rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700" @click="zoomOut" title="缩小"><Minus class="w-4 h-4" /></button>
-      <span class="text-xs text-slate-400 w-10 text-center tabular-nums">{{ Math.round(scale * 100) }}%</span>
-      <button type="button" class="w-8 h-8 rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700" @click="zoomIn" title="放大"><Plus class="w-4 h-4" /></button>
-      <div class="w-px h-5 bg-slate-200 dark:bg-slate-700 mx-0.5" />
-      <button type="button" class="w-8 h-8 rounded-lg flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700" @click="resetView" title="重置视图"><Maximize2 class="w-4 h-4" /></button>
+    <div class="absolute bottom-4 left-4 flex items-center gap-1 rounded-2xl border border-border-subtle bg-surface/86 p-1 backdrop-blur-xl">
+      <button type="button" class="w-8 h-8 rounded-xl flex items-center justify-center text-text-secondary hover:bg-accent-soft hover:text-accent" @click="zoomOut" title="缩小"><Minus class="w-4 h-4" /></button>
+      <span class="text-xs text-text-tertiary w-10 text-center tabular-nums">{{ Math.round(scale * 100) }}%</span>
+      <button type="button" class="w-8 h-8 rounded-xl flex items-center justify-center text-text-secondary hover:bg-accent-soft hover:text-accent" @click="zoomIn" title="放大"><Plus class="w-4 h-4" /></button>
+      <div class="w-px h-5 bg-surface-sunken mx-0.5" />
+      <button type="button" class="w-8 h-8 rounded-xl flex items-center justify-center text-text-secondary hover:bg-accent-soft hover:text-accent" @click="resetView" title="重置视图"><Maximize2 class="w-4 h-4" /></button>
     </div>
   </div>
 </template>

@@ -18,6 +18,7 @@ from backend.application.tools.execution import (
 from backend.application.tools.result import normalize_tool_error, normalize_tool_result
 from backend.application.tools.runtime_gateway import RuntimeToolGateway
 from backend.application.tools.tool_assembly_pipeline import ToolAssemblyPipeline
+from backend.config.loggers import get_logger
 from backend.core.agents.middlewares.runtime_budget import charge_agent_tool_call
 from backend.core.agents.middlewares.runtime_policy import (
     RuntimePolicyGuardrailProvider,
@@ -25,6 +26,8 @@ from backend.core.agents.middlewares.runtime_policy import (
 from backend.core.skills.scoped_skills_provider import ScopedSkillsProvider
 from backend.domain.agents.runtime_context import AgentRuntimeContext
 from backend.domain.tools.runtime_context import ToolRuntimeContext
+
+logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from backend.application.agents.definition import ResolvedAgentDefinition
@@ -81,12 +84,18 @@ class RuntimeToolInvoker:
             time_context=context.time_context,
             request_metadata=dict(context.request_metadata),
             domain_context=dict(context.domain_context),
+            context_scope_id=(
+                f"{context.request_id}::{context.internal_thread_id}"
+                if (context.request_id or context.internal_thread_id)
+                else ""
+            ),
         )
         self._tools = {
             str(getattr(tool, "name", "") or ""): tool
             for tool in ToolAssemblyPipeline(
                 subagent_enabled=False,
                 use_search=context.use_search,
+                deep_retrieval=getattr(context, "deep_retrieval", False),
                 kb_ids=list(context.kb_ids),
                 selected_skills=effective_skills,
                 skills_provider=ScopedSkillsProvider(
@@ -199,17 +208,22 @@ class RuntimeToolInvoker:
                     execute_multi_kb_search_structured,
                 )
 
+                deep_retrieval = bool(
+                    getattr(self._context, "deep_retrieval", False)
+                )
                 value = await invoke_service_call(
                     tool_obj,
                     lambda: execute_multi_kb_search_structured(
                         **dict(args),
                         kb_ids=list(self._context.kb_ids),
+                        deep_retrieval=deep_retrieval,
                     ),
                     tool_name=tool_name,
                     cache_key_payload={
                         "scope": self._context.request_id,
                         "args": dict(args),
                         "kb_ids": list(self._context.kb_ids),
+                        "deep_retrieval": deep_retrieval,
                     },
                     # The structured normalizer below owns compaction so that
                     # evidence and image metadata are not flattened first.
@@ -315,6 +329,7 @@ def parse_tool_json_result(value: Any) -> dict[str, Any]:
             if isinstance(parsed, dict):
                 return parsed
         except Exception:
+            logger.debug("工具返回值不是有效 JSON 对象，按文本处理", exc_info=True)
             return {"content": value}
     return {"content": value}
 

@@ -123,7 +123,7 @@ def _assemble_from_features(
       2.   RuntimeBudgetMiddleware (always)
       3.   ToolErrorHandlingMiddleware (always)
       4.   SummarizationMiddleware (summarization feature)
-      5.   ViewImageMiddleware (vision feature)
+      5.   Custom vision middleware (vision feature, instance only)
       6.   SubagentLimitMiddleware (subagent feature)
       7.   ToolBudgetAvailabilityMiddleware (always)
       8.   LoopDetectionMiddleware (always)
@@ -165,13 +165,11 @@ def _assemble_from_features(
                 "summarization=True requires a custom AgentMiddleware instance"
             )
 
-    if feat.vision is not False:
-        if isinstance(feat.vision, AgentMiddleware):
-            chain.append(feat.vision)
-        else:
-            from backend.core.agents.middlewares.view_image import ViewImageMiddleware
-
-            chain.append(ViewImageMiddleware())
+    if isinstance(feat.vision, AgentMiddleware):
+        # Only custom vision middleware is honored. The old built-in
+        # ViewImageMiddleware was deerflow legacy: no ``view_image`` tool ever
+        # existed, so it scanned every model round without ever injecting.
+        chain.append(feat.vision)
 
     if feat.subagent is not False:
         if isinstance(feat.subagent, AgentMiddleware):

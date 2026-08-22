@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -42,7 +43,10 @@ def create_native_skill_tools(
         )
         if selected_skills is not None and normalized_skill_name not in selected_skills:
             raise ValueError(f"Skill '{normalized_skill_name}' is not allowed in this session")
-        content = skills_provider.read_skill_content(normalized_skill_name)
+        content = await asyncio.to_thread(
+            skills_provider.read_skill_content,
+            normalized_skill_name,
+        )
         mark_skill_loaded(normalized_skill_name)
         logger.info("[NativeSkillTools] skill loaded into request context: %s", normalized_skill_name)
         return content
@@ -59,13 +63,20 @@ def create_native_skill_tools(
         )
         if selected_skills is not None and normalized_skill_name not in selected_skills:
             raise ValueError(f"Skill '{normalized_skill_name}' is not allowed in this session")
-        return skills_provider.read_skill_reference(normalized_skill_name, reference_path)
+        return await asyncio.to_thread(
+            skills_provider.read_skill_reference,
+            normalized_skill_name,
+            reference_path,
+        )
 
     @tool("list_available_skills")
     async def list_available_skills() -> str:
         """列出当前可用 Skills。"""
         logger.info("[NativeSkillTools] list_available_skills called")
-        skills = skills_provider.get_available_skills_for_user(selected_skills=selected_skills)
+        skills = await asyncio.to_thread(
+            skills_provider.get_available_skills_for_user,
+            selected_skills=selected_skills,
+        )
         skill_infos = [
             {
                 "name": skill.name,

@@ -15,7 +15,7 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 
-from backend.db.models import Base
+from backend.db.models.base import Base
 
 
 class ExperimentDataset(Base):

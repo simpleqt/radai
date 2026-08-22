@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from typing import Any
 
 from backend.application.agent_runtime.visible_answer import (
@@ -164,9 +165,18 @@ async def invoke_mcp_tool(
     thread_id: str | None = None,
     conversation_id: str | None = None,
     checkpointer=None,
+    allowed_tools: Sequence[str] | None = None,
 ) -> Any:
-    """Invoke one catalogued tool through the normal policy/runtime boundary."""
+    """Invoke one catalogued tool through the normal policy/runtime boundary.
+
+    ``allowed_tools`` is the caller credential's per-key allowlist. It must be
+    enforced here as well as at the transport layer, because the built-in
+    ``call_tool`` proxy would otherwise let an allowlisted entry point reach any
+    other tool in the bound catalog.
+    """
     spec = spec or get_default_mcp_service_spec()
+    if allowed_tools is not None and tool_name not in set(allowed_tools):
+        raise PermissionError(f"API Key 无权调用 MCP 工具: {tool_name}")
     normalized_arguments = dict(arguments or {})
     if len(normalized_arguments) > 64:
         raise ValueError("MCP 工具参数字段过多")

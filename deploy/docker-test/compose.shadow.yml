@@ -1,0 +1,179 @@
+name: radai-docker-test-shadow
+
+x-backend-common: &backend-common
+  env_file:
+    - "${RUNTIME_ENV:?RUNTIME_ENV is required}"
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  read_only: true
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 45s
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 768
+  mem_limit: 10g
+  cpus: 6.0
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=4g,mode=1777
+  volumes:
+    - "${RUNTIME_ROOT:?RUNTIME_ROOT is required}/data:${RUNTIME_ROOT:?RUNTIME_ROOT is required}/data:rw"
+    - "${RUNTIME_ROOT:?RUNTIME_ROOT is required}/logs:${RUNTIME_ROOT:?RUNTIME_ROOT is required}/logs:rw"
+    - "${RUNTIME_ROOT:?RUNTIME_ROOT is required}/data/backend-app:/app/backend/data:rw"
+    - "${GROUNDWATER_BUILTIN_ROOT:-/home/inspur/myenv/runtime/doc-agent-shared/groundwater/liutang}:${GROUNDWATER_BUILTIN_ROOT:-/home/inspur/myenv/runtime/doc-agent-shared/groundwater/liutang}:ro"
+  networks:
+    - application
+    - firecrawl
+  logging:
+    driver: json-file
+    options:
+      max-size: 20m
+      max-file: "3"
+
+x-frontend-common: &frontend-common
+  env_file:
+    - "${FRONTEND_ENV:?FRONTEND_ENV is required}"
+  read_only: true
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 15s
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  mem_limit: 384m
+  cpus: 1.0
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
+  networks:
+    - application
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+  healthcheck:
+    test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+    interval: 10s
+    timeout: 3s
+    retries: 12
+    start_period: 10s
+
+services:
+  agent-api:
+    <<: *backend-common
+    image: "${AGENT_API_IMAGE:?AGENT_API_IMAGE is required}"
+    command:
+      - python
+      - -m
+      - backend.cli
+      - run-api
+      - --service-role
+      - agent
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8082"
+      - --workers
+      - "1"
+    environment:
+      USER: app
+      LOGNAME: app
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "8082"
+      KNOWLEDGE_SERVICE_BASE_URL: http://knowledge-api:8086
+      RAG_SERVICE_BASE_URL: http://knowledge-api:8086
+      FIRECRAWL_API_URL: http://langchain-firecrawl-gateway:3002
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${TEST_AGENT_PORT:-28082}:8082"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8082/live', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+
+  # knowledge-api 已拆分至 omnigraph 仓库(github.com/simpleqt/omnigraph)独立部署。
+  # 本编排假定其已接入同一 docker 网络,服务名 knowledge-api、端口 8086;
+  # 或将 KNOWLEDGE_SERVICE_BASE_URL/RAG_SERVICE_BASE_URL 指向可达地址。
+
+  guest-api:
+    <<: *backend-common
+    image: "${GUEST_API_IMAGE:?GUEST_API_IMAGE is required}"
+    command:
+      - python
+      - -m
+      - backend.api.guest_http_server
+    environment:
+      USER: app
+      LOGNAME: app
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "8083"
+      GUEST_SERVER_HOST: 0.0.0.0
+      GUEST_SERVER_PORT: "8083"
+      GUEST_SERVER_WORKERS: "1"
+      KNOWLEDGE_SERVICE_BASE_URL: http://knowledge-api:8086
+      RAG_SERVICE_BASE_URL: http://knowledge-api:8086
+      FIRECRAWL_API_URL: http://langchain-firecrawl-gateway:3002
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${TEST_GUEST_API_PORT:-28083}:8083"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8083/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+
+  frontend:
+    <<: *frontend-common
+    image: "${FRONTEND_IMAGE:?FRONTEND_IMAGE is required}"
+    depends_on:
+      agent-api:
+        condition: service_healthy
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${TEST_FRONTEND_PORT:-25173}:8080"
+
+  csh-frontend:
+    <<: *frontend-common
+    image: "${CSH_FRONTEND_IMAGE:?CSH_FRONTEND_IMAGE is required}"
+    depends_on:
+      agent-api:
+        condition: service_healthy
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${TEST_CSH_FRONTEND_PORT:-25174}:8080"
+
+  fmca-frontend:
+    <<: *frontend-common
+    image: "${FMCA_FRONTEND_IMAGE:?FMCA_FRONTEND_IMAGE is required}"
+    depends_on:
+      agent-api:
+        condition: service_healthy
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${TEST_FMCA_FRONTEND_PORT:-25176}:8080"
+
+  landslide-frontend:
+    <<: *frontend-common
+    image: "${LANDSLIDE_FRONTEND_IMAGE:?LANDSLIDE_FRONTEND_IMAGE is required}"
+    depends_on:
+      agent-api:
+        condition: service_healthy
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${TEST_LANDSLIDE_FRONTEND_PORT:-25175}:8080"
+
+  guest-frontend:
+    <<: *frontend-common
+    image: "${GUEST_FRONTEND_IMAGE:?GUEST_FRONTEND_IMAGE is required}"
+    depends_on:
+      guest-api:
+        condition: service_healthy
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${TEST_GUEST_FRONTEND_PORT:-28084}:8080"
+
+networks:
+  application:
+    driver: bridge
+  firecrawl:
+    external: true
+    name: langchain-firecrawl_backend

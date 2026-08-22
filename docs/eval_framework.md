@@ -1,6 +1,7 @@
 # RAG 评测框架
 
 > 项目内置的检索质量与端到端 RAG 评测工具，覆盖 HotpotQA 通用基准与核电子学期刊论文库（Paper KB）领域评测。
+> 自研入库链路的 schema、BM25、repair 与一致性 smoke 见 §7.3。
 
 ---
 
@@ -101,7 +102,7 @@ venv314/bin/python ablation_direct_retriever.py \
 
 ### 4.1 配置
 
-- **知识库 ID**：`<kb_id_paper>`
+- **知识库 ID**：`de4ccde7-b286-4e49-bd8c-9dd37bd61878`
 - **KB Code**：`NuclearElectronicsPaperRepository`
 - **测试题**：`eval/datasets/paper_kb/test_queries.jsonl`（17 道领域问题）
 
@@ -159,7 +160,7 @@ bash run_lightrag_modes_ragas.sh
 
 ```bash
 source venv314/bin/activate
-cd <project_root>
+cd /home/inspur/myenv/langchian_project
 
 # 生产 vs LightRAG hybrid 快测
 python eval/graphrag_bench/run_official_graphrag_eval.py \
@@ -231,12 +232,44 @@ python eval/graphrag_bench/run_official_graphrag_eval.py \
 | SSE 协议 smoke | 正常 chunk/status/event/error/done 均能编码，模型异常不会导致 ASGI 未捕获异常 | 必须通过 |
 | Skill 加载 smoke | `read_local_skill_file` 能加载 profile 默认 Skill，脏参数如 `html-ppt</parameter` 会被规范化 | 必须通过 |
 | ToolPolicy smoke | `selected_skills` 能启用对应工具，未声明工具不会注入 | 必须通过 |
-| 深研任务 smoke | confirmed research plan 能创建后台任务，状态流、取消、活动任务查询可用 | 必须通过 |
+| 深研协同 smoke | `deep_research` 的 `/api/v2/agent-runtime/query` 返回任务启动确认并带出 `task_id`；随后 task `status/stream/cancel` 路由可用，task stream 能产生 `plan.created`、`workflow.step`、`coordination.*`、报告 artifact 和终态 `done` | 必须通过 |
 | 前端协议回归 | RadAI/CSH-AI 登录态 query 默认走 `/api/v2/agent-runtime/query`，访客仍走 `/api/v2/guest/query` | 必须通过 |
+
+### 7.2 深度研究证据质量指标
+
+深研运行时已能从 Claim–Source 图谱和最终答案核验中输出以下确定性指标，可作为后续中文领域评测集和 A/B 配置的基础：
+
+| 指标 | 计算口径 | 期望方向 |
+| :--- | :--- | :--- |
+| `citation_coverage` | 带 `supporting_refs` 的 Claim / 全部 Claim | 越高越好 |
+| `corroboration_rate` | 被两个及以上规范化来源支持的 Claim / 可核验 Claim | 越高越好 |
+| `high_authority_source_ratio` | 用户知识库、项目数据、政府/高校或学术索引来源 / 全部规范化来源 | 按任务类型设阈值 |
+| `conflicted_claims` | 数值或否定关系存在确定性冲突的 Claim 数 | 越低越好；非零时必须核验或披露 |
+| `semantic_review_candidates` | 低置信、显式冲突、缺失条件或确定性冲突的 Claim 数 | 越低越好 |
+| `verified_claim_rate` | 最终报告中与证据 Claim 形成强确定性对齐的事实句 / 候选事实句 | 越高越好 |
+| `ambiguous_claims` | 已通过基础检查但词项重叠不足、建议进入语义复核的事实句数 | 用于诊断，不直接降级正文 |
+| `unsupported_claims` | 未找到对齐 Claim，或存在数字、否定、引用冲突的事实句数 | 应为 0 |
+
+这些指标会进入 `research_reflection_*`、`writer_started/writer_completed` 运行事件的 metadata；普通网页比例高本身不会自动把正文降级，而是与任务要求、交叉印证和冲突指标一起判断。
 
 短期建议将 `backend/tests/test_agent_platform_standardization.py` 作为 CI 基础用例；中期增加启动真实 FastAPI app 的 HTTP smoke；长期将端到端问答样例接入定期评测。
 
-详见 [下一步开发需求.md](./下一步开发需求.md)。
+文档与代码差距复核见 [入库实现方案审查.md](./入库实现方案审查.md)、[agent_development_guide.md](./agent_development_guide.md)（2026-07-03 已同步双轨入库与 Agent Runtime）。
+
+### 7.3 自研入库 / 召回回归脚本
+
+这些脚本不属于 HotpotQA/Paper KB 评测集，但用于验证 self_ingestion 的入库、Redis BM25、repair 与四库一致性：
+
+| 类型 | 命令 / 文件 | 覆盖点 |
+| :--- | :--- | :--- |
+| Schema 迁移验收 | `venv314/bin/python scripts/migrations/verify_self_ingestion_schema.py` | `knowledge_bases` 兼容列、`kb_self_ingest_jobs` / `kb_self_chunks`、废弃 MySQL 图谱/blocks 表清理 |
+| 抽取金样例 | `venv314/bin/python scripts/eval_self_extraction.py --mode llm` | Schema-aware LLM 抽取、JSON repair、质量门控、hydrogeology / nuclear_electronics 样例 |
+| 一致性巡检 | `venv314/bin/python scripts/check_self_ingestion_consistency.py` | MySQL / Milvus / Redis / Nebula 可见性与缺失索引检查 |
+| repair smoke | `venv314/bin/python scripts/repair_self_ingestion.py` | `partial_success` / `failed` job 从 `staging_uri` 重放 |
+| 重入库工具 | `venv314/bin/python scripts/reingest_self_kb.py`、`scripts/reingest_from_staging_payload.py` | self KB 重建、staging payload 重放 |
+| Milvus 可见性压测 | `venv314/bin/python scripts/benchmark_milvus_visibility.py` | `chunks_v2` visible 标记、delete+insert/upsert 一致性 |
+| Redis BM25 单测 | `venv314/bin/python -m pytest backend/tests/test_redis_bm25_index.py` | inverted postings、CJK ngram、scan/redisearch 回退 |
+| self 路由/repair 单测 | `venv314/bin/python -m pytest backend/tests/test_retrieval_pipeline_self_routing.py backend/tests/test_self_ingestion_repair_worker.py` | blocked 不回退 legacy、repair worker 与 retrieval backend 路由 |
 
 ---
 

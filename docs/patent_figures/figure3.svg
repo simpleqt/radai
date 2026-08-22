@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="760" viewBox="0 0 1100 760">
+  <defs><marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#000"/></marker></defs>
+  <rect width="1100" height="760" fill="#fff"/>
+  <g fill="#fff" stroke="#000" stroke-width="2">
+    <rect x="350" y="35" width="400" height="70"/>
+    <rect x="40" y="210" width="220" height="70"/><rect x="300" y="210" width="220" height="70"/>
+    <rect x="580" y="210" width="220" height="70"/><rect x="840" y="210" width="220" height="70"/>
+    <rect x="350" y="405" width="400" height="70"/><rect x="350" y="565" width="400" height="70"/>
+  </g>
+  <g font-family="sans-serif" font-size="21" text-anchor="middle" fill="#000">
+    <text x="550" y="77">301  直接检索服务检索表达</text>
+    <text x="150" y="252">302  实体向量召回</text><text x="410" y="252">303  关键词召回</text>
+    <text x="690" y="252">304  文本块向量召回</text><text x="950" y="252">305  知识图谱扩展召回</text>
+    <text x="550" y="447">306  候选知识单元池</text><text x="550" y="607">307  通道标记、去重与截断</text>
+  </g>
+  <g stroke="#000" stroke-width="2" fill="none">
+    <path d="M550 105 V150"/><path d="M150 150 H950"/>
+    <path d="M150 280 V350"/><path d="M410 280 V350"/><path d="M690 280 V350"/><path d="M950 280 V350"/>
+    <path d="M150 350 H950"/>
+  </g>
+  <g stroke="#000" stroke-width="2" fill="none" marker-end="url(#a)">
+    <path d="M150 150 V210"/><path d="M410 150 V210"/><path d="M690 150 V210"/><path d="M950 150 V210"/>
+    <path d="M550 350 V405"/><path d="M550 475 V565"/>
+  </g>
+</svg>

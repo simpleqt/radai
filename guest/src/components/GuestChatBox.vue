@@ -7,6 +7,7 @@ const props = defineProps({
   selectedKbs: { type: Array, default: () => [] },
   modelValue: { type: String, default: '' },
   searchEnabled: { type: Boolean, default: false },
+  searchLocked: { type: Boolean, default: false },
 });
 
 const emit = defineEmits([
@@ -15,6 +16,7 @@ const emit = defineEmits([
   'update:selectedKbs',
   'update:modelValue',
   'update:searchEnabled',
+  'search-locked-click',
 ]);
 
 const question = ref(props.modelValue);
@@ -22,7 +24,10 @@ const textareaRef = ref(null);
 const kbDropdownRef = ref(null);
 const kbMenuOpen = ref(false);
 
-const availableKbs = ref([]);
+const availableKbs = ref([
+  { id: 'c056bf59-6091-45ed-98cb-e2e860580a69', name: '核电子学库' },
+  { id: 'de4ccde7-b286-4e49-bd8c-9dd37bd61878', name: '期刊论文库' },
+]);
 
 watch(
   () => props.modelValue,
@@ -43,6 +48,10 @@ const toggleKbMenu = () => {
 
 const toggleSearch = () => {
   if (props.isBusy) return;
+  if (props.searchLocked) {
+    emit('search-locked-click');
+    return;
+  }
   emit('update:searchEnabled', !props.searchEnabled);
 };
 
@@ -133,7 +142,9 @@ watch(question, () => {
             :disabled="isBusy"
             @click="toggleSearch"
             class="inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 h-7 text-[11px] font-semibold transition-colors disabled:opacity-50 md:gap-2 md:px-3 md:h-8 md:text-[12px]"
-            :class="searchEnabled
+            :class="searchLocked
+              ? 'cursor-pointer border-slate-200 bg-slate-100 text-slate-300 grayscale dark:border-slate-800 dark:bg-slate-900 dark:text-slate-600'
+              : searchEnabled
               ? 'border-indigo-200 bg-indigo-50 text-indigo-700 dark:border-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300'
               : 'border-slate-200 bg-slate-50 text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400'"
           >
@@ -143,7 +154,7 @@ watch(question, () => {
               <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
             </svg>
             联网搜索
-            <span>{{ searchEnabled ? '开' : '关' }}</span>
+            <span>{{ searchLocked ? '需登录' : (searchEnabled ? '开' : '关') }}</span>
           </button>
 
           <!-- 知识库选择按钮 -->
@@ -164,9 +175,10 @@ watch(question, () => {
               知识库
               <span v-if="selectedKbs.length > 0">{{ selectedKbs.length }} 项</span>
             </button>
+            <Transition name="dropdown">
             <div
               v-if="kbMenuOpen"
-              class="absolute left-0 bottom-full mb-2 w-64 rounded-xl border border-slate-200 bg-white shadow-lg shadow-slate-200/50 dark:border-slate-700 dark:bg-slate-900 dark:shadow-slate-900/30 overflow-hidden z-50"
+              class="absolute left-0 bottom-full mb-2 w-64 origin-bottom-left rounded-xl border border-slate-200 bg-white shadow-lg shadow-slate-200/50 dark:border-slate-700 dark:bg-slate-900 dark:shadow-slate-900/30 overflow-hidden z-50"
             >
               <div class="px-4 py-2 bg-slate-50 text-xs font-semibold text-slate-500 border-b border-slate-200 dark:bg-slate-800/60 dark:border-slate-700 dark:text-slate-400">
                 知识库
@@ -187,31 +199,39 @@ watch(question, () => {
                 </button>
               </div>
             </div>
+            </Transition>
           </div>
         </div>
 
         <div class="flex shrink-0 items-center">
-          <button
-            v-if="isBusy"
-            type="button"
-            title="停止生成"
-            @click="emit('abort')"
-            class="p-1.5 md:p-2 rounded-lg md:rounded-xl bg-rose-500 text-white hover:bg-rose-600 transition-all duration-200 flex items-center justify-center shadow-md shadow-rose-200/50 dark:shadow-none active:scale-95 flex-shrink-0"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-              <rect x="5" y="5" width="14" height="14" rx="2"/>
-            </svg>
-          </button>
-          <button
-            v-else
-            @click="submit"
-            :disabled="!question.trim()"
-            class="p-1.5 md:p-2 rounded-lg md:rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 disabled:bg-slate-200 dark:disabled:bg-slate-700 disabled:text-slate-400 transition-all duration-300 flex items-center justify-center shadow-md shadow-indigo-200/50 dark:shadow-none active:scale-95 flex-shrink-0"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>
-            </svg>
-          </button>
+          <!-- 发送/停止按钮：同位叠放交叉切换，避免布局跳动 -->
+          <div class="relative size-8 flex-shrink-0 md:size-9">
+            <Transition name="btn-swap">
+              <button
+                v-if="isBusy"
+                key="stop"
+                type="button"
+                title="停止生成"
+                @click="emit('abort')"
+                class="absolute inset-0 rounded-lg md:rounded-xl bg-rose-500 text-white hover:bg-rose-600 transition-colors flex items-center justify-center shadow-md shadow-rose-200/50 dark:shadow-none active:scale-95"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="5" y="5" width="14" height="14" rx="2"/>
+                </svg>
+              </button>
+              <button
+                v-else
+                key="send"
+                @click="submit"
+                :disabled="!question.trim()"
+                class="absolute inset-0 rounded-lg md:rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 disabled:bg-slate-200 dark:disabled:bg-slate-700 disabled:text-slate-400 transition-colors flex items-center justify-center shadow-md shadow-indigo-200/50 dark:shadow-none enabled:active:scale-95"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>
+                </svg>
+              </button>
+            </Transition>
+          </div>
         </div>
       </div>
     </div>
@@ -225,6 +245,32 @@ watch(question, () => {
 .fade-enter-from, .fade-leave-to {
   opacity: 0;
   transform: translateY(4px);
+}
+
+/* 发送↔停止按钮交叉切换（两者均绝对定位于同一格） */
+.btn-swap-enter-active {
+  transition: transform 0.22s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.15s ease;
+}
+.btn-swap-leave-active {
+  transition: transform 0.15s ease, opacity 0.12s ease;
+}
+.btn-swap-enter-from,
+.btn-swap-leave-to {
+  opacity: 0;
+  transform: scale(0.5) rotate(-90deg);
+}
+
+/* 知识库下拉：自锚点浮起 */
+.dropdown-enter-active {
+  transition: opacity 0.15s ease, transform 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.dropdown-leave-active {
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.dropdown-enter-from,
+.dropdown-leave-to {
+  opacity: 0;
+  transform: translateY(6px) scale(0.98);
 }
 
 .scrollbar-none {

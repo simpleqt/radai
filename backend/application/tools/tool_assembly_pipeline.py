@@ -13,6 +13,7 @@ from backend.application.tools.assembler import (
     ToolAssemblyContext,
     tool_spec_metadata,
 )
+from backend.config.log_privacy import text_fingerprint
 from backend.config.loggers import get_logger
 from backend.core.skills.scoped_skills_provider import ScopedSkillsProvider
 from backend.core.skills.skill_runtime_state import has_loaded_skill
@@ -60,10 +61,12 @@ class ToolAssemblyPipeline:
         policy_tool_assembler: PolicyToolAssembler | None = None,
         tool_runtime_context: ToolRuntimeContext | None = None,
         enforce_skill_load: bool = True,
+        deep_retrieval: bool = False,
     ):
         self._model_name = model_name
         self._subagent_enabled = subagent_enabled
         self._use_search = use_search
+        self._deep_retrieval = bool(deep_retrieval)
         self._kb_ids = kb_ids if kb_ids is not None else []
         self._selected_skills = selected_skills
         self._skills_provider = skills_provider or ScopedSkillsProvider()
@@ -147,11 +150,11 @@ class ToolAssemblyPipeline:
                 and any((high_level_keywords, low_level_keywords, query_type))
             ):
                 logger.info(
-                    "[ToolAssembly] 检索查询保护: workflow=%s model_query=%s "
-                    "effective_query=%s model_hints_ignored=%s",
+                    "[ToolAssembly] 检索查询保护: workflow=%s model_query_meta=%s "
+                    "effective_query_meta=%s model_hints_ignored=%s",
                     workflow_name,
-                    model_query[:160],
-                    query[:240],
+                    text_fingerprint(model_query),
+                    text_fingerprint(query),
                     not allow_planned_hints
                     and bool(high_level_keywords or low_level_keywords or query_type),
                 )
@@ -163,9 +166,9 @@ class ToolAssemblyPipeline:
                     and not has_loaded_skill(required_skill)
                 ):
                     logger.warning(
-                        "[ToolAssembly] multi_kb_search 被拦截：skill 未加载，skill=%s query=%s",
+                        "[ToolAssembly] multi_kb_search 被拦截：skill 未加载，skill=%s query_meta=%s",
                         required_skill,
-                        query,
+                        text_fingerprint(query),
                     )
                     message = (
                         "You MUST call read_local_skill_file"
@@ -210,6 +213,7 @@ class ToolAssemblyPipeline:
                 external_ll_keywords=effective_ll_keywords,
                 external_query_type=effective_query_type,
                 max_result_chars=effective_max_result_chars,
+                deep_retrieval=self._deep_retrieval,
                 _structured=True,
             )
             if not isinstance(structured, dict):
@@ -444,6 +448,9 @@ class ToolAssemblyPipeline:
 
     def _apply_policy_metadata(self, tools_by_name: dict[str, BaseTool]) -> None:
         for tool_name, tool_item in list(tools_by_name.items()):
+            if tool_name in CONTROL_PLANE_TOOLS:
+                # Native skill control-plane tools are injected outside ToolRegistry.
+                continue
             try:
                 spec = self._policy_tool_assembler.get_spec(tool_name)
             except Exception:

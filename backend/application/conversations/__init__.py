@@ -1,11 +1,16 @@
 """Conversation application services."""
 
-from backend.application.conversations.conversation_store import (
+from backend.application.conversations.conversation_store import ConversationStore
+from backend.application.conversations.errors import (
     ConversationAgentMismatchError,
     ConversationBusyError,
     ConversationDeletedError,
     ConversationStateError,
-    ConversationStore,
+)
+from backend.application.conversations.local_catalog import (
+    ConversationRecord,
+    SQLiteConversationCatalog,
+    get_local_conversation_catalog,
 )
 from backend.application.conversations.session_memory import (
     ConversationMemoryStore,
@@ -21,6 +26,9 @@ __all__ = [
     "ConversationAgentMismatchError",
     "ConversationBusyError",
     "ConversationDeletedError",
+    "ConversationRecord",
+    "SQLiteConversationCatalog",
+    "get_local_conversation_catalog",
     "ConversationMemoryStore",
     "build_memory_from_summary",
     "default_agent_memory",

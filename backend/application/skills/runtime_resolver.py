@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.application.skills.access_service import SkillAccessService
+from backend.application.skills.domain_policy import skill_domain_matches
 from backend.db.crud.skill_crud import SkillCRUD
 from backend.db.models import User
 from backend.db.models.skill import ManagedSkill, SkillVersion
@@ -242,21 +243,11 @@ class SkillRuntimeResolver:
 
     @staticmethod
     def _domain_matches(skill_domain: str, agent_code: str, agent_domain: str) -> bool:
-        normalized = str(skill_domain or "").strip().lower()
-        generic = {
-            "general-table-analysis",
-            "html-ppt",
-            "deep-research",
-            "academic-search",
-            "excel-experiment-analysis",
-        }
-        return normalized in {
-            "*",
-            "general",
-            agent_code.lower(),
-            agent_domain.lower(),
-            *generic,
-        }
+        return skill_domain_matches(
+            skill_domain,
+            agent_code=agent_code,
+            agent_domain=agent_domain,
+        )
 
     @staticmethod
     def _dedupe(items: list[str]) -> list[str]:

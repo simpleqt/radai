@@ -8,13 +8,13 @@ from typing import Any
 from backend.application.policies.knowledge_base_access import KnowledgeBaseAccessPolicy
 from backend.domain.agents.profile import AgentProfile
 
-
 SUPPORTED_GUARDRAIL_POLICIES = frozenset(
     {
         "default",
         "csh_domain_scope",
         "ne_domain_scope",
         "groundwater_project_scope",
+        "university_audit_scope",
     }
 )
 
@@ -94,7 +94,12 @@ class ProfileRuntimePolicy:
                 "project_id": project_id,
                 "read_only": bool(domain_context.get("read_only", True)),
             }
-        if policy in {"csh_domain_scope", "ne_domain_scope", "default"}:
+        if policy in {
+            "csh_domain_scope",
+            "ne_domain_scope",
+            "university_audit_scope",
+            "default",
+        }:
             return {"authorized": True, "domain": profile.domain}
         raise ValueError(f"Unknown guardrail policy: {profile.guardrail_policy}")
 
@@ -112,6 +117,11 @@ class ProfileRuntimePolicy:
             ),
             "ne_domain_scope": "核电子学、辐射探测、核仪器及其直接相关任务",
             "groundwater_project_scope": "当前已授权地下水项目的数据与分析任务",
+            "university_audit_scope": (
+                "高校内部审计及其直接相关的治理、预算财务、科研经费、采购招标、"
+                "合同、工程建设、资产、人事薪酬、内部控制、风险与整改事项，以及"
+                "绑定审计知识库中可检索验证的制度和证据"
+            ),
             "default": profile.domain,
         }.get(policy)
         if scope is None:
@@ -131,6 +141,15 @@ class ProfileRuntimePolicy:
                 "案例和数值问题，必须先检索所选知识库；未检索不得以超出专业范围为由拒答。\n"
                 "- 只有在完成必要检索后，确认问题与上述业务范围及所选知识库内容均无关时，"
                 "才说明无法处理，并简要说明可处理范围。\n"
+            )
+        if policy == "university_audit_scope":
+            scope_decision_lines = (
+                "- 涉及制度条款、金额、日期、责任主体或审计发现时，必须先检索绑定的"
+                "审计知识库；不得凭常识补写条款号、文号、金额或违规结论。\n"
+                "- 必须区分制度要求、材料证据、审计发现与专业判断；证据不足时明确列出"
+                "缺口并建议人工复核，不得替代审计人员作最终定性或处理决定。\n"
+                "- 对包含个人信息、财务信息或未公开审计材料的问题坚持最小必要披露。\n"
+                "- 只有完成必要检索后确认与高校审计及绑定知识库均无关，才说明无法处理。\n"
             )
         return (
             "\n<runtime_guardrail_policy>\n"

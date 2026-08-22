@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from backend.application.skills.domain_policy import skill_domain_matches
 from backend.application.skills.manifest_loader import SkillManifestLoader
 from backend.application.skills.runtime_resolver import SkillRuntimeError
 from backend.application.tools.registry import ToolRegistry
@@ -167,13 +168,11 @@ class UnmanagedSkillClosureResolver:
 
     @staticmethod
     def _domain_matches(manifest: SkillManifest, profile: AgentProfile) -> bool:
-        domain = str(manifest.domain or "").strip().lower()
-        return domain in {
-            "*",
-            "general",
-            profile.code.strip().lower(),
-            profile.domain.strip().lower(),
-        }
+        return skill_domain_matches(
+            manifest.domain,
+            agent_code=profile.code,
+            agent_domain=profile.domain,
+        )
 
     @staticmethod
     def _dedupe(items: Iterable[str]) -> list[str]:

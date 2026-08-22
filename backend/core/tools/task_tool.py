@@ -47,6 +47,7 @@ from backend.core.skills.skill_runtime_state import (
     set_request_skill_state,
 )
 from backend.core.tools.request_limits import get_subagent_execution_budget
+from backend.core.utils.async_tasks import close_async_iterator_safely
 from backend.domain.agents.runtime_agent import RuntimeAgentSpec
 from backend.domain.tools.runtime_context import ToolRuntimeContext
 
@@ -293,18 +294,30 @@ async def _run_subagent(
     )
 
     context_policy = context_policy or ContextPolicy.from_env(effective_model_name)
-    extra_middleware = [
-        ContextPruningMiddleware(
-            thread_id=f"{thread_id or task_id}:subagent:{task_id}",
-            model_name=effective_model_name,
-            user_id=(
-                str(tool_runtime_context.user_id or "").strip()
-                if tool_runtime_context is not None
-                else None
-            ),
-            policy=context_policy,
-            checkpointer=checkpointer,
+    context_pruning = ContextPruningMiddleware(
+        thread_id=f"{thread_id or task_id}:subagent:{task_id}",
+        model_name=effective_model_name,
+        user_id=(
+            str(tool_runtime_context.user_id or "").strip()
+            if tool_runtime_context is not None
+            else None
         ),
+        # Install the child ledger under the sub-agent's own scope key (set on
+        # the runtime context below). Without it the child ledger was only
+        # reachable through the ContextVar while the child's scoped
+        # context_read looked up the parent's request_id and resolved the
+        # parent ledger, so every child-retrieved sid failed as not granted.
+        request_id=(
+            str(getattr(tool_runtime_context, "context_scope_id", "") or "")
+            if tool_runtime_context is not None
+            else None
+        )
+        or None,
+        policy=context_policy,
+        checkpointer=checkpointer,
+    )
+    extra_middleware = [
+        context_pruning,
         ModelTurnLimitMiddleware(max_turns),
     ]
     graph = create_agent_graph(
@@ -368,44 +381,71 @@ async def _run_subagent(
     latest_message = ""
     message_index = 0
 
+    async def _stream_subagent_events():
+        """Stream the subagent graph inside its capability-ledger scope."""
+
+        if context_pruning is not None:
+            with context_pruning.capability_scope():
+                async for event in graph.astream_events(
+                    {"messages": [{"role": "user", "content": prompt}]},
+                    config=invoke_config,
+                    version="v2",
+                    stream_mode=["messages", "custom", "updates", "tasks"],
+                ):
+                    yield event
+        else:
+            async for event in graph.astream_events(
+                {"messages": [{"role": "user", "content": prompt}]},
+                config=invoke_config,
+                version="v2",
+                stream_mode=["messages", "custom", "updates", "tasks"],
+            ):
+                yield event
+
     async def _consume_events() -> str:
         nonlocal latest_message, message_index
         if cancellation_token is not None:
             cancellation_token.raise_if_cancelled()
-        async for event in graph.astream_events(
-            {"messages": [{"role": "user", "content": prompt}]},
-            config=invoke_config,
-            version="v2",
-            stream_mode=["messages", "custom", "updates", "tasks"],
-        ):
-            if cancellation_token is not None:
-                cancellation_token.raise_if_cancelled()
-            kind = event.get("event")
-            data = event.get("data", {}) or {}
-            if kind == "on_chat_model_stream":
-                chunk_text = _extract_chunk_text(data.get("chunk"))
-                if chunk_text:
-                    answer_fragments.append(chunk_text)
-            elif kind == "on_chat_model_end":
-                final_text = extract_chat_model_output_text(data.get("output")).strip()
-                candidate = final_text or "".join(answer_fragments).strip()
-                if candidate and candidate != latest_message:
-                    latest_message = candidate
-                    message_index += 1
-                    _emit_task_event(
-                        writer,
-                        {
-                            "type": "task_running",
-                            "task_id": task_id,
-                            "description": description,
-                            "subagent_type": subagent_cfg.name,
-                            "trace_id": trace_id,
-                            "message_index": message_index,
-                            "total_messages": message_index,
-                            "message_text": _trim_text(candidate, 800),
-                        },
-                    )
-                answer_fragments.clear()
+        # 显式持有生成器,放弃路径统一 aclose:循环体内 raise_if_cancelled
+        # 抛出时生成器停在 yield 点被整体遗弃,capability_scope 的退出与
+        # astream_events 的内部收尾(run manager/子图任务)都不会执行,只能
+        # 等 GC 在不确定的时点 finalize(还可能落在已死循环上)。
+        stream = _stream_subagent_events()
+        try:
+            async for event in stream:
+                if cancellation_token is not None:
+                    cancellation_token.raise_if_cancelled()
+                kind = event.get("event")
+                data = event.get("data", {}) or {}
+                if kind == "on_chat_model_stream":
+                    chunk_text = _extract_chunk_text(data.get("chunk"))
+                    if chunk_text:
+                        answer_fragments.append(chunk_text)
+                elif kind == "on_chat_model_end":
+                    final_text = extract_chat_model_output_text(
+                        data.get("output")
+                    ).strip()
+                    candidate = final_text or "".join(answer_fragments).strip()
+                    if candidate and candidate != latest_message:
+                        latest_message = candidate
+                        message_index += 1
+                        _emit_task_event(
+                            writer,
+                            {
+                                "type": "task_running",
+                                "task_id": task_id,
+                                "description": description,
+                                "subagent_type": subagent_cfg.name,
+                                "trace_id": trace_id,
+                                "message_index": message_index,
+                                "total_messages": message_index,
+                                "message_text": _trim_text(candidate, 800),
+                            },
+                        )
+                    answer_fragments.clear()
+        finally:
+            with suppress(Exception, asyncio.CancelledError):
+                await close_async_iterator_safely(stream, timeout=2.0)
         return latest_message or "".join(answer_fragments).strip()
 
     async def _consume_with_cancellation() -> str:
@@ -537,8 +577,14 @@ async def task_tool(
         )
     tool_runtime_context = None
     if domain and tool_policy and thread_id:
+        # The child graph's ContextPruningMiddleware installs its capability
+        # ledger under this derived scope key, and the child's scoped tools
+        # (context_read) look it up by the same key. It must match the
+        # middleware thread expression in _run_subagent.
+        subagent_scope_thread = f"{thread_id or task_id}:subagent:{task_id}"
+        parent_request_id = str(configurable.get("request_id") or "")
         tool_runtime_context = ToolRuntimeContext(
-            request_id=str(configurable.get("request_id") or ""),
+            request_id=parent_request_id,
             user_id=str(configurable.get("user_id") or ""),
             agent_code=str(configurable.get("agent_code") or ""),
             domain=domain,
@@ -548,6 +594,7 @@ async def task_tool(
             time_context=str(configurable.get("time_context") or ""),
             request_metadata=dict(request_metadata),
             domain_context=dict(domain_context),
+            context_scope_id=f"{parent_request_id}::{subagent_scope_thread}",
         )
 
     try:

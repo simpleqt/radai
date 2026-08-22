@@ -12,9 +12,27 @@ const topics = ref<ExploreTopic[]>([]);
 const loadingTopics = ref(false);
 const mounted = ref(false);
 const hoveredIndex = ref<number | null>(null);
+const viewportWidth = ref(0);
+const viewportHeight = ref(0);
 
 const parallaxX = ref(0);
 const parallaxY = ref(0);
+
+const isCompactViewport = computed(() => viewportWidth.value < 1360 || viewportHeight.value < 760);
+const isVeryCompactViewport = computed(() => viewportWidth.value < 1100 || viewportHeight.value < 700);
+const visibleTopics = computed(() => (
+  isVeryCompactViewport.value
+    ? topics.value.slice(0, 6)
+    : isCompactViewport.value
+      ? topics.value.slice(0, 10)
+      : topics.value
+));
+
+function updateViewport() {
+  if (typeof window === 'undefined') return;
+  viewportWidth.value = window.innerWidth;
+  viewportHeight.value = window.innerHeight;
+}
 
 function handleMouseMove(e: MouseEvent) {
   const { clientWidth, clientHeight } = document.documentElement;
@@ -45,26 +63,67 @@ const stars = computed(() => {
 });
 
 const positions = computed(() => {
-  if (topics.value.length === 0) return [];
+  const layoutTopics = visibleTopics.value;
+  if (layoutTopics.length === 0) return [];
   
+  // 磨砂卡片的核心包围边界及安全间距
+  const cardLeft = isCompactViewport.value ? 28 : 26;
+  const cardRight = isCompactViewport.value ? 72 : 74;
+  const cardTop = isCompactViewport.value ? 26 : 24;
+  const cardBottom = isCompactViewport.value ? 74 : 76;
+  const minX = isCompactViewport.value ? 13 : 6;
+  const maxX = isCompactViewport.value ? 87 : 94;
+  const minY = isCompactViewport.value ? 12 : 10;
+  const maxY = isCompactViewport.value ? 88 : 90;
+
+  // 将节点投影到带安全边界的卡片区域之外
+  const projectOutsideCard = (x: number, y: number, w: number, h: number) => {
+    // 增加适当的安全边界，保证文字气泡绝对不遮挡卡片
+    const padX = w / 2 + 2.5;
+    const padY = h / 2 + 2.0;
+    const L = cardLeft - padX;
+    const R = cardRight + padX;
+    const T = cardTop - padY;
+    const B = cardBottom + padY;
+    
+    if (x > L && x < R && y > T && y < B) {
+      const dx = x - 50 || 0.1;
+      const dy = y - 50 || 0.1;
+      
+      // 计算沿射线的缩放比例使其落在外包围盒边缘
+      const k_x = dx > 0 ? (R - 50) / dx : (L - 50) / dx;
+      const k_y = dy > 0 ? (B - 50) / dy : (T - 50) / dy;
+      const k = Math.min(k_x, k_y);
+      
+      return {
+        x: 50 + k * dx,
+        y: 50 + k * dy
+      };
+    }
+    return { x, y };
+  };
+
   // 1. 初始化节点位置 (使用黄金角螺旋线作为基础分布)
-  const nodes = topics.value.map((topic, i) => {
-    const angle = i * 2.399963;
-    const radius = 0.55 + hash(i) * 0.30;
-    const left = 50 + Math.cos(angle) * radius * 40 + (hash(i + 7) - 0.5) * 3;
-    const top = 50 + Math.sin(angle) * radius * 35 + (hash(i + 13) - 0.5) * 3;
+  const nodes = layoutTopics.map((topic, i) => {
+    const angle = i * 2.399963 - 0.4;
+    const radius = 0.72 + hash(i) * 0.22;
+    const left = 50 + Math.cos(angle) * radius * 46 + (hash(i + 7) - 0.5) * 2.4;
+    const top = 50 + Math.sin(angle) * radius * 39 + (hash(i + 13) - 0.5) * 2.4;
     
     // 估算节点的百分比宽度和高度
     const textLen = topic.title.length;
-    const w = Math.max(9, textLen * 0.65 + 5.5);
-    const h = 4.8;
+    const w = Math.max(11, textLen * 0.72 + 7.2);
+    const h = 5.7;
+    
+    // 初始位置即确保投影在卡片外
+    const projected = projectOutsideCard(left, top, w, h);
     
     return {
       id: topic.id,
-      x: left,
-      y: top,
-      origX: left,
-      origY: top,
+      x: projected.x,
+      y: projected.y,
+      origX: projected.x,
+      origY: projected.y,
       w,
       h,
       size: hash(i + 3) > 0.65 ? 'lg' as const : 'md' as const,
@@ -74,6 +133,7 @@ const positions = computed(() => {
   // 2. 迭代碰撞松弛 (物理排斥算法解决重叠)
   const ticks = 80;
   for (let t = 0; t < ticks; t++) {
+    // A. 节点与节点之间的相互排斥
     for (let i = 0; i < nodes.length; i++) {
       const u = nodes[i];
       for (let j = i + 1; j < nodes.length; j++) {
@@ -100,26 +160,37 @@ const positions = computed(() => {
       }
     }
     
-    const cardLeft = 28, cardRight = 72, cardTop = 22, cardBottom = 78;
-    
+    // B. 对中央卡片的碰撞排斥（防止节点被其他节点挤进卡片内部）
     for (let i = 0; i < nodes.length; i++) {
       const u = nodes[i];
-      if (u.x > cardLeft && u.x < cardRight && u.y > cardTop && u.y < cardBottom) {
-        const dx = u.x - 50 || 0.1;
-        const dy = u.y - 50 || 0.1;
-        const dist = Math.hypot(dx, dy * 1.1) || 0.1;
-        u.x += (dx / dist) * 0.25;
-        u.y += (dy / dist) * 0.25;
+      const projected = projectOutsideCard(u.x, u.y, u.w, u.h);
+      if (projected.x !== u.x || projected.y !== u.y) {
+        // 向安全投影位置移动
+        u.x += (projected.x - u.x) * 0.35;
+        u.y += (projected.y - u.y) * 0.35;
       }
       
+      // C. 引力机制：向各自的安全初始位置靠拢，维持星系形态
       const dOrigX = u.origX - u.x;
       const dOrigY = u.origY - u.y;
       u.x += dOrigX * 0.08;
       u.y += dOrigY * 0.08;
       
-      u.x = Math.min(93, Math.max(7, u.x));
-      u.y = Math.min(90, Math.max(10, u.y));
+      // D. 视口边界限位约束
+      u.x = Math.min(maxX, Math.max(minX, u.x));
+      u.y = Math.min(maxY, Math.max(minY, u.y));
     }
+  }
+  
+  // 3. 最终强制校正，100% 杜绝因迭代残留导致任何细微遮挡
+  for (let i = 0; i < nodes.length; i++) {
+    const u = nodes[i];
+    const projected = projectOutsideCard(u.x, u.y, u.w, u.h);
+    u.x = projected.x;
+    u.y = projected.y;
+    
+    u.x = Math.min(maxX, Math.max(minX, u.x));
+    u.y = Math.min(maxY, Math.max(minY, u.y));
   }
   
   return nodes.map((n, i) => ({
@@ -132,12 +203,18 @@ const positions = computed(() => {
 
 
 
-const featuredTopics = computed(() => topics.value.slice(0, 4));
+const featuredTopics = computed(() => (
+  isVeryCompactViewport.value
+    ? topics.value.slice(0, 3)
+    : isCompactViewport.value
+      ? topics.value.slice(0, 4)
+      : topics.value.slice(0, 5)
+));
 
 // 输入框占位提示基于已加载的预制主题动态生成，自动适配不同学科
 const placeholder = computed(() => {
   const examples = topics.value.slice(0, 2).map((t) => t.title).join('、');
-  return examples ? `例如：${examples}…` : '输入你想探究的主题…';
+  return examples ? `例如：${examples}…` : '输入或选择学习主题…';
 });
 
 async function loadTopics() {
@@ -164,20 +241,23 @@ function pick(topic: ExploreTopic) {
 }
 
 onMounted(async () => {
+  updateViewport();
   await loadTopics();
   requestAnimationFrame(() => { mounted.value = true; });
   window.addEventListener('mousemove', handleMouseMove);
+  window.addEventListener('resize', updateViewport);
 });
 
 onUnmounted(() => {
   window.removeEventListener('mousemove', handleMouseMove);
+  window.removeEventListener('resize', updateViewport);
 });
 
 defineExpose({ loadTopics });
 </script>
 
 <template>
-  <div class="galaxy relative w-full h-full overflow-hidden bg-slate-50 dark:bg-[#080b13]">
+  <div class="galaxy relative w-full h-full overflow-hidden bg-surface-sunken dark:bg-[#080b13]">
     <!-- 背景氛围 (带鼠标 3D 视差偏移) -->
     <div
       class="galaxy-bg absolute inset-0 pointer-events-none transition-transform duration-500 ease-out"
@@ -197,7 +277,7 @@ defineExpose({ loadTopics });
       <span
         v-for="(star, idx) in stars"
         :key="idx"
-        class="absolute rounded-full bg-indigo-200 dark:bg-indigo-300 opacity-0 animate-twinkle"
+        class="absolute rounded-full bg-accent opacity-0 animate-twinkle"
         :style="{
           left: `${star.left}%`,
           top: `${star.top}%`,
@@ -221,12 +301,14 @@ defineExpose({ loadTopics });
       class="galaxy-orbit galaxy-orbit--3 absolute pointer-events-none transition-transform duration-500 ease-out"
       :style="{ transform: `translate(-50%, -50%) translate3d(${parallaxX * 0.1}px, ${parallaxY * 0.1}px, 0)` }"
     />
+    <div class="galaxy-orbit galaxy-orbit--4 absolute pointer-events-none transition-transform duration-500 ease-out" />
+    <div class="galaxy-dots absolute pointer-events-none" />
     <div class="galaxy-hub absolute pointer-events-none" />
 
     <!-- 主题节点 (强制使用 100% 全屏无 padding 绝对定位容器，与背景绝对契合) -->
-    <div class="absolute inset-0 w-full h-full pointer-events-none" style="left: 0 !important; top: 0 !important;">
+    <div class="absolute inset-0 hidden w-full h-full pointer-events-none md:block" style="left: 0 !important; top: 0 !important;">
       <div
-        v-for="(t, i) in topics"
+        v-for="(t, i) in visibleTopics"
         :key="t.id"
         class="absolute pointer-events-auto -translate-x-1/2 -translate-y-1/2 galaxy-node"
         :class="mounted ? 'galaxy-node--in' : ''"
@@ -243,27 +325,26 @@ defineExpose({ loadTopics });
     </div>
 
     <!-- 中央探索区 -->
-    <div class="absolute inset-0 flex items-center justify-center px-4 pointer-events-none">
+    <div class="absolute inset-0 flex items-center justify-center px-4 py-4 pointer-events-none sm:px-6">
       <div
-        class="relative z-10 w-full max-w-xl pointer-events-auto galaxy-hero"
+        class="relative z-10 w-full max-w-[min(640px,calc(100vw-2rem))] pointer-events-auto galaxy-hero xl:max-w-[720px]"
         :class="mounted ? 'galaxy-hero--in' : ''"
       >
-        <!-- 高端磨砂玻璃拟态卡片 (半透明融合背景，拒绝突兀白框) -->
-        <div class="rounded-3xl border border-white/20 dark:border-white/10 bg-white/25 dark:bg-slate-950/35 backdrop-blur-3xl shadow-[0_20px_60px_rgba(99,102,241,0.04)] dark:shadow-[0_30px_70px_rgba(0,0,0,0.6)] px-6 py-8 md:px-9 md:py-9 transition-all duration-500 hover:border-white/35 dark:hover:border-white/15">
-          <div class="flex items-center justify-center mb-5 animate-pulse-slow">
-            <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold tracking-wide text-indigo-600 dark:text-indigo-400 bg-indigo-50/60 dark:bg-indigo-500/10 border border-indigo-100/50 dark:border-indigo-500/20 shadow-sm">
+        <div class="rounded-[28px] border border-border-subtle bg-surface/82 px-5 py-6 backdrop-blur-3xl transition-all duration-500 hover:border-accent/30 md:px-8 md:py-7 xl:rounded-[32px] xl:px-11 xl:py-10 dark:border-white/10">
+          <div class="mb-4 flex items-center justify-center xl:mb-5">
+            <span class="inline-flex items-center gap-1.5 rounded-full border border-accent/30 bg-accent-soft px-3.5 py-1.5 text-[12px] font-semibold tracking-wide text-accent shadow-sm">
               <Sparkles class="w-3.5 h-3.5" />
-              探索式学习
+              AI 探索引擎
             </span>
           </div>
 
-          <h1 class="text-center text-2xl md:text-[2rem] leading-snug font-extrabold text-slate-800 dark:text-slate-100 mb-3 tracking-tight">
+          <h1 class="text-center text-3xl font-extrabold leading-tight text-text-primary md:text-4xl xl:text-[42px]">
             开启你的
-            <span class="bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 bg-clip-text text-transparent animate-shimmer bg-[length:200%_auto]">知识探索</span>
+            <span class="bg-accent bg-clip-text text-transparent animate-shimmer bg-[length:200%_auto]">探索式学习</span>
             之旅
           </h1>
-          <p class="text-center text-[13px] md:text-sm leading-relaxed text-slate-600/90 dark:text-slate-400 max-w-sm mx-auto mb-7">
-            输入或点选主题，AI 将构建知识图谱、逐级拆解概念，并生成详解与配套练习。
+          <p class="mx-auto mb-5 mt-3 max-w-[520px] text-center text-sm leading-6 text-text-secondary md:text-[15px] xl:mb-8 xl:leading-7">
+            输入或选择主题，AI 将为你生成知识图谱、深度解析与关联内容，并生成针对性练习，助你系统掌握。
           </p>
 
           <div class="relative group">
@@ -271,38 +352,38 @@ defineExpose({ loadTopics });
               v-model="input"
               type="text"
               :placeholder="placeholder"
-              class="w-full pl-5 pr-16 py-4 rounded-2xl text-sm text-slate-800 dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 bg-white/40 dark:bg-slate-950/40 border border-white/30 dark:border-slate-800/60 focus:outline-none focus:border-indigo-500 focus:bg-white/70 dark:focus:bg-slate-950/60 focus:ring-4 focus:ring-indigo-500/10 dark:focus:ring-indigo-500/5 transition-all shadow-inner"
+              class="h-14 w-full rounded-2xl border border-accent/30 bg-surface/88 pl-5 pr-16 text-[14px] text-text-primary transition-all placeholder:text-text-tertiary focus:border-accent focus:bg-surface focus:outline-none focus:ring-4 focus:ring-accent/10 xl:h-16 xl:pl-6 xl:pr-20 xl:text-[15px] dark:border-white/10"
               @keydown.enter="submit"
             />
             <button
               type="button"
-              class="absolute right-2 top-1/2 -translate-y-1/2 w-11 h-11 rounded-xl flex items-center justify-center text-white bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-600 hover:to-purple-700 shadow-md shadow-indigo-200/40 dark:shadow-none transition-all duration-300 active:scale-95 hover:scale-[1.03]"
+              class="absolute right-2 top-1/2 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-2xl bg-accent text-accent-fg transition-colors hover:bg-accent-hover active:scale-95 xl:right-2.5 xl:h-12 xl:w-12"
               @click="submit"
             >
-              <Search class="w-4.5 h-4.5" />
+              <Search class="h-5 w-5" />
             </button>
           </div>
 
-          <div v-if="featuredTopics.length" class="mt-6">
-            <p class="text-[11px] font-semibold text-slate-400 dark:text-slate-500 mb-3 text-center tracking-wider uppercase">热门探索</p>
+          <div v-if="featuredTopics.length" class="mt-5 xl:mt-6">
+            <p class="mb-3 text-center text-[12px] font-semibold text-text-secondary">热门探索</p>
             <div class="flex flex-wrap items-center justify-center gap-2">
               <button
                 v-for="t in featuredTopics"
                 :key="t.id"
                 type="button"
-                class="inline-flex items-center gap-1 px-3.5 py-1.5 rounded-full text-[12px] font-medium text-slate-600 dark:text-slate-300 bg-white/45 dark:bg-slate-950/30 border border-white/30 dark:border-slate-800/50 hover:border-indigo-400 dark:hover:border-indigo-500/50 hover:bg-white/60 dark:hover:bg-slate-950/50 hover:text-indigo-600 dark:hover:text-indigo-300 transition-all duration-300 hover:scale-[1.03] active:scale-[0.97]"
+                class="inline-flex max-w-[170px] items-center gap-1.5 rounded-full border border-border-subtle bg-surface/70 px-3 py-1.5 text-[12px] font-semibold text-text-secondary shadow-sm transition-all duration-300 hover:scale-[1.03] hover:border-accent/30 hover:bg-surface hover:text-accent active:scale-[0.97] xl:max-w-[190px] xl:px-3.5 xl:py-2 dark:border-white/10 dark:bg-white/5"
                 @click="pick(t)"
               >
-                {{ t.title }}
-                <ArrowRight class="w-3 h-3 opacity-60 group-hover:translate-x-0.5 transition-transform" />
+                <span class="truncate">{{ t.title }}</span>
+                <ArrowRight class="h-3 w-3 shrink-0 opacity-60 transition-transform group-hover:translate-x-0.5" />
               </button>
             </div>
           </div>
 
-          <div class="mt-6 flex items-center justify-center">
+          <div class="mt-4 flex items-center justify-center xl:mt-5">
             <button
               type="button"
-              class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold text-slate-500 dark:text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 transition-all duration-300"
+              class="inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold text-text-secondary transition-all duration-300 hover:bg-accent-soft hover:text-accent disabled:cursor-wait disabled:opacity-70"
               :disabled="loadingTopics"
               @click="loadTopics"
             >
@@ -320,9 +401,10 @@ defineExpose({ loadTopics });
 <style scoped>
 .galaxy-bg {
   background:
-    radial-gradient(ellipse 70% 55% at 50% -5%, rgba(99, 102, 241, 0.15), transparent 55%),
-    radial-gradient(ellipse 50% 45% at 90% 90%, rgba(139, 92, 246, 0.08), transparent 50%),
-    radial-gradient(ellipse 40% 40% at 5% 70%, rgba(59, 130, 246, 0.06), transparent 45%);
+    radial-gradient(ellipse 72% 58% at 50% 48%, rgba(139, 92, 246, 0.20), transparent 62%),
+    radial-gradient(ellipse 42% 36% at 8% 18%, rgba(59, 130, 246, 0.09), transparent 58%),
+    radial-gradient(ellipse 38% 34% at 92% 82%, rgba(217, 70, 239, 0.10), transparent 56%),
+    linear-gradient(180deg, #fbfbff 0%, #f4f0ff 54%, #fafbff 100%);
 }
 :global(.dark) .galaxy-bg {
   background:
@@ -333,15 +415,15 @@ defineExpose({ loadTopics });
 
 .galaxy-mesh {
   background-image:
-    radial-gradient(at 20% 30%, rgba(99, 102, 241, 0.08) 0, transparent 50%),
-    radial-gradient(at 80% 20%, rgba(139, 92, 246, 0.07) 0, transparent 45%),
-    radial-gradient(at 60% 80%, rgba(79, 70, 229, 0.05) 0, transparent 40%);
+    radial-gradient(at 18% 32%, rgba(99, 102, 241, 0.12) 0, transparent 44%),
+    radial-gradient(at 82% 25%, rgba(139, 92, 246, 0.11) 0, transparent 40%),
+    radial-gradient(at 60% 86%, rgba(56, 189, 248, 0.08) 0, transparent 44%);
 }
 
 .galaxy-grid {
-  background-image: radial-gradient(circle, rgba(99, 102, 241, 0.08) 1px, transparent 1px);
-  background-size: 32px 32px;
-  mask-image: radial-gradient(ellipse 75% 75% at 50% 50%, black 20%, transparent 75%);
+  background-image: radial-gradient(circle, rgba(124, 58, 237, 0.13) 1px, transparent 1px);
+  background-size: 18px 18px;
+  mask-image: radial-gradient(ellipse 43% 38% at 50% 53%, black 10%, transparent 75%);
 }
 :global(.dark) .galaxy-grid {
   background-image: radial-gradient(circle, rgba(129, 140, 248, 0.09) 1px, transparent 1px);
@@ -372,24 +454,42 @@ defineExpose({ loadTopics });
   left: 50%;
   top: 50%;
   border-radius: 50%;
-  border: 1px solid rgba(99, 102, 241, 0.09);
+  border: 1px solid rgba(255, 255, 255, 0.76);
+  box-shadow: 0 0 0 1px rgba(124, 58, 237, 0.035), inset 0 0 24px rgba(255, 255, 255, 0.26);
   transition: all 0.5s ease-out;
 }
 :global(.dark) .galaxy-orbit {
   border-color: rgba(129, 140, 248, 0.13);
 }
-.galaxy-orbit--1 { width: min(480px, 68vw); height: min(480px, 68vw); opacity: 0.7; }
-.galaxy-orbit--2 { width: min(680px, 88vw); height: min(680px, 88vw); opacity: 0.45; }
-.galaxy-orbit--3 { width: min(860px, 105vw); height: min(860px, 105vw); opacity: 0.22; }
+.galaxy-orbit--1 { width: min(560px, 70vw); height: min(360px, 45vw); opacity: 0.86; }
+.galaxy-orbit--2 { width: min(820px, 92vw); height: min(520px, 58vw); opacity: 0.66; }
+.galaxy-orbit--3 { width: min(1060px, 112vw); height: min(660px, 70vw); opacity: 0.46; }
+.galaxy-orbit--4 { left: 50%; top: 50%; width: min(1260px, 128vw); height: min(760px, 82vw); transform: translate(-50%, -50%); opacity: 0.30; }
+
+.galaxy-dots {
+  left: 50%;
+  top: 50%;
+  width: min(1120px, 118vw);
+  height: min(680px, 78vw);
+  transform: translate(-50%, -50%);
+  background:
+    radial-gradient(circle at 18% 50%, rgba(124, 58, 237, 0.42) 0 3px, transparent 4px),
+    radial-gradient(circle at 32% 18%, rgba(124, 58, 237, 0.34) 0 3px, transparent 4px),
+    radial-gradient(circle at 66% 84%, rgba(124, 58, 237, 0.32) 0 3px, transparent 4px),
+    radial-gradient(circle at 85% 52%, rgba(255, 255, 255, 0.88) 0 4px, transparent 5px),
+    radial-gradient(circle at 50% 90%, rgba(255, 255, 255, 0.86) 0 4px, transparent 5px);
+  filter: drop-shadow(0 5px 10px rgba(124, 58, 237, 0.16));
+}
 
 .galaxy-hub {
   left: 50%;
   top: 50%;
-  width: 380px;
-  height: 380px;
+  width: min(760px, 72vw);
+  height: min(460px, 52vw);
   transform: translate(-50%, -50%);
-  background: radial-gradient(circle, rgba(99, 102, 241, 0.09) 0%, transparent 70%);
-  filter: blur(28px);
+  background:
+    radial-gradient(ellipse at center, rgba(139, 92, 246, 0.20) 0%, rgba(139, 92, 246, 0.10) 36%, transparent 72%);
+  filter: blur(18px);
 }
 
 .galaxy-lines {

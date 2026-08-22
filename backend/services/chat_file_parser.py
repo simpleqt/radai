@@ -27,6 +27,16 @@ from backend.config.loggers import get_logger
 
 logger = get_logger(__name__)
 
+
+def _mineru_error_message(exc: BaseException) -> str:
+    """MinerU 解析失败的用户可见文案（原始异常只进日志）。"""
+    text = str(exc or "").lower()
+    if "timeout" in text or "timed out" in text:
+        return "解析服务超时，请稍后重试"
+    if any(key in text for key in ("connection", "connect", "refused", "unreachable")):
+        return "解析服务暂不可用，请稍后重试"
+    return "文件解析失败，请检查文件是否损坏或格式受支持"
+
 # ── 文件类型常量 ─────────────────────────────────────────
 
 MULTIMODAL_EXTENSIONS: set[str] = {
@@ -475,11 +485,15 @@ class ChatFileParser:
                 await ocr.close()
 
         except Exception as e:
-            logger.error("[ChatFileParser] MinerU 解析异常: %s, error=%s", filename, e)
+            logger.error(
+                "[ChatFileParser] MinerU 解析异常: %s, error=%s", filename, e
+            )
+            # str(e) 可携带连接错误串/上游 URL/内部组件名，直达终端用户；
+            # 原始异常只进日志，用户侧给固定分类文案。
             return ParseResult(
                 category="failed",
                 method="mineru",
-                error=str(e),
+                error=_mineru_error_message(e),
             )
         finally:
             if tmp_path and await asyncio.to_thread(os.path.exists, tmp_path):
@@ -623,15 +637,20 @@ class ChatFileParser:
                             )
                             img_idx += 1
                             continue
-                        if img_path and os.path.exists(img_path):
+                        # img_path 来自外部 OCR 服务响应,直接当本地路径读取会
+                        # 构成"响应可注入 → 任意本地文件读取并上传到用户可见
+                        # 前缀"的通道(R4-SV-10)。仅当显式配置了 MinerU 本地
+                        # 输出根目录且路径解析后落在其内时才读取;未配置时跳过
+                        # (跨机部署本就不该出现可读的本地路径)。
+                        local_image = _resolve_local_mineru_image(str(img_path)) if img_path else None
+                        if local_image is not None:
                             try:
-                                with open(img_path, 'rb') as f:
-                                    img_data = f.read()
+                                img_data = local_image.read_bytes()
                                 if len(img_data) >= 100:
                                     ct = _detect_image_content_type(img_data)
                                     images.append(ExtractedImage(
                                         data=img_data,
-                                        name=os.path.basename(img_path),
+                                        name=os.path.basename(str(img_path)),
                                         caption=caption,
                                         content_type=ct,
                                     ))
@@ -815,6 +834,30 @@ def compress_image_if_needed(img: ExtractedImage) -> ExtractedImage:
 
 # ── 图片 MIME 类型检测 ──────────────────────────────────
 
+def _resolve_local_mineru_image(img_path: str) -> Path | None:
+    """把 MinerU 响应中的本地图片路径限定在配置的输出根目录内。
+
+    根目录经 ``MINERU_LOCAL_IMAGE_ROOT`` 配置;未配置时一律拒绝本地路径
+    (R4-SV-10:外部服务响应不可信,不能凭它读任意本地文件)。
+    """
+    raw_root = (os.getenv("MINERU_LOCAL_IMAGE_ROOT") or "").strip()
+    if not raw_root or not img_path:
+        return None
+    try:
+        root = Path(raw_root).resolve()
+        candidate = Path(img_path).resolve()
+        candidate.relative_to(root)
+    except (ValueError, OSError):
+        logger.warning(
+            "[ChatFileParser] 拒绝 MinerU 输出根目录之外的本地图片路径: %s",
+            img_path,
+        )
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
+
+
 def _detect_image_content_type(data: bytes) -> str:
     """通过文件头检测图片 MIME 类型"""
     if data[:8] == b'\x89PNG\r\n\x1a\n':
@@ -841,16 +884,6 @@ def _guess_mime(ext: str) -> str:
         ".svg": "image/svg+xml",
     }
     return mapping.get(ext, "application/octet-stream")
-
-
-def get_file_category_hint(filename: str) -> str:
-    """快速判断文件大类（不解析内容）"""
-    ext = Path(filename).suffix.lower()
-    if ext in MULTIMODAL_EXTENSIONS:
-        return "multimodal"
-    if ext in PYTHON_PARSEABLE_EXTENSIONS | RICH_DOCUMENT_EXTENSIONS:
-        return "document"
-    return "unknown"
 
 
 def clean_surrogates(val):

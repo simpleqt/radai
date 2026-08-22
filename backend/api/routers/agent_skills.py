@@ -6,13 +6,15 @@ import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import select
 
 from backend.api.dependencies.auth import ApiKeyAuth, require_admin
 from backend.application.agents.code_resolver import AgentCodeResolver
 from backend.application.agents.profile_loader import AgentProfileLoader
-from backend.application.skills.runtime_resolver import SkillRuntimeResolver
+from backend.application.skills.domain_policy import skill_domain_matches
 from backend.db.connection import get_async_session_factory
 from backend.db.crud.skill_crud import SkillCRUD
+from backend.db.models.skill import ManagedSkill
 
 router = APIRouter()
 
@@ -68,9 +70,25 @@ async def list_agent_skills(
     factory = get_async_session_factory()
     async with factory() as session:
         rows = await SkillCRUD.list_bindings(session, runtime_code)
+        skill_rows = await session.execute(
+            select(ManagedSkill.skill_id, ManagedSkill.domain).where(
+                ManagedSkill.status == "published",
+                ManagedSkill.active_version_id.is_not(None),
+            )
+        )
+        compatible_skill_ids = [
+            skill_id
+            for skill_id, domain in skill_rows.all()
+            if skill_domain_matches(
+                domain,
+                agent_code=profile.code,
+                agent_domain=profile.domain,
+            )
+        ]
         return {
             "agent_code": runtime_code,
             "skills": [_binding_payload(binding, skill) for binding, skill in rows],
+            "compatible_skill_ids": compatible_skill_ids,
         }
 
 
@@ -93,8 +111,10 @@ async def set_agent_skills(
                 raise HTTPException(status_code=404, detail=f"Skill 不存在: {item.skill_id}")
             if skill.status != "published" or not skill.active_version_id:
                 raise HTTPException(status_code=409, detail=f"Skill 未发布: {skill.skill_key}")
-            if not SkillRuntimeResolver._domain_matches(
-                skill.domain, profile.code, profile.domain
+            if not skill_domain_matches(
+                skill.domain,
+                agent_code=profile.code,
+                agent_domain=profile.domain,
             ):
                 raise HTTPException(status_code=409, detail=f"Skill domain 与智能体不兼容: {skill.skill_key}")
         await SkillCRUD.replace_bindings(

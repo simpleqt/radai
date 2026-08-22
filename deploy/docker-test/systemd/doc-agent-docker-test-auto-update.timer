@@ -1,0 +1,16 @@
+[Unit]
+Description=Check RADAI origin/dev and update the Docker primary-test environment
+
+[Timer]
+OnBootSec=2min
+# 空转轮次只是一次 fetch+SHA 比较，成本可忽略；2 分钟节拍把推送→开跑的
+# 平均等待从 ~2.5 分钟压到 ~1 分钟。部署控制器的 auto-update.lock 互斥
+# 保证与手工 deploy/manage 的重入安全，长轮次期间定时器自然顺延。
+OnUnitInactiveSec=2min
+RandomizedDelaySec=30s
+AccuracySec=30s
+Persistent=true
+Unit=doc-agent-docker-test-auto-update.service
+
+[Install]
+WantedBy=timers.target

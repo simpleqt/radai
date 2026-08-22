@@ -1,6 +1,7 @@
 import { ref } from 'vue';
 
 const API_BASE = '/api/v1';
+const KNOWLEDGE_API_BASE = '/knowledge-api/api/v1';
 const AUTH_VERIFY_INTERVAL_MS = 60 * 1000;
 const AUTH_TOKEN_KEY = 'auth_token';
 const USER_INFO_KEY = 'user_info';
@@ -44,6 +45,17 @@ export function setAuth(token: string, user: any) {
 }
 
 export function logout(options?: { redirectTo?: string } | Event) {
+  // 服务端撤销（删 Redis token）：UI 登出若只清本地态，token 在服务端
+  // 仍有效至过期，公共机房的「退出」不产生任何保护。fire-and-forget。
+  const token = authState.value.token;
+  if (token) {
+    void fetch('/api/v1/auth/logout', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      // 页面即将跳转/销毁，keepalive 保证撤销请求不被中途丢弃
+      keepalive: true,
+    }).catch(() => undefined);
+  }
   setAuth('', null);
   const redirectTo =
     options && typeof options === 'object' && 'redirectTo' in options
@@ -69,7 +81,7 @@ async function verifyTokenAndAutoLogout() {
       headers,
     });
 
-    if (response.status === 401 || response.status === 403) {
+    if (response.status === 401) {
       logout();
     }
   } catch {
@@ -98,7 +110,22 @@ export function startAuthAutoLogoutMonitor() {
 }
 
 export async function request(path: string, options: RequestInit = {}) {
-  const url = path.startsWith('http') ? path : `${API_BASE}${path}`;
+  const knowledgeApiPrefixes = [
+    '/knowledge_bases',
+    '/uploads',
+    '/documents',
+    '/keywords',
+    '/ingestion',
+    '/admin/self-ingestion',
+    '/health/self-ingestion',
+    '/rag',
+  ];
+  const usesKnowledgeApi = knowledgeApiPrefixes.some(
+    (prefix) => path === prefix || path.startsWith(`${prefix}/`) || path.startsWith(`${prefix}?`),
+  );
+  const url = path.startsWith('http') || path.startsWith('/api/')
+    ? path
+    : `${usesKnowledgeApi ? KNOWLEDGE_API_BASE : API_BASE}${path}`;
   const headers = new Headers(options.headers || {});
   
   if (authState.value.token) {
@@ -111,15 +138,95 @@ export async function request(path: string, options: RequestInit = {}) {
 
   const response = await fetch(url, { ...options, headers });
   
-  if (response.status === 401 || response.status === 403) {
-    logout();
+  if (response.status === 401) {
+    // 登录请求本身的 401（密码错误）不能触发整页跳转登录页，
+    // 否则报错提示闪没、表单被清空（与其余前端同步该修复）。
+    const isAuthLoginRequest = /\/auth\/(?:login|cas\/exchange)$/.test(path);
+    if (!isAuthLoginRequest) logout();
     throw new Error('认证失败，请重新登录');
   }
   
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.message || data.detail || `HTTP Error ${response.status}`);
+    const detail = data.detail;
+    const message =
+      data.message ||
+      (typeof detail === 'string' ? detail : detail?.message) ||
+      `HTTP Error ${response.status}`;
+    const error = new Error(message) as Error & { status: number };
+    error.status = response.status;
+    throw error;
   }
   
   return data;
+}
+
+function filenameFromContentDisposition(header: string | null): string | null {
+  if (!header) return null;
+  const utf8Match = header.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+  const basicMatch = header.match(/filename="?([^";]+)"?/i);
+  return basicMatch?.[1]?.trim() || null;
+}
+
+export async function downloadWithAuth(
+  url: string,
+  options?: { filename?: string; openInNewTab?: boolean },
+) {
+  const token = authState.value.token;
+  if (!token) {
+    throw new Error('请先登录后再下载资源');
+  }
+  // 同源硬断言：本函数会把 Bearer token 放进请求头，绝不允许发往其它源。
+  if (new URL(url, window.location.origin).origin !== window.location.origin) {
+    throw new Error('仅支持下载本站资源');
+  }
+
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (response.status === 401) {
+    logout();
+    throw new Error('登录状态已过期，请重新登录');
+  }
+
+  if (!response.ok) {
+    let message = `下载失败 (${response.status})`;
+    try {
+      const data = await response.json();
+      if (typeof data?.detail === 'string') message = data.detail;
+    } catch {
+      // ignore non-json error bodies
+    }
+    throw new Error(message);
+  }
+
+  const blob = await response.blob();
+  const filename =
+    options?.filename
+    || filenameFromContentDisposition(response.headers.get('Content-Disposition'))
+    || 'download';
+  const objectUrl = URL.createObjectURL(blob);
+
+  if (options?.openInNewTab) {
+    window.open(objectUrl, '_blank', 'noopener,noreferrer');
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+    return;
+  }
+
+  const anchor = document.createElement('a');
+  anchor.href = objectUrl;
+  anchor.download = filename;
+  anchor.rel = 'noopener';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(objectUrl);
 }

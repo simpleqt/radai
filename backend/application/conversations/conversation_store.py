@@ -4,32 +4,36 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from backend.application.conversations.errors import (
+    ConversationAgentMismatchError,
+    ConversationDeletedError,
+    ConversationStateError,
+)
+from backend.application.conversations.local_catalog import (
+    get_local_conversation_catalog,
+)
 from backend.db.connection import get_async_session_factory
 from backend.db.models import Conversation, User
 
 logger = logging.getLogger(__name__)
 
 
-class ConversationStateError(RuntimeError):
-    """Raised when a thread cannot be safely reused by an agent request."""
+def _conversation_writes_enabled() -> bool:
+    """Return whether runtime conversation metadata may be written at all."""
 
-
-class ConversationAgentMismatchError(ConversationStateError):
-    """The external thread already belongs to another agent profile."""
-
-
-class ConversationDeletedError(ConversationStateError):
-    """A deleted thread id must not be revived with stale checkpoint state."""
-
-
-class ConversationBusyError(ConversationStateError):
-    """Another request currently owns the conversation row lock."""
+    return os.getenv("AGENT_CONVERSATION_WRITES_ENABLED", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 class ConversationStore:
@@ -45,6 +49,28 @@ class ConversationStore:
         workflow_name: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
+        if not _conversation_writes_enabled():
+            logger.info(
+                "[ConversationStore] 运行时会话目录写入已禁用，"
+                "仅保留 Checkpointer: user_id=%s thread_id=%s",
+                user_id,
+                thread_id,
+            )
+            return
+
+        local_catalog = get_local_conversation_catalog()
+        if local_catalog is not None:
+            await local_catalog.ensure_runtime_conversation(
+                user_id=user_id,
+                thread_id=thread_id,
+                title=self._title_from_question(question),
+                agent_code=agent_code,
+                workflow_name=workflow_name,
+                question=question,
+                metadata=metadata,
+            )
+            return
+
         session_factory = get_async_session_factory()
         async with session_factory() as session:
             try:
@@ -123,7 +149,9 @@ class ConversationStore:
 
                 base_meta = dict(conversation.metadata_ or {})
                 runtime_meta = dict(base_meta.get("agent_runtime") or {})
-                owner_agent_code = str(runtime_meta.get("agent_code") or "").strip().lower()
+                owner_agent_code = (
+                    str(runtime_meta.get("agent_code") or "").strip().lower()
+                )
                 requested_agent_code = str(agent_code or "").strip().lower()
                 if owner_agent_code and owner_agent_code != requested_agent_code:
                     raise ConversationAgentMismatchError(
@@ -193,7 +221,15 @@ class ConversationStore:
         thread_id: str,
         registered_images: dict[str, Any],
     ) -> None:
-        if not registered_images:
+        if not registered_images or not _conversation_writes_enabled():
+            return
+        local_catalog = get_local_conversation_catalog()
+        if local_catalog is not None:
+            await local_catalog.merge_registered_images(
+                user_id=user_id,
+                thread_id=thread_id,
+                registered_images=registered_images,
+            )
             return
         session_factory = get_async_session_factory()
         async with session_factory() as session:
@@ -236,6 +272,39 @@ class ConversationStore:
                     )
                 raise
 
+    async def get_registered_images(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        """Load durable image identities needed to resolve later turns."""
+
+        local_catalog = get_local_conversation_catalog()
+        if local_catalog is not None:
+            conversation = await local_catalog.get(
+                user_id=user_id,
+                thread_id=thread_id,
+                include_deleted=False,
+            )
+            return (
+                dict((conversation.metadata_ or {}).get("registered_images") or {})
+                if conversation
+                else {}
+            )
+
+        session_factory = get_async_session_factory()
+        async with session_factory() as session:
+            result = await session.execute(
+                select(Conversation.metadata_).where(
+                    Conversation.user_id == user_id,
+                    Conversation.thread_id == thread_id,
+                    Conversation.is_deleted.is_(False),
+                )
+            )
+            metadata = result.scalar_one_or_none() or {}
+            return dict(metadata.get("registered_images") or {})
+
     async def _lock_conversation(
         self,
         session,
@@ -256,9 +325,7 @@ class ConversationStore:
             Conversation.user_id == user_id,
         )
         result = await asyncio.wait_for(
-            session.execute(
-                select(Conversation).where(*predicate).with_for_update()
-            ),
+            session.execute(select(Conversation).where(*predicate).with_for_update()),
             timeout=10.0,
         )
         return result.scalar_one_or_none()

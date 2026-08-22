@@ -53,7 +53,13 @@ export function useQuiz() {
     return true;
   }
 
+  // 单调序号守卫：快速切换难度/节点时，慢的旧响应不允许覆盖新状态。
+  let generateSeq = 0;
+
   async function generate(nodeTitle: string, kbIds: string[], count = 6, force = false) {
+    // 序号必须在缓存恢复判定之前递增：否则「节点 A 无缓存在途生成 →
+    // 切到节点 B 命中缓存恢复」后，A 的慢响应仍会覆盖 B 的缓存视图。
+    const seq = ++generateSeq;
     if (!force && restoreFromCache(nodeTitle, kbIds)) {
       loading.value = false;
       return;
@@ -71,21 +77,24 @@ export function useQuiz() {
         difficulty: difficulty.value,
         count,
       });
+      if (seq !== generateSeq) return;
       questions.value = data.questions || [];
       userAnswers.value = {};
       grades.value = {};
       saveCache(nodeTitle, kbIds);
     } catch (e: any) {
+      if (seq !== generateSeq) return;
       error.value = e?.message || '生成习题失败';
       questions.value = [];
     } finally {
-      loading.value = false;
+      if (seq === generateSeq) loading.value = false;
     }
   }
 
   async function gradeQuestion(q: QuizQuestion, nodeTitle?: string, kbIds?: string[]) {
     const answer = userAnswers.value[q.id] || '';
     if (!answer.trim()) return;
+    if (grading.value[q.id]) return; // 双击评分去重
     grading.value = { ...grading.value, [q.id]: true };
     try {
       const result = await ExploreAPI.grade(q, answer);

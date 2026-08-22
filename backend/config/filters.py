@@ -3,8 +3,7 @@
 """
 
 import logging
-import threading
-from collections import OrderedDict
+import re
 from contextvars import ContextVar
 from typing import Optional
 
@@ -36,45 +35,6 @@ def clear_user_context() -> None:
     _request_id_ctx.set(None)
 
 
-def get_user_context() -> dict:
-    """获取当前请求的用户上下文"""
-    return {
-        "user_id": _user_id_ctx.get(),
-        "username": _username_ctx.get(),
-        "request_id": _request_id_ctx.get(),
-    }
-
-
-class LevelFilter(logging.Filter):
-    """
-    级别过滤器
-
-    只允许特定级别及以上的日志通过
-    """
-
-    def __init__(self, level: int):
-        super().__init__()
-        self.level = level
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        return record.levelno >= self.level
-
-
-class ModuleFilter(logging.Filter):
-    """
-    模块过滤器
-
-    只允许特定模块的日志通过
-    """
-
-    def __init__(self, module_prefix: str):
-        super().__init__()
-        self.module_prefix = module_prefix
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        return record.name.startswith(self.module_prefix)
-
-
 class ErrorFilter(logging.Filter):
     """
     错误过滤器
@@ -87,112 +47,95 @@ class ErrorFilter(logging.Filter):
 
 
 class SensitiveDataFilter(logging.Filter):
-    """
-    敏感数据过滤器
+    """敏感数据脱敏过滤器。
 
-    过滤日志中的敏感信息（密码、密钥等）
+    把 ``key=value`` / ``"key": value`` 里的敏感值替换为 ``***``，而不是整条
+    丢弃日志。旧实现用裸子串 ``if "token" in msg: return False``：既误杀含
+    ``tokens=``/``total_tokens`` 的正常记账与性能日志（整条丢失），又只挂在
+    部分 handler 上。现在按「键名 + 分隔符」精确匹配，用词边界让 ``token`` 不
+    命中 ``tokens``，其余正文保留。
     """
 
-    SENSITIVE_PATTERNS = [
-        ("password", "***"),
-        ("passwd", "***"),
-        ("secret", "***"),
-        ("token", "***"),
-        ("api_key", "***"),
-        ("apikey", "***"),
-        ("access_key", "***"),
-        ("private_key", "***"),
-    ]
+    # 键名后必须紧跟 = 或 : 才算敏感键值对；键名两侧允许可选引号（JSON 风格）。
+    # 注意：token 的前缀组合（access_token/refresh_token/session_token/id_token）
+    # 必须显式列出——``_`` 是 word 字符，``\btoken\b`` 不会命中 ``access_token``。
+    _SENSITIVE_KV = re.compile(
+        r"([\"']?\b(?:password|passwd|secret|api[_-]?key|access[_-]?key|"
+        r"private[_-]?key|"
+        r"(?:access|refresh|session|id|auth|bearer|csrf)?[_-]?token|"
+        r"authorization(?:\s+bearer)?|cookie|session[_-]?id|jwt)"
+        r"[\"']?\s*[=:]\s*)"
+        r"(\"[^\"]*\"|'[^']*'|[^\s,;}&]+)",
+        re.IGNORECASE,
+    )
+    # 连接串 userinfo 密码段：scheme://user:password@host → scheme://user:***@host
+    # （用户名允许为空，覆盖 redis://:pass@host 形态；无 @ 的 host:port 不受影响）
+    _SENSITIVE_URI = re.compile(
+        r"(\b[a-zA-Z][a-zA-Z0-9+.-]*://[^:/\s@]*:)[^@\s/]+(@)",
+    )
+    # Bearer 凭据本体（出现在冒号之后，键值对规则够不到）
+    _SENSITIVE_BEARER = re.compile(
+        r"(\bbearer\s+)([A-Za-z0-9._\-~+/=]+)",
+        re.IGNORECASE,
+    )
+    _REDACTED = "***"
 
     def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-
-        for pattern, _replacement in self.SENSITIVE_PATTERNS:
-            if pattern.lower() in msg.lower():
-                return False
-
-        return True
-
-
-class DuplicateFilter(logging.Filter):
-    """
-    重复日志过滤器
-
-    过滤重复的日志消息
-    """
-
-    def __init__(self, max_duplicates: int = 3, max_tracked_messages: int = 10000):
-        super().__init__()
-        self.max_duplicates = max_duplicates
-        self.max_tracked_messages = max(100, max_tracked_messages)
-        self.message_counts: OrderedDict[str, int] = OrderedDict()
-        self._lock = threading.Lock()
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        with self._lock:
-            count = self.message_counts.get(msg, 0) + 1
-            self.message_counts[msg] = count
-            self.message_counts.move_to_end(msg)
-
-            while len(self.message_counts) > self.max_tracked_messages:
-                self.message_counts.popitem(last=False)
-
-            return count <= self.max_duplicates
-
-    def clear(self):
-        """清除计数器"""
-        with self._lock:
-            self.message_counts.clear()
-
-
-class ContextFilter(logging.Filter):
-    """
-    上下文过滤器
-
-    为日志记录添加上下文信息
-    """
-
-    def __init__(self, context: dict):
-        super().__init__()
-        self.context = context
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        for key, value in self.context.items():
-            setattr(record, key, value)
-        return True
-
-
-class PerformanceFilter(logging.Filter):
-    """
-    性能过滤器
-
-    过滤性能相关的日志
-    """
-
-    PERFORMANCE_KEYWORDS = [
-        "slow",
-        "timeout",
-        "latency",
-        "performance",
-        "bottleneck",
-    ]
-
-    def __init__(self, include: bool = True):
-        super().__init__()
-        self.include = include
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage().lower()
-
-        has_performance_info = any(
-            keyword in msg for keyword in self.PERFORMANCE_KEYWORDS
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        redacted = self._SENSITIVE_URI.sub(
+            lambda match: f"{match.group(1)}{self._REDACTED}{match.group(2)}",
+            message,
         )
+        # bearer 先于键值对：否则 authorization 的值会先吞掉 "Bearer" 这个词
+        redacted = self._SENSITIVE_BEARER.sub(
+            lambda match: f"{match.group(1)}{self._REDACTED}", redacted
+        )
+        redacted = self._SENSITIVE_KV.sub(
+            lambda match: f"{match.group(1)}{self._REDACTED}", redacted
+        )
+        if redacted != message:
+            # 用脱敏后的静态串替换，并清空 args 防止 formatter 二次格式化。
+            record.msg = redacted
+            record.args = None
+        # 异常栈文本由 formatter 在消息之后渲染，filter 阶段不可见；
+        # 预先脱敏 record.exc_text（已渲染缓存）与 exc_info 源头。
+        if record.exc_info:
+            try:
+                import traceback
 
-        if self.include:
-            return has_performance_info
-        else:
-            return not has_performance_info
+                text = "".join(traceback.format_exception(*record.exc_info))
+                cleaned = self._SENSITIVE_URI.sub(
+                    lambda match: f"{match.group(1)}{self._REDACTED}{match.group(2)}",
+                    text,
+                )
+                cleaned = self._SENSITIVE_BEARER.sub(
+                    lambda match: f"{match.group(1)}{self._REDACTED}", cleaned
+                )
+                cleaned = self._SENSITIVE_KV.sub(
+                    lambda match: f"{match.group(1)}{self._REDACTED}", cleaned
+                )
+                if cleaned != text:
+                    record.exc_info = (record.exc_info[0], record.exc_info[1], None)
+                    record.exc_text = cleaned
+            except Exception:
+                pass
+        elif record.exc_text:
+            cleaned = self._SENSITIVE_URI.sub(
+                lambda match: f"{match.group(1)}{self._REDACTED}{match.group(2)}",
+                record.exc_text,
+            )
+            cleaned = self._SENSITIVE_BEARER.sub(
+                lambda match: f"{match.group(1)}{self._REDACTED}", cleaned
+            )
+            cleaned = self._SENSITIVE_KV.sub(
+                lambda match: f"{match.group(1)}{self._REDACTED}", cleaned
+            )
+            if cleaned != record.exc_text:
+                record.exc_text = cleaned
+        return True
 
 
 class KafkaBusinessFilter(logging.Filter):

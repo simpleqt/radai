@@ -20,3 +20,11 @@ class ToolRuntimeContext:
     time_context: str = ""
     request_metadata: dict[str, Any] = field(default_factory=dict)
     domain_context: dict[str, Any] = field(default_factory=dict)
+    # Capability-ledger scope key. One request fans out into parallel
+    # coordination units and task sub-agents that each own a request-scoped
+    # CapabilityLedger; keying the ledger registry by request_id alone made
+    # those executions overwrite each other. The scope id is derived from
+    # (request_id, execution thread id) at assembly time so the middleware
+    # that installs a ledger and the scoped tools that look it up always
+    # agree. Empty means "fall back to request_id" (legacy behavior).
+    context_scope_id: str = ""

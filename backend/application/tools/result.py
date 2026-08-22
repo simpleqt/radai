@@ -159,16 +159,26 @@ def _fit_envelope(
     if "tool_output_truncated" not in warnings:
         warnings.append("tool_output_truncated")
     envelope["warnings"] = warnings
+    structured_omissions: list[dict[str, Any]] = []
 
     # Structured data is often the largest duplicate of the human-readable
     # summary. Evidence is kept longer because downstream writers depend on it.
     if envelope.get("data"):
         envelope["data"] = {"_truncated": True}
+        structured_omissions.append(
+            {"reason": "tool_output_truncated", "dropped": "data"}
+        )
     if _serialized_size(envelope) > limit and envelope.get("artifacts"):
         envelope["artifacts"] = []
+        structured_omissions.append(
+            {"reason": "tool_output_truncated", "dropped": "artifacts"}
+        )
     if _serialized_size(envelope) > limit and envelope.get("metrics"):
         envelope["metrics"] = {}
         envelope["stats"] = envelope["metrics"]
+        structured_omissions.append(
+            {"reason": "tool_output_truncated", "dropped": "metrics"}
+        )
 
     original_text = str(envelope.get("text") or envelope.get("summary") or "")
     if _serialized_size(envelope) > limit:
@@ -210,6 +220,11 @@ def _fit_envelope(
             envelope["error"] = _truncate(str(error), max(1, limit // 4))[0]
     if _serialized_size(envelope) > limit:
         envelope["warnings"] = ["tool_output_truncated"]
+    else:
+        candidate_warnings = [*warnings, *structured_omissions]
+        envelope["warnings"] = candidate_warnings
+        if _serialized_size(envelope) > limit:
+            envelope["warnings"] = warnings
     return envelope
 
 

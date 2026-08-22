@@ -18,6 +18,7 @@ import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import parse_qs, urlparse
 
 from langchain.tools import InjectedToolCallId, ToolRuntime, tool
 from langchain_core.messages import ToolMessage
@@ -28,7 +29,7 @@ from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml.ns import qn
 from docx.shared import Pt
 
-from backend.application.blocking import run_blocking
+from backend.application.blocking import run_blocking, run_in_fresh_loop
 from backend.application.tools.execution import invoke_sync_with_timeout
 from backend.application.tools.runtime_resolution import (
     resolve_runtime_thread_id as _resolve_runtime_thread_id,
@@ -47,6 +48,37 @@ logger = get_logger(__name__)
 
 DOCX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 DEFAULT_DOCX_TITLE = "Deep Research Report"
+
+
+def _report_content_char_limit() -> int:
+    """Hard cap on report Markdown so one call cannot exhaust memory/disk.
+
+    Tool arguments are model-controlled; without a ceiling a single
+    ``save_deep_research_report`` could pin an unbounded string into pandas/
+    Pandoc, the temp file, and MinIO. 2,000,000 chars is far above any real
+    report yet bounds the worst case.
+    """
+
+    try:
+        return max(10_000, int(os.getenv("DEEP_RESEARCH_REPORT_MAX_CHARS", "2000000")))
+    except (TypeError, ValueError):
+        return 2_000_000
+
+
+def _bounded_report_content(content: str) -> str:
+    limit = _report_content_char_limit()
+    text = content or ""
+    if len(text) <= limit:
+        return text
+    logger.warning(
+        "[DeepResearchReport] content exceeds %d chars (%d); truncating",
+        limit,
+        len(text),
+    )
+    return (
+        text[:limit]
+        + "\n\n[报告内容超出长度上限，已截断；请缩小范围或分节生成。]"
+    )
 
 
 def _safe_report_filename(filename: str | None) -> str:
@@ -153,7 +185,7 @@ def _resolve_pandoc_executable() -> str:
         if bundled_path:
             return str(bundled_path)
     except Exception:
-        pass
+        logger.debug("未找到可用的 pypandoc 内置 Pandoc", exc_info=True)
 
     raise RuntimeError(
         "Pandoc is required for Markdown to DOCX conversion. "
@@ -218,10 +250,121 @@ def _render_report_docx_with_python(*, title: str, content: str) -> bytes:
     return buffer.getvalue()
 
 
+# 可视化图表的签名代理 URL（visualize_excel_data 输出的 Markdown 图片）
+_CHART_IMAGE_URL_RE = re.compile(
+    r"(!\[[^\]]*\]\()(/api/v1/charts/[\w-]+/[\w-]+\?[^)\s]+)(\))"
+)
+
+
+def _materialize_chart_images(markdown_input: str, tmp_path: Path) -> str:
+    """把图表签名 URL 物化为本地临时 PNG，让 Pandoc 能把图表嵌入 DOCX。
+
+    Pandoc 无法抓取相对 URL，不做本地化时导出的 Word 会丢失图表。
+    嵌入前按 HTTP 端点相同的规则验签；验签失败或取图失败保留原引用。
+    """
+    if "/api/v1/charts/" not in markdown_input:
+        return markdown_input
+
+    from backend.services.chart_image_store import (
+        fetch_chart,
+        verify_chart_signature,
+    )
+
+    def _replace(match: re.Match) -> str:
+        raw_url = match.group(2)
+        try:
+            parsed = urlparse(raw_url)
+            user_id, chart_id = parsed.path.strip("/").split("/")[-2:]
+            query = parse_qs(parsed.query)
+            exp = int((query.get("exp") or ["0"])[0] or 0)
+            sig = (query.get("sig") or [""])[0]
+            if not verify_chart_signature(user_id, chart_id, exp, sig):
+                return match.group(0)
+            # 本函数总在无事件循环的工作线程中执行（to_thread/run_blocking）;
+            # 一次性循环退出前需要清理按循环注册的连接资源。
+            png = run_in_fresh_loop(lambda: fetch_chart(user_id, chart_id))
+            if not png:
+                return match.group(0)
+            local = tmp_path / f"chart-{user_id}-{chart_id}.png"
+            local.write_bytes(png)
+            return f"{match.group(1)}{local.as_posix()}{match.group(3)}"
+        except Exception:
+            logger.warning(
+                "[DeepResearchReport] 图表本地化失败，保留原引用: %s",
+                raw_url,
+                exc_info=True,
+            )
+            return match.group(0)
+
+    return _CHART_IMAGE_URL_RE.sub(_replace, markdown_input)
+
+
+def _sanitize_report_image_sources(markdown_input: str, tmp_path: Path) -> str:
+    """Neutralize every image reference except locally materialized charts.
+
+    Model-authored Markdown reaches Pandoc verbatim; Pandoc embeds
+    ``![](http://…)`` and local-path images while producing the DOCX, which is
+    an in-process SSRF / arbitrary-local-file-read primitive
+    (``![](http://169.254.169.254/…)`` etc.). ``--sandbox`` would close this
+    but also blocks reading the chart PNGs we just materialized into
+    ``tmp_path``, dropping every chart. Instead we allow only image targets
+    under ``tmp_path`` (our own signed-chart output) and strip all others —
+    inline, reference-style, and raw ``<img>`` — so no attacker-controlled
+    target survives for Pandoc to fetch.
+    """
+
+    allowed_prefix = tmp_path.resolve().as_posix()
+
+    def _is_local_chart(target: str) -> bool:
+        cleaned = str(target or "").strip().strip("<>").strip().strip('"').strip("'")
+        if not cleaned:
+            return False
+        try:
+            resolved = Path(cleaned).resolve().as_posix()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return resolved == allowed_prefix or resolved.startswith(
+            allowed_prefix + "/"
+        )
+
+    def _inline(match: re.Match) -> str:
+        alt, target = match.group(1), match.group(2)
+        if _is_local_chart(target):
+            return match.group(0)
+        # Keep the alt text as plain prose so information is not silently lost.
+        return alt or ""
+
+    sanitized = re.sub(
+        r"!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?[^)]*\)",
+        _inline,
+        markdown_input,
+    )
+
+    def _ref_definition(match: re.Match) -> str:
+        target = match.group(2)
+        # Drop link/image reference definitions that point outside tmp_path;
+        # an undefined reference renders as literal text (no fetch).
+        return match.group(0) if _is_local_chart(target) else ""
+
+    sanitized = re.sub(
+        r"(?m)^[ \t]*\[([^\]]+)\]:[ \t]*<?([^\s>]+)>?.*$",
+        _ref_definition,
+        sanitized,
+    )
+
+    # gfm keeps raw HTML; a raw <img> would be embedded too. Remove the tags
+    # (chart output never uses raw HTML img).
+    sanitized = re.sub(r"(?is)<img\b[^>]*?>", "", sanitized)
+    return sanitized
+
+
 def _render_report_docx_bytes(*, title: str, content: str) -> bytes:
     """Render Markdown to DOCX, falling back to python-docx when Pandoc fails."""
     normalized_title = title.strip() or DEFAULT_DOCX_TITLE
-    normalized_content = content.strip() or f"# {normalized_title}\n\n(No content)"
+    normalized_content = (
+        _bounded_report_content(content).strip()
+        or f"# {normalized_title}\n\n(No content)"
+    )
 
     effective_title = normalized_title
     markdown_input = normalized_content
@@ -251,7 +394,13 @@ def _render_report_docx_bytes(*, title: str, content: str) -> bytes:
             input_md = tmp_path / "report.md"
             output_docx = tmp_path / "report.docx"
 
-            input_md.write_text(markdown_input, encoding="utf-8")
+            input_md.write_text(
+                _sanitize_report_image_sources(
+                    _materialize_chart_images(markdown_input, tmp_path),
+                    tmp_path,
+                ),
+                encoding="utf-8",
+            )
 
             reference_override = os.getenv("DEEP_RESEARCH_REFERENCE_DOCX", "").strip()
             if reference_override and Path(reference_override).is_file():

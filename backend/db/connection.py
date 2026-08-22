@@ -43,6 +43,35 @@ def _mysql_pool_timeout_seconds() -> float:
         return 5.0
 
 
+def mysql_session_read_only_enabled() -> bool:
+    """Return whether every MySQL session is forced into read-only mode."""
+
+    return os.getenv("MYSQL_SESSION_READ_ONLY", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _configure_mysql_connection(dbapi_connection) -> None:
+    """Apply deterministic settings to every sync or async DBAPI connection."""
+
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("SET NAMES utf8mb4")
+        if mysql_session_read_only_enabled():
+            cursor.execute("SET SESSION TRANSACTION READ ONLY")
+    finally:
+        cursor.close()
+
+
+def _configure_async_engine_connections(engine) -> None:
+    @event.listens_for(engine.sync_engine, "connect")
+    def configure_session(dbapi_connection, _connection_record):
+        _configure_mysql_connection(dbapi_connection)
+
+
 @asynccontextmanager
 async def _cancellation_safe_context(context_manager):
     """Keep async resource teardown running after an AnyIO request cancellation.
@@ -133,7 +162,7 @@ async def retry_async_db_operation(
 
 
 def _create_pooled_async_engine():
-    return create_async_engine(
+    engine = create_async_engine(
         settings.async_mysql_url,
         pool_size=settings.mysql_pool_size,
         max_overflow=settings.mysql_max_overflow,
@@ -142,6 +171,8 @@ def _create_pooled_async_engine():
         pool_recycle=3600,
         echo=False,
     )
+    _configure_async_engine_connections(engine)
+    return engine
 
 
 def get_engine():
@@ -164,9 +195,7 @@ def get_engine():
 
                 @event.listens_for(engine, "connect")
                 def set_charset(dbapi_connection, _connection_record):
-                    cursor = dbapi_connection.cursor()
-                    cursor.execute("SET NAMES utf8mb4")
-                    cursor.close()
+                    _configure_mysql_connection(dbapi_connection)
 
                 _engine = engine
 
@@ -204,16 +233,27 @@ def get_async_engine():
     if loop is None:
         # CLI/bootstrap code may construct a factory before an event loop exists.
         # Keep that exceptional path unpooled so it is never shared across loops.
-        if _async_engine is None:
-            _async_engine = create_async_engine(
-                settings.async_mysql_url,
-                poolclass=NullPool,
-                pool_pre_ping=False,
-                echo=False,
-            )
-        return _async_engine
+        # 复用注册表锁防止并发线程双初始化(NullPool 泄漏无害,但保持单例语义)。
+        with _async_registry_lock:
+            if _async_engine is None:
+                _async_engine = create_async_engine(
+                    settings.async_mysql_url,
+                    poolclass=NullPool,
+                    pool_pre_ping=False,
+                    echo=False,
+                )
+                _configure_async_engine_connections(_async_engine)
+            return _async_engine
 
     with _async_registry_lock:
+        # 已关闭循环的引擎无法靠弱引用回收(池中连接持有对循环的强引用),
+        # 主动丢弃引用;正常路径应经 dispose_async_engine_for_current_loop
+        # 显式释放,这里只兜底防止字典无限增长。
+        for dead in [
+            item for item in _async_engines_by_loop.keys() if item.is_closed()
+        ]:
+            _async_engines_by_loop.pop(dead, None)
+            _async_factories_by_loop.pop(dead, None)
         engine = _async_engines_by_loop.get(loop)
         if engine is None:
             engine = _create_pooled_async_engine()
@@ -227,15 +267,16 @@ def get_async_session_factory():
 
     loop = _current_loop()
     if loop is None:
-        if _async_session_factory is None:
-            _async_session_factory = async_sessionmaker(
-                bind=get_async_engine(),
-                class_=AsyncSession,
-                autocommit=False,
-                autoflush=False,
-                expire_on_commit=False,
-            )
-        return _async_session_factory
+        with _async_registry_lock:
+            if _async_session_factory is None:
+                _async_session_factory = async_sessionmaker(
+                    bind=get_async_engine(),
+                    class_=AsyncSession,
+                    autocommit=False,
+                    autoflush=False,
+                    expire_on_commit=False,
+                )
+            return _async_session_factory
 
     with _async_registry_lock:
         factory = _async_factories_by_loop.get(loop)
@@ -355,10 +396,22 @@ async def close_db_async():
         await _async_engine.dispose()
         _async_engine = None
         _async_session_factory = None
+    await dispose_async_engine_for_current_loop()
+
+
+async def dispose_async_engine_for_current_loop() -> None:
+    """Dispose only the pooled engine registered for the current event loop.
+
+    Ephemeral loops (sync tool bridges running ``asyncio.run`` in blocking
+    threads) must call this before the loop dies: the registry key is a weak
+    reference, so the entry disappears on GC, but the engine's MySQL
+    connections are never disposed and would linger until server timeout.
+    """
     loop = _current_loop()
-    if loop is not None:
-        with _async_registry_lock:
-            engine = _async_engines_by_loop.pop(loop, None)
-            _async_factories_by_loop.pop(loop, None)
-        if engine is not None:
-            await engine.dispose()
+    if loop is None:
+        return
+    with _async_registry_lock:
+        engine = _async_engines_by_loop.pop(loop, None)
+        _async_factories_by_loop.pop(loop, None)
+    if engine is not None:
+        await engine.dispose()

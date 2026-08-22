@@ -1,49 +1,52 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHistory, type RouteLocationGeneric, type RouteRecordRaw } from 'vue-router'
 import { authState } from '@/utils/request'
 import AdminLayout from '@/views/admin/components/AdminLayout.vue'
 
-const detectDefaultMode = (): 'mobile' | 'desktop' => {
-  const fromStorage = (localStorage.getItem('ui_mode') || 'auto').toLowerCase();
-  if (fromStorage === 'mobile') return 'mobile';
-  if (fromStorage === 'desktop') return 'desktop';
-
-  // Client-side detection only since we need window
-  if (typeof window === 'undefined') return 'desktop';
-
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-  const width = window.innerWidth;
-  const uaMobile = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(ua.toLowerCase());
-  return uaMobile || width <= 900 ? 'mobile' : 'desktop';
+const APP_NAME = '核电子学智能助手'
+const normalizeSafeRedirect = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null;
+  if (!value.startsWith('/') || value.startsWith('//')) return null;
+  return value;
 };
 
-const remapChatPathByMode = (toPath: string, mode: 'mobile' | 'desktop', threadId?: string) => {
-  const base = mode === 'mobile' ? '/m' : '/app';
-  if (threadId) return `${base}/${threadId}`;
-  return base;
+/** 旧的移动端专用路径统一并入 /app，布局改由容器宽度决定 */
+const toAppPath = (to: RouteLocationGeneric) => {
+  const threadId = to.params.threadId as string | undefined;
+  return { path: threadId ? `/app/${threadId}` : '/app', query: to.query, hash: to.hash };
 };
 
-const routes = [
-  { path: '/', redirect: () => (detectDefaultMode() === 'mobile' ? '/m' : '/app') },
-  // 探索式学习路由需先于 /app/:threadId? 与 /m/:threadId? 定义，避免被通配的 threadId 抢占匹配。
+const routes: RouteRecordRaw[] = [
+  { path: '/', redirect: '/app' },
+  // 各功能页需先于 /app/:threadId? 定义，避免被通配的 threadId 抢占匹配。
   {
     path: '/explore',
     component: () => import('@/views/explore/index.vue'),
-    meta: { title: '探索式学习 - 核电子学智能助手' }
+    meta: { title: `探索式学习 - ${APP_NAME}` }
   },
   {
-    path: '/m/explore',
-    component: () => import('@/views/explore/index.vue'),
-    meta: { title: '探索式学习 - 核电子学智能助手' }
+    path: '/custom-learning/path/:planId?',
+    component: () => import('@/views/custom-learning/path.vue'),
+    meta: { title: `学习路径 - ${APP_NAME}` }
+  },
+  {
+    path: '/custom-learning',
+    component: () => import('@/views/custom-learning/index.vue'),
+    meta: { title: `自定义学习 - ${APP_NAME}` }
+  },
+  {
+    path: '/learning-style',
+    component: () => import('@/views/learning-style/index.vue'),
+    meta: { title: `学习风格测评 - ${APP_NAME}` }
+  },
+  {
+    path: '/settings',
+    component: () => import('@/views/settings/index.vue'),
+    meta: { title: `用户设置 - ${APP_NAME}`, requiresAuth: true }
   },
   {
     path: '/app/:threadId?',
     component: () => import('@/views/ne-full/index.vue'),
-    meta: { title: '核电子学智能助手' }
-  },
-  {
-    path: '/m/:threadId?',
-    component: () => import('@/views/ne-full/index.vue'),
-    meta: { title: '核电子学智能助手' }
+    meta: { title: APP_NAME }
   },
   {
     path: '/login',
@@ -53,32 +56,29 @@ const routes = [
   {
     path: '/my-files',
     component: () => import('@/views/ne-full/MyFilesView.vue'),
-    meta: { title: '个人文件库 - 核电子学智能助手', requiresAuth: true }
+    meta: { title: `个人文件库 - ${APP_NAME}`, requiresAuth: true }
   },
-  {
-    path: '/chat/:threadId?',
-    redirect: (to: any) => {
-      const mode = detectDefaultMode();
-      return { path: remapChatPathByMode(to.path, mode, to.params.threadId as string | undefined) };
-    },
-  },
-  { 
-    path: '/ne-full/:threadId?', 
-    redirect: (to: any) => {
-      const mode = detectDefaultMode();
-      return { path: remapChatPathByMode(to.path, mode, to.params.threadId as string | undefined) };
-    },
-  },
+
+  // 兼容旧链接与用户收藏
+  { path: '/m/explore', redirect: '/explore' },
+  { path: '/m/custom-learning/path/:planId?', redirect: (to) => ({ path: `/custom-learning/path/${to.params.planId || ''}`.replace(/\/$/, '') }) },
+  { path: '/m/custom-learning', redirect: '/custom-learning' },
+  { path: '/m/learning-style', redirect: '/learning-style' },
+  { path: '/m/settings', redirect: '/settings' },
+  { path: '/m/:threadId?', redirect: toAppPath },
+  { path: '/chat/:threadId?', redirect: toAppPath },
+  { path: '/ne-full/:threadId?', redirect: toAppPath },
+
   {
     path: '/admin/login',
     component: () => import('@/views/admin/login.vue'),
-    meta: { title: '管理员登录', guest: true }
+    meta: { title: '智能体管理平台 - 管理员登录', guest: true }
   },
   {
     path: '/admin',
     component: AdminLayout,
     redirect: '/admin/dashboard',
-    meta: { requiresAuth: true },
+    meta: { requiresAuth: true, requiresAdmin: true },
     children: [
       {
         path: 'dashboard',
@@ -91,6 +91,36 @@ const routes = [
         meta: { title: '知识库管理' }
       },
       {
+        path: 'prompts',
+        component: () => import('@/views/admin/prompt-management.vue'),
+        meta: { title: '提示词管理' }
+      },
+      {
+        path: 'skills',
+        component: () => import('@/views/admin/skills.vue'),
+        meta: { title: 'Skills 管理' }
+      },
+      {
+        path: 'datasets',
+        component: () => import('@/views/admin/datasets.vue'),
+        meta: { title: '实验数据管理' }
+      },
+      {
+        path: 'platform',
+        component: () => import('@/views/admin/platform.vue'),
+        meta: { title: '平台运维' }
+      },
+      {
+        path: 'runtime',
+        component: () => import('@/views/admin/runtime.vue'),
+        meta: { title: '运行监控' }
+      },
+      {
+        path: 'system',
+        component: () => import('@/views/admin/system.vue'),
+        meta: { title: '系统管理' }
+      },
+      {
         path: 'kb/:id',
         component: () => import('@/views/admin/kb-detail.vue'),
         meta: { title: '知识库详情' }
@@ -101,62 +131,48 @@ const routes = [
 
 const router = createRouter({
   history: createWebHistory(),
-  routes
-})
-
-router.beforeEach((to, from, next) => {
-  if (to.meta.title) document.title = to.meta.title as string;
-
-  const isChatPath = (path: string) => {
-    if (path === '/explore' || path === '/m/explore') return false;
-    return path === '/app' || path.startsWith('/app/') || path === '/m' || path.startsWith('/m/');
-  };
-
-  if (isChatPath(to.path)) {
-    const expectedMode = to.query.mode === 'desktop' ? 'desktop' : to.query.mode === 'mobile' ? 'mobile' : detectDefaultMode();
-    const targetPath = remapChatPathByMode(to.path, expectedMode, to.params.threadId as string | undefined);
-    
-    if (expectedMode === 'mobile' && (to.path === '/app' || to.path.startsWith('/app/'))) {
-      return next({ path: targetPath, query: to.query, hash: to.hash, replace: true });
-    }
-    if (expectedMode === 'desktop' && (to.path === '/m' || to.path.startsWith('/m/'))) {
-      return next({ path: targetPath, query: to.query, hash: to.hash, replace: true });
-    }
+  routes,
+  scrollBehavior(_to, _from, savedPosition) {
+    return savedPosition || { top: 0 };
   }
+});
+
+router.beforeEach((to, _from, next) => {
+  if (to.meta.title) document.title = to.meta.title as string;
 
   const isAuth = !!authState.value.token;
   const isAdmin = String(authState.value.user?.role || '').toLowerCase() === 'admin';
-  const isAdminLoginPage = to.path === '/admin/login';
 
   // 管理员登录页始终可访问，避免已登录普通用户无法切换到管理员账号。
-  if (isAdminLoginPage) {
+  if (to.path === '/admin/login') {
     next();
     return;
   }
 
-  if (to.path.startsWith('/admin')) {
+  const requiresAdmin = to.matched.some((record) => record.meta.requiresAdmin) || to.path.startsWith('/admin');
+
+  if (requiresAdmin) {
     if (!isAuth) {
       next('/admin/login');
       return;
     }
-
-    if (!isAdmin && to.path !== '/admin/login') {
+    if (!isAdmin) {
       next('/app');
       return;
     }
   }
-  
+
   if (to.meta.requiresAuth && !isAuth) {
     if (to.path.startsWith('/admin')) {
       next('/admin/login');
     } else {
-      next('/login');
+      next({ path: '/login', query: { redirect: to.fullPath } });
     }
   } else if (to.meta.guest && isAuth) {
     if (to.path.startsWith('/admin')) {
       next(isAdmin ? '/admin/dashboard' : '/app');
     } else {
-      next('/app');
+      next(normalizeSafeRedirect(to.query.redirect) || '/app');
     }
   } else {
     next();

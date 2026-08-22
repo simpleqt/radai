@@ -36,16 +36,31 @@ tools:
 
   read_context_artifact:
     provider: backend.application.tools.providers.context_artifact_tool:get_scoped_read_context_artifact_tool
-    description: 读取上下文压缩阶段保存的大结果 artifact 引用
+    description: 读取旧版上下文压缩阶段保存的 artifact://context/... 大结果引用（兼容入口）
     domains: ["*"]
     workflows: [full, deep_research, plan_solve]
     required_skills: []
     risk_level: safe
     enabled_by_default: true
-    instructions: 仅当需要核查 ContextItem.raw_ref 或 handoff.raw_artifact_refs 的原始大结果时调用；返回内容必须受 max_chars 限制。
-    timeout_seconds: 15
+    instructions: 仅当需要核查旧版 ContextItem.raw_ref 或 handoff.raw_artifact_refs 的 artifact://context/... 原始大结果时调用；新链路请使用 context_read 句柄。
+    timeout_seconds: 30
     side_effect: none
     policy_source: registry:read_context_artifact
+    max_concurrency: 8
+    max_output_chars: 30000
+
+  context_read:
+    provider: backend.application.tools.providers.context_read_tool:get_scoped_context_read_tool
+    description: 按本轮【证据台账】中的 sid 读取上下文对象片段正文
+    domains: ["*"]
+    workflows: [full, deep_research, plan_solve]
+    required_skills: []
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 仅当需要读取【证据台账】列出的 sid 正文时调用；sids 必须来自本轮动态上下文，句柄仅为兼容旧调用的可选参数；失败时禁止重新发起知识库检索。
+    timeout_seconds: 30
+    side_effect: none
+    policy_source: registry:context_read
     max_concurrency: 8
     max_output_chars: 30000
 
@@ -90,6 +105,42 @@ tools:
     cache_enabled: true
     cache_ttl_seconds: 900
 
+  execute_python:
+    provider: backend.application.tools.providers.code_interpreter_tool:get_execute_python_tool
+    description: 在受限 Python 沙箱中执行代码做精确数值计算、公式验算、统计分析与绘图
+    domains: ["*"]
+    workflows: [full, deep_research, plan_solve]
+    required_skills: []
+    risk_level: write
+    enabled_by_default: false
+    instructions: 仅在需要精确数值计算、公式推导验算、统计分析或自定义绘图时调用；代码必须自包含并用 print 输出结果；需要分析当前会话上传的数据文件（CSV/Excel/JSON 等）时把文件名传入 input_files，文件出现在 inputs/ 目录下用相对路径读取；需要生成可下载的结果文件时写入 outputs/ 目录，执行后自动保存为会话工件并返回下载链接；沙箱禁止联网、派生进程与访问沙箱外文件；matplotlib 图表自动捕获并以 Markdown 图片链接返回。
+    timeout_seconds: 90
+    side_effect: compute
+    policy_source: registry:execute_python
+    idempotent: false
+    parallel_safe: true
+    max_concurrency: 2
+    max_attempts: 1
+    max_output_chars: 20000
+
+  export_document:
+    provider: backend.application.tools.providers.document_export_tool:get_export_document_tool
+    description: 把 Markdown 回答导出为 DOCX 或 PDF 交付文档并保存为会话工件
+    domains: ["*"]
+    workflows: [full, deep_research, plan_solve]
+    required_skills: []
+    risk_level: write
+    enabled_by_default: false
+    instructions: 仅在用户明确需要把回答/报告导出为可下载文档时调用；content 用标准 Markdown（图表用 visualize_excel_data/execute_python 返回的图片链接引用即可自动嵌入）；format 支持 docx（默认）与 pdf。
+    timeout_seconds: 180
+    side_effect: artifact_write
+    policy_source: registry:export_document
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 2
+    max_attempts: 1
+    max_output_chars: 4000
+
   generate_html_ppt:
     provider: backend.application.tools.providers.html_ppt_tool:generate_html_ppt_tool
     description: 生成 HTML/PPT 风格演示产物
@@ -106,6 +157,59 @@ tools:
     parallel_safe: false
     max_concurrency: 2
     max_output_chars: 10000
+
+  generate_mechanics_diagram:
+    provider: backend.application.tools.providers.mechanics_diagram_tool:generate_mechanics_diagram_tool
+    description: 生成基础力学受力图、剪力图与弯矩图（知识库无原图时的兜底）
+    domains: [fundamental-mechanics-course]
+    workflows: [lightweight, full, deep_research, plan_solve]
+    required_skills: []
+    risk_level: write
+    enabled_by_default: false
+    instructions: 仅在题目或知识库没有现成图片且图示对理解必要时调用；优先复用知识库原图。
+    timeout_seconds: 60
+    side_effect: artifact_write
+    policy_source: registry:generate_mechanics_diagram
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 2
+    max_output_chars: 3000
+
+  search_kb_images:
+    provider: backend.application.tools.providers.kb_image_search_tool:search_kb_images_tool
+    description: 检索知识库原图（受力图、内力图、图表等）并注册到图片白名单
+    domains: ["*"]
+    workflows: [lightweight, full, deep_research, plan_solve]
+    required_skills: []
+    risk_level: safe
+    enabled_by_default: false
+    instructions: 回答或演示产物需要知识库原图时调用；优先于画图工具。
+    timeout_seconds: 60
+    side_effect: local_read
+    policy_source: registry:search_kb_images
+    idempotent: true
+    parallel_safe: false
+    max_concurrency: 2
+    max_output_chars: 8000
+
+  search_question_bank:
+    provider: backend.application.tools.providers.question_bank_tool:search_question_bank_tool
+    description: 检索基础力学题库（结构化题目，图必随题）：按 QB- 题号精确取整题讲解，或按关键词/知识点列举相似题
+    domains: [fundamental-mechanics-course]
+    # 轻量路径不给模型绑任何工具（lightweight_qa_agent 无 bind_tools），声明
+    # lightweight 会让 fmca 轻量会话的题库讲解静默不可用，故不再声明。
+    workflows: [full, deep_research, plan_solve]
+    required_skills: []
+    risk_level: safe
+    enabled_by_default: false
+    instructions: 讲解试题（学生提到 QB- 编号或练习模式的题目）时按 question_id 精确取题；题目本体严禁从知识库检索，知识库只做概念/公式讲解支撑；做题引导学生前往侧边栏「习题练习」。
+    timeout_seconds: 30
+    side_effect: local_read
+    policy_source: registry:search_question_bank
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 4
+    max_output_chars: 8000
 
   list_experiment_datasets:
     provider: backend.application.tools.providers.excel_data_analysis_tool:get_excel_analysis_tools
@@ -267,3 +371,347 @@ tools:
     required_skills: [groundwater-project-analysis]
     risk_level: safe
     enabled_by_default: true
+
+  # ── 课程评价（course_eval）──
+  # 读工具：真实读库；写工具：走 course_eval service 层（状态机护栏+审计），
+  # risk_level: write / side_effect: db_write，匿名与访客会被 guardrail 硬拒。
+  list_course_eval_tasks:
+    provider: backend.application.course_eval.tools:get_list_course_eval_tasks_tool
+    description: 列出当前用户可访问的课程评价学期任务
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 只读工具；不返回学号/成绩明细；需要统计数据请调用 get_course_stats。
+    timeout_seconds: 60
+    side_effect: none
+    policy_source: registry:list_course_eval_tasks
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 2
+    max_output_chars: 8000
+
+  get_course_stats:
+    provider: backend.application.course_eval.tools:get_course_stats_tool
+    description: 读取指定学期任务的成绩分布、得分率与课程目标达成度快照
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 只读工具；必须传入 semester_task_id；只返回已存在的快照，不得触发计算。
+    timeout_seconds: 60
+    side_effect: local_read
+    policy_source: registry:get_course_stats
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 2
+    max_output_chars: 12000
+
+  get_achievement:
+    provider: backend.application.course_eval.tools:get_achievement_tool
+    description: 读取达成度与历年对比
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 只读工具；必须传入 semester_task_id。
+    timeout_seconds: 60
+    side_effect: none
+    policy_source: registry:get_achievement
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 2
+    max_output_chars: 8000
+
+  draft_report_narrative:
+    provider: backend.application.course_eval.tools:get_draft_report_narrative_tool
+    description: 起草报告定性文字（不得包含数字）
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 只产出文字草稿；不得输出任何数字（数字由渲染器从快照填入）；不得复述往年措辞。
+    timeout_seconds: 60
+    side_effect: none
+    policy_source: registry:draft_report_narrative
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 2
+    max_output_chars: 8000
+
+  check_report_quality:
+    provider: backend.application.course_eval.tools:get_check_report_quality_tool
+    description: 报告质检（QC-01~QC-10 + 02a/b/c，只读）
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 只读工具；返回质检结果，不修改报告。
+    timeout_seconds: 60
+    side_effect: none
+    policy_source: registry:check_report_quality
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 2
+    max_output_chars: 8000
+
+  load_previous_reports:
+    provider: backend.application.course_eval.tools:get_load_previous_reports_tool
+    description: 历史达成度与措施（不返回历史报告正文）
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 只返回历史达成度数值与措施条目摘要；历史正文不入任何生成上下文。
+    timeout_seconds: 60
+    side_effect: none
+    policy_source: registry:load_previous_reports
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 2
+    max_output_chars: 8000
+
+  # ── 课程评价写工具（流水线执行者，走 service 层）──
+
+  transition_task:
+    provider: backend.application.course_eval.tools:get_transition_task_tool
+    description: 推进学期任务状态机（唯一迁移入口，非法迁移被拒）
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；走 task_service.transition（状态机护栏+审计）；调用前先查任务当前状态，非法目标返回 allowed_actions。
+    timeout_seconds: 120
+    side_effect: db_write
+    policy_source: registry:transition_task
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 8000
+
+  extract_grade_sheet:
+    provider: backend.application.course_eval.tools:get_extract_grade_sheet_tool
+    description: 解析成绩单 PDF 并落学生成绩（确定性坐标法）
+    domains: [course-outcome-evaluation]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；需先上传成绩单材料（文件名含「成绩单」）；material_id 从任务资料列表获取；解析后写 ce_students。
+    timeout_seconds: 600
+    side_effect: db_write
+    policy_source: registry:extract_grade_sheet
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 12000
+
+  extract_paper:
+    provider: backend.application.course_eval.tools:get_extract_paper_tool
+    description: 解析答题试卷 PDF 版面结构并自动提取封面得分表，落试卷结构与学生得分
+    domains: [course-outcome-evaluation]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；需先上传试卷 PDF（文件名含「试卷」）；必须等 extract_grade_sheet 成功后再单独调用，不能与它同轮并行（封面得分要按总分对到成绩单学生上）；一次 MinerU OCR 同时取大题结构（题型/满分）与封面得分表，写入 ce_exam_papers/ce_exam_sections/ce_score_records；只有各题之和与总分列自洽的页才 confirmed，其余进待确认清单；识别不可用时降级提示补录，不静默。
+    timeout_seconds: 900
+    side_effect: db_write
+    policy_source: registry:extract_paper
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 12000
+
+  extract_syllabus:
+    provider: backend.application.course_eval.tools:get_extract_syllabus_tool
+    description: 从教学大纲抽取课程目标与考核权重（LLM 结构化抽取，校验后落库）
+    domains: [course-outcome-evaluation]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；需先上传大纲材料（文件名含「大纲」）；未通过校验不入库转人工（§6.4）。
+    timeout_seconds: 300
+    side_effect: db_write
+    policy_source: registry:extract_syllabus
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 12000
+
+  run_validation:
+    provider: backend.application.course_eval.tools:get_run_validation_tool
+    description: 执行确定性校验规则（GS-*/PS-*），返回 issue 清单（只读）
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 只读工具；返回 issue；有 error 级 issue 时建议停在 needs_review 待教师处理。
+    timeout_seconds: 120
+    side_effect: local_read
+    policy_source: registry:run_validation
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 2
+    max_output_chars: 12000
+
+  suggest_goal_mapping:
+    provider: backend.application.course_eval.tools:get_suggest_goal_mapping_tool
+    description: 生成试题-目标映射建议（LLM 语义匹配，不落库）
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 只产出映射建议；用户确认后调用 apply_mappings 对话工具落库（标 confirmed_by、触发回退）。
+    timeout_seconds: 300
+    side_effect: none
+    policy_source: registry:suggest_goal_mapping
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 2
+    max_output_chars: 12000
+
+  compute_statistics:
+    provider: backend.application.course_eval.tools:get_compute_statistics_tool
+    description: 计算统计快照（成绩分布/得分率），落 ce_stats_snapshots
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；需已完成提取与映射；走 report_service.compute（Decimal 纯函数）。
+    timeout_seconds: 120
+    side_effect: db_write
+    policy_source: registry:compute_statistics
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 12000
+
+  generate_report:
+    provider: backend.application.course_eval.tools:get_generate_report_tool
+    description: 生成报告草稿并渲染《试卷分析表》docx（落 ce_reports，返回下载链接）
+    domains: [course-outcome-evaluation]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；需先 compute_statistics；docx.rendered=true 时把 download_url 以 Markdown 链接给教师并说明定性段需补写；模板文件未配置时降级为仅草稿（原因在 docx.reason），不阻断。
+    timeout_seconds: 300
+    side_effect: db_write
+    policy_source: registry:generate_report
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 8000
+
+  export_report_pdf:
+    provider: backend.application.course_eval.tools:get_export_report_pdf_tool
+    description: 把已渲染的《试卷分析表》最新版 docx 转成 PDF 并返回下载链接
+    domains: [course-outcome-evaluation]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 需先 generate_report 渲染出 docx；只做格式转换（不改报告数据、不新建版本），转换在写事务之外执行；LibreOffice 不可用时返回说明并继续用 docx 链接；把下载链接以 Markdown 链接给教师，并提示定性段仍以 docx 为编辑底稿。
+    timeout_seconds: 180
+    side_effect: artifact_write
+    policy_source: registry:export_report_pdf
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_attempts: 1
+    max_output_chars: 4000
+
+  # ── 课程评价对话式工具（对话入口：建任务/绑材料/读网格/改分/确认映射）──
+
+  create_semester_task:
+    provider: backend.application.course_eval.tools:get_create_semester_task_tool
+    description: 创建（或复用）课程并新建学期任务（对话入口第一步）
+    domains: [course-outcome-evaluation]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；从用户描述提取课程名称、学期、教学班号后调用（course_code 可选，缺省自动生成 AUTO- 代码，勿为此追问用户）；课程按 name+code 查重复用。
+    timeout_seconds: 120
+    side_effect: db_write
+    policy_source: registry:create_semester_task
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 8000
+
+  attach_material:
+    provider: backend.application.course_eval.tools:get_attach_material_tool
+    description: 把对话上传的文件绑定为任务材料（类型按文件名自动识别）
+    domains: [course-outcome-evaluation]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；file_id 来自对话上传；文件名含「成绩单」「大纲」「试卷(PDF)」自动归类。
+    timeout_seconds: 120
+    side_effect: db_write
+    policy_source: registry:attach_material
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 8000
+
+  get_score_grid:
+    provider: backend.application.course_eval.tools:get_score_grid_tool
+    description: 读取分数网格摘要（存疑单元格 + 行校验失败），供对话核对
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: safe
+    enabled_by_default: true
+    instructions: 只读工具；返回低置信度单元格与行校验失败项；用户指正后调用 update_scores。
+    timeout_seconds: 120
+    side_effect: local_read
+    policy_source: registry:get_score_grid
+    idempotent: true
+    parallel_safe: true
+    max_concurrency: 2
+    max_output_chars: 12000
+
+  update_scores:
+    provider: backend.application.course_eval.tools:get_update_scores_tool
+    description: 按用户指正修正分数（写审计、触发统计回退）
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；cells 需含 student_id/section_id/item_id/score；走 score_service.update_scores。
+    timeout_seconds: 120
+    side_effect: db_write
+    policy_source: registry:update_scores
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 8000
+
+  confirm_scores:
+    provider: backend.application.course_eval.tools:get_confirm_scores_tool
+    description: 教师认可自动识别得分时置为已确认（不改分值，写审计）
+    domains: [course-outcome-evaluation, fundamental-mechanics-course]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；教师说「分数没问题/确认」时调用，cells 省略即确认全部待核对；教师给的是修正值时改用 update_scores；走 score_service.confirm_scores。
+    timeout_seconds: 120
+    side_effect: db_write
+    policy_source: registry:confirm_scores
+    idempotent: true
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 4000
+
+  apply_mappings:
+    provider: backend.application.course_eval.tools:get_apply_mappings_tool
+    description: 按用户确认的映射建议落库（标 confirmed_by、触发回退）
+    domains: [course-outcome-evaluation]
+    workflows: [full, plan_solve]
+    risk_level: write
+    enabled_by_default: true
+    instructions: 写工具；mappings 需含 goal_id/section_id/item_id/weight；走 mapping_service.apply_mappings。
+    timeout_seconds: 120
+    side_effect: db_write
+    policy_source: registry:apply_mappings
+    idempotent: false
+    parallel_safe: false
+    max_concurrency: 1
+    max_output_chars: 8000

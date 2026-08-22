@@ -1,5 +1,21 @@
 <script setup lang="ts">
 import { computed } from 'vue';
+import {
+  Activity,
+  BarChart3,
+  CircleDot,
+  Cpu,
+  Database,
+  FlaskConical,
+  Link2,
+  Network,
+  RadioTower,
+  ScanSearch,
+  ShieldCheck,
+  Sparkles,
+  Waves,
+  Zap,
+} from 'lucide-vue-next';
 import type { ExploreTopic } from '@/api/explore';
 
 const props = defineProps<{
@@ -14,15 +30,32 @@ defineEmits<{
 }>();
 
 const DOT_COLORS = [
-  'from-indigo-500 to-violet-500 ring-indigo-500/20',
-  'from-violet-500 to-purple-500 ring-violet-500/20',
-  'from-blue-500 to-indigo-500 ring-blue-500/20',
-  'from-indigo-400 to-blue-500 ring-indigo-400/20',
-  'from-purple-500 to-indigo-600 ring-purple-500/20',
-  'from-sky-500 to-indigo-500 ring-sky-500/20',
+  'text-accent bg-accent-soft',
+  'text-blue-600 bg-blue-500/10',
+  'text-fuchsia-600 bg-fuchsia-500/10',
+  'text-accent bg-accent-soft',
+  'text-sky-600 bg-sky-500/10',
+  'text-accent bg-accent-soft',
 ];
 
 const dotClass = computed(() => DOT_COLORS[props.index % DOT_COLORS.length]);
+const iconSet = [
+  Zap,
+  Database,
+  CircleDot,
+  ShieldCheck,
+  Activity,
+  Cpu,
+  Waves,
+  Link2,
+  FlaskConical,
+  BarChart3,
+  ScanSearch,
+  Network,
+  RadioTower,
+  Sparkles,
+];
+const bubbleIcon = computed(() => iconSet[props.index % iconSet.length]);
 
 const floatStyle = computed(() => {
   const delay = (props.index % 7) * -0.65; // Use negative delay so it starts floating immediately
@@ -44,29 +77,21 @@ const floatStyle = computed(() => {
     @mouseenter="$emit('hover', true)"
     @mouseleave="$emit('hover', false)"
   >
-    <!-- 悬停霓虹发光底色 -->
-    <span class="absolute -inset-1.5 rounded-2xl bg-gradient-to-r from-indigo-500/0 to-purple-500/0 opacity-0 group-hover:from-indigo-500/12 group-hover:to-purple-500/12 blur-xl transition-all duration-500 group-hover:opacity-100" />
+    <span class="absolute -inset-2 rounded-2xl bg-accent/0 opacity-0 blur-xl transition-all duration-500 group-hover:bg-accent-soft group-hover:opacity-100" />
     
-    <!-- 气泡本体玻璃态 -->
     <span
-      class="relative flex items-center gap-2 min-w-0 rounded-2xl border border-white/70 dark:border-slate-800/80 bg-white/75 dark:bg-slate-900/60 backdrop-blur-xl shadow-sm shadow-indigo-100/30 dark:shadow-none transition-all duration-300 group-hover:border-indigo-400/60 dark:group-hover:border-indigo-500/50 group-hover:shadow-lg group-hover:shadow-indigo-500/10 dark:group-hover:shadow-indigo-500/5"
-      :class="size === 'lg' ? 'px-4.5 py-3' : 'px-4 py-2.5'"
+      class="relative flex items-center gap-2.5 min-w-0 rounded-2xl border border-border-subtle bg-surface/90 backdrop-blur-2xl transition-all duration-300 group-hover:border-accent/80 group-hover:bg-surface dark:border-white/10"
+      :class="size === 'lg' ? 'px-[18px] py-3' : 'px-4 py-2.5'"
     >
-      <!-- 核心脉冲指示器 -->
-      <span class="relative flex h-2 w-2 shrink-0">
-        <span
-          class="animate-ping absolute inline-flex h-full w-full rounded-full opacity-60"
-          :class="[dotClass.split(' ')[0]]"
-        />
-        <span
-          class="relative inline-flex rounded-full bg-gradient-to-br shadow-inner ring-4"
-          :class="[dotClass, size === 'lg' ? 'w-2 h-2' : 'w-2 h-2']"
-        />
+      <span
+        class="relative grid shrink-0 place-items-center rounded-xl"
+        :class="[dotClass, size === 'lg' ? 'h-7 w-7' : 'h-6 w-6']"
+      >
+        <component :is="bubbleIcon" :class="size === 'lg' ? 'h-4 w-4' : 'h-3.5 w-3.5'" />
       </span>
       
-      <!-- 主题标签文本 -->
       <span
-        class="font-medium text-slate-700 dark:text-slate-200 whitespace-nowrap group-hover:text-indigo-600 dark:group-hover:text-indigo-300 transition-colors tracking-wide"
+        class="max-w-[190px] truncate whitespace-nowrap font-semibold text-text-secondary transition-colors group-hover:text-accent"
         :class="size === 'lg' ? 'text-[13px]' : 'text-[12px]'"
       >{{ topic.title }}</span>
     </span>

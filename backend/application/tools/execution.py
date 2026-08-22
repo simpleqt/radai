@@ -15,6 +15,9 @@ from time import monotonic
 from typing import Any
 
 from backend.application.tools.runtime_state import tool_runtime_state
+from backend.config.loggers import get_logger
+
+logger = get_logger(__name__)
 
 _CONCURRENCY_LOCK = threading.Lock()
 _CONCURRENCY_LIMITERS: weakref.WeakKeyDictionary[
@@ -385,6 +388,16 @@ def _bound_tool_result(value: Any, limit: int | None) -> Any:
         except (TypeError, ValueError, json.JSONDecodeError):
             return bounded
 
+    # LangGraph 工具（如 search_question_bank）返回 Command 而非裸值：上限
+    # 必须作用于 update["messages"] 里各消息的 content，否则 max_output_chars
+    # 对这类工具是无效声明。
+    try:
+        from langgraph.types import Command as _LangGraphCommand
+    except ImportError:  # pragma: no cover - langgraph 是核心依赖
+        _LangGraphCommand = None
+    if _LangGraphCommand is not None and isinstance(value, _LangGraphCommand):
+        return _bound_command_result(value, limit)
+
     content = getattr(value, "content", None)
     if not isinstance(content, str) or len(content) <= limit:
         return value
@@ -393,6 +406,29 @@ def _bound_tool_result(value: Any, limit: int | None) -> Any:
     if callable(model_copy):
         return model_copy(update={"content": bounded_content})
     return value
+
+
+def _bound_command_result(command: Any, limit: int) -> Any:
+    import dataclasses
+
+    update = getattr(command, "update", None)
+    if not isinstance(update, dict):
+        return command
+    messages = update.get("messages")
+    if not isinstance(messages, list):
+        return command
+    bounded_messages = [_bound_tool_result(item, limit) for item in messages]
+    if all(
+        new is old
+        for new, old in zip(bounded_messages, messages, strict=False)
+    ):
+        return command
+    new_update = dict(update)
+    new_update["messages"] = bounded_messages
+    try:
+        return dataclasses.replace(command, update=new_update)
+    except TypeError:
+        return command
 
 
 def _bound_text(value: str, limit: int) -> str:
@@ -462,6 +498,7 @@ def _service_cache_get(tool_obj: Any, cache_key: str) -> Any:
     try:
         return copy.deepcopy(value)
     except Exception:
+        logger.debug("工具结果缓存深拷贝失败，丢弃缓存项", exc_info=True)
         with _RESULT_CACHE_LOCK:
             loop_cache = _RESULT_CACHES.get(loop)
             if loop_cache is not None and loop_cache.get(key) is cached:
@@ -483,6 +520,7 @@ def _service_cache_put(
     try:
         cached_value = copy.deepcopy(value)
     except (TypeError, ValueError):
+        logger.debug("工具结果不可深拷贝，跳过缓存", exc_info=True)
         return
     loop = asyncio.get_running_loop()
     key = (id(tool_obj), cache_key)
@@ -558,6 +596,10 @@ def invoke_sync_with_timeout(call, *, timeout: float, label: str) -> Any:
         raise
     thread.join(timeout=bounded_timeout)
     if thread.is_alive():
+        logger.warning(
+            "同步工具调用超时，后台守护线程将继续运行直至调用自行结束: tool=%s",
+            label,
+        )
         raise TimeoutError(f"Tool '{label}' timed out after {timeout:.0f}s")
     try:
         ok, value = result_queue.get_nowait()

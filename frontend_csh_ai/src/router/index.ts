@@ -1,57 +1,46 @@
-import { createRouter, createWebHistory } from 'vue-router'
+import { createRouter, createWebHistory, type RouteLocationGeneric, type RouteRecordRaw } from 'vue-router'
 import { authState } from '@/utils/request'
 import AdminLayout from '@/views/admin/components/AdminLayout.vue'
 
-const detectDefaultMode = (): 'mobile' | 'desktop' => {
-  const fromStorage = (localStorage.getItem('ui_mode') || 'auto').toLowerCase();
-  if (fromStorage === 'mobile') return 'mobile';
-  if (fromStorage === 'desktop') return 'desktop';
+const APP_NAME = '成理场地污染水文地质智学助手'
 
-  // Client-side detection only since we need window
-  if (typeof window === 'undefined') return 'desktop';
-
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-  const width = window.innerWidth;
-  const uaMobile = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(ua.toLowerCase());
-  return uaMobile || width <= 900 ? 'mobile' : 'desktop';
+const normalizeSafeRedirect = (value: unknown): string | null => {
+  if (typeof value !== 'string') return null;
+  if (!value.startsWith('/') || value.startsWith('//')) return null;
+  return value;
 };
 
-const remapChatPathByMode = (toPath: string, mode: 'mobile' | 'desktop', threadId?: string) => {
-  const base = mode === 'mobile' ? '/m' : '/app';
-  if (threadId) return `${base}/${threadId}`;
-  return base;
+/** 旧的移动端专用路径统一并入 /app，布局改由容器宽度决定 */
+const toAppPath = (to: RouteLocationGeneric) => {
+  const threadId = to.params.threadId as string | undefined;
+  return { path: threadId ? `/app/${threadId}` : '/app', query: to.query, hash: to.hash };
 };
 
-const routes = [
-  { path: '/', redirect: () => (detectDefaultMode() === 'mobile' ? '/m' : '/app') },
-  // 探索式学习路由需先于 /app/:threadId? 与 /m/:threadId? 定义，避免被通配的 threadId 抢占匹配。
+const routes: RouteRecordRaw[] = [
+  { path: '/', redirect: '/app' },
+  // 探索式学习路由需先于 /app/:threadId? 定义，避免被通配的 threadId 抢占匹配。
   {
     path: '/explore',
     component: () => import('@/views/explore/index.vue'),
-    meta: { title: '探索式学习 - 成理场地污染水文地质智学助手' }
-  },
-  {
-    path: '/m/explore',
-    component: () => import('@/views/explore/index.vue'),
-    meta: { title: '探索式学习 - 成理场地污染水文地质智学助手' }
+    meta: { title: `探索式学习 - ${APP_NAME}` }
   },
   {
     path: '/groundwater/:threadId?',
     component: () => import('@/views/groundwater/index.vue'),
     meta: {
-      title: '地下水项目分析 - 成理场地污染水文地质智学助手',
+      title: `地下水项目分析 - ${APP_NAME}`,
       requiresAuth: true,
     }
   },
   {
-    path: '/app/:threadId?',
-    component: () => import('@/views/ne-full/index.vue'),
-    meta: { title: '成理场地污染水文地质智学助手' }
+    path: '/settings',
+    component: () => import('@/views/settings/index.vue'),
+    meta: { title: `用户设置 - ${APP_NAME}`, requiresAuth: true }
   },
   {
-    path: '/m/:threadId?',
+    path: '/app/:threadId?',
     component: () => import('@/views/ne-full/index.vue'),
-    meta: { title: '成理场地污染水文地质智学助手' }
+    meta: { title: APP_NAME }
   },
   {
     path: '/login',
@@ -61,26 +50,20 @@ const routes = [
   {
     path: '/my-files',
     component: () => import('@/views/ne-full/MyFilesView.vue'),
-    meta: { title: '个人文件库 - 成理场地污染水文地质智学助手', requiresAuth: true }
+    meta: { title: `个人文件库 - ${APP_NAME}`, requiresAuth: true }
   },
-  {
-    path: '/chat/:threadId?',
-    redirect: (to: any) => {
-      const mode = detectDefaultMode();
-      return { path: remapChatPathByMode(to.path, mode, to.params.threadId as string | undefined) };
-    },
-  },
-  { 
-    path: '/ne-full/:threadId?', 
-    redirect: (to: any) => {
-      const mode = detectDefaultMode();
-      return { path: remapChatPathByMode(to.path, mode, to.params.threadId as string | undefined) };
-    },
-  },
+
+  // 兼容旧链接与用户收藏
+  { path: '/m/explore', redirect: '/explore' },
+  { path: '/m/settings', redirect: '/settings' },
+  { path: '/m/:threadId?', redirect: toAppPath },
+  { path: '/chat/:threadId?', redirect: toAppPath },
+  { path: '/ne-full/:threadId?', redirect: toAppPath },
+
   {
     path: '/admin/login',
     component: () => import('@/views/admin/login.vue'),
-    meta: { title: '管理员登录', guest: true }
+    meta: { title: '智能体管理平台 - 管理员登录', guest: true }
   },
   {
     path: '/admin',
@@ -99,6 +82,21 @@ const routes = [
         meta: { title: '知识库管理' }
       },
       {
+        path: 'prompts',
+        component: () => import('@/views/admin/prompt-management.vue'),
+        meta: { title: '提示词管理' }
+      },
+      {
+        path: 'skills',
+        component: () => import('@/views/admin/skills.vue'),
+        meta: { title: 'Skills 管理' }
+      },
+      {
+        path: 'datasets',
+        component: () => import('@/views/admin/datasets.vue'),
+        meta: { title: '实验数据管理' }
+      },
+      {
         path: 'groundwater-projects',
         component: () => import('@/views/admin/groundwater-projects.vue'),
         meta: { title: '地下水项目管理' }
@@ -114,28 +112,14 @@ const routes = [
 
 const router = createRouter({
   history: createWebHistory(),
-  routes
-})
-
-router.beforeEach((to, from, next) => {
-  if (to.meta.title) document.title = to.meta.title as string;
-
-  const isChatPath = (path: string) => {
-    if (path === '/explore' || path === '/m/explore') return false;
-    return path === '/app' || path.startsWith('/app/') || path === '/m' || path.startsWith('/m/');
-  };
-
-  if (isChatPath(to.path)) {
-    const expectedMode = to.query.mode === 'desktop' ? 'desktop' : to.query.mode === 'mobile' ? 'mobile' : detectDefaultMode();
-    const targetPath = remapChatPathByMode(to.path, expectedMode, to.params.threadId as string | undefined);
-    
-    if (expectedMode === 'mobile' && (to.path === '/app' || to.path.startsWith('/app/'))) {
-      return next({ path: targetPath, query: to.query, hash: to.hash, replace: true });
-    }
-    if (expectedMode === 'desktop' && (to.path === '/m' || to.path.startsWith('/m/'))) {
-      return next({ path: targetPath, query: to.query, hash: to.hash, replace: true });
-    }
+  routes,
+  scrollBehavior(_to, _from, savedPosition) {
+    return savedPosition || { top: 0 };
   }
+});
+
+router.beforeEach((to, _from, next) => {
+  if (to.meta.title) document.title = to.meta.title as string;
 
   const isAuth = !!authState.value.token;
   const isAdmin = String(authState.value.user?.role || '').toLowerCase() === 'admin';
@@ -153,23 +137,23 @@ router.beforeEach((to, from, next) => {
       return;
     }
 
-    if (!isAdmin && to.path !== '/admin/login') {
+    if (!isAdmin) {
       next('/app');
       return;
     }
   }
-  
+
   if (to.meta.requiresAuth && !isAuth) {
     if (to.path.startsWith('/admin')) {
       next('/admin/login');
     } else {
-      next('/login');
+      next({ path: '/login', query: { redirect: to.fullPath } });
     }
   } else if (to.meta.guest && isAuth) {
     if (to.path.startsWith('/admin')) {
       next(isAdmin ? '/admin/dashboard' : '/app');
     } else {
-      next('/app');
+      next(normalizeSafeRedirect(to.query.redirect) || '/app');
     }
   } else {
     next();

@@ -10,6 +10,7 @@ from langchain_core.tools import tool
 
 from backend.application.groundwater import GroundwaterProjectService
 from backend.application.tools.providers.excel_engine import (
+    _UNSAFE_SQL,
     _mask_sql_literals_and_comments,
     execute_named_tables_sql,
     get_named_tables_schema,
@@ -19,14 +20,6 @@ from backend.core.tools.tool_arguments import clean_malformed_tool_text
 from backend.domain.tools.runtime_context import ToolRuntimeContext
 
 logger = get_logger(__name__)
-
-_UNSAFE_SQL = re.compile(
-    r"\b(attach|copy|create|delete|detach|drop|export|import|insert|install|load|"
-    r"glob|httpfs|parquet_scan|postgres_scan|pragma|read_csv|read_json|"
-    r"read_parquet|read_text|replace|secret|sqlite_scan|update|"
-    r"write_csv|write_parquet)\b",
-    re.IGNORECASE,
-)
 
 # Project packages are standardized over time, while models often use generic
 # hydrogeology names.  Keep this compatibility layer deliberately small and

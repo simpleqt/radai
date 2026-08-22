@@ -1,98 +1,53 @@
-# 核电子学智能助手 (RadAI)
+# RADAI 智能体平台
 
-RAG + 多智能体平台，面向核电子学领域知识问答、文档管理与深度研究；并扩展支持成理水文地质智学助手 (CSH-AI) 与访客演示模式。
+RADAI 是从原单体仓库拆分出来的**独立智能体平台**:智能体运行时、会话、技能、
+题库/学情/课程评价,以及全部前端应用。**知识库能力已拆分至独立的
+[omnigraph](https://github.com/simpleqt/omnigraph) 知识服务**(自研入库 + 自研检索),
+本仓库不再包含 RAG/知识库实现,全部通过 HTTP 访问:
 
-**完整文档** → [`docs/README.md`](docs/README.md)
+- 知识库管理/上传/文档/关键词/目录/入库管理:经 `backend/api/routers/knowledge_proxy.py`
+  反向代理到 `KNOWLEDGE_SERVICE_BASE_URL`(默认 `http://127.0.0.1:8086`)
+- 检索工具(`multi_kb_search`)、MCP 文本检索、图片检索、会话暂存清理:
+  经 `X-Internal-Secret` 保护的 omnigraph 内部接口
+  (`backend/application/knowledge/internal_client.py`)
 
----
+## 部署前提
 
-## 产品线
-
-| 产品 | 前端 | 端口 | 后端 API |
-| :--- | :--- | :--- | :--- |
-| RadAI 核电子学智能助手 | `frontend/` | 5173 | 主 API `:8082` → `/api/v2/agent` |
-| CSH-AI 水文地质智学助手 | `frontend_csh_ai/` | 5174 | 主 API `:8082` → `/api/v2/csh_agent` |
-| Guest 访客演示 | `guest/` | 8085 | 访客 API `:8083` |
-
----
-
-## 技术栈
-
-Python 3.14 · FastAPI · LangGraph · LightRAG · Vue 3 · Vite 8 · Tailwind CSS 4
-
-基础设施：MySQL · Milvus · NebulaGraph · MinIO · Redis · Kafka · SQLite (Checkpointer)
-
----
+1. 部署并启动 omnigraph 知识服务(见其仓库 README)
+2. 本服务与 omnigraph 配置**相同的非空** `INTERNAL_API_SECRET`
+3. `.env` 中设置 `KNOWLEDGE_SERVICE_BASE_URL=http://127.0.0.1:8086`
+4. 共享同一 MySQL/Redis/MinIO 实例
 
 ## 快速开始
 
 ```bash
-# 1. 安装依赖
+cp .env.example .env      # 填写连接信息与 INTERNAL_API_SECRET
 make install
-
-# 2. 配置环境变量（复制既有 backend/.env 或参考 plans/task_06_deployment_config.md）
-# 编辑 LLM、MySQL、Milvus、MinIO、Redis 等
-
-# 3. 初始化数据库
 make init-db
-
-# 4. 启动后端
-make run-api              # http://localhost:8082/docs
-
-# 5. 启动前端
-bash run_frontends.sh     # RadAI:5173 + CSH-AI:5174
+make run-api              # 智能体 API (8082)
+make run-guest-api        # 访客 API (8083)
 ```
 
-访客模式：
+> 原 `run-worker` / `run-ingest-worker` 已随知识库管线迁移至 omnigraph。
+
+## 结构
+
+```
+backend/    智能体平台服务(agent runtime/会话/技能/题库/MCP/前端 API)
+frontend*/  主站与各院系定制前端(csh/fmca/landslide/audit)
+guest/      访客前端
+deploy/     docker-test 编排与发布脚本
+docs/       设计文档(docs/split_agent_rag_services.md 描述两服务拆分部署)
+```
+
+## 开发
 
 ```bash
-make run-guest-api        # 访客 API :8083
-cd guest && npm run dev   # 访客前端 :8085
+make check-imports   # 校验内部导入闭包(拆分完整性门禁)
+make test            # pytest(智能体侧测试)
 ```
 
----
+## 来源
 
-## 常用命令
-
-```bash
-make help                 # 查看所有命令
-make test                 # 运行测试
-make run-worker           # Kafka 任务 Worker
-make run-ingest-worker    # 文档入库 Worker
-make lint                 # 代码检查
-```
-
----
-
-## 项目结构
-
-```text
-backend/          # API、Agent、RAG、DB、Worker、Skills
-frontend/         # RadAI 前端
-frontend_csh_ai/  # CSH-AI 前端
-guest/            # 访客前端
-docs/             # 项目文档
-eval/             # RAG 评测框架
-```
-
----
-
-## 文档导航
-
-| 文档 | 说明 |
-| :--- | :--- |
-| [docs/README.md](docs/README.md) | 文档总索引 |
-| [docs/developer_guide.md](docs/developer_guide.md) | 开发者指南 |
-| [docs/api_quick_reference.md](docs/api_quick_reference.md) | API 速查 |
-| [docs/architecture_overview.md](docs/architecture_overview.md) | 系统架构总览 |
-| [docs/知识库算法和架构.md](docs/知识库算法和架构.md) | RAG 检索算法、Profile、评测结论（生产主文档） |
-| [docs/文档代码对照清单.md](docs/文档代码对照清单.md) | 文档↔代码维护索引 |
-| [docs/docs_backend/README.md](docs/docs_backend/README.md) | 后端模块文档 |
-| [docs/docs_frontend/README.md](docs/docs_frontend/README.md) | 前端模块文档 |
-| [docs/docs_backend/deployment_runbook.md](docs/docs_backend/deployment_runbook.md) | 部署运维手册 |
-| [docs/下一步开发需求.md](docs/下一步开发需求.md) | 路线图与待办 |
-| [plans/debug/README.md](plans/debug/README.md) | 只读代码审查与文档差距追踪（不修代码） |
-
----
-
-© 2026 核电子学智能助手项目组
+由 RADAI 单体仓库拆分而来(2026-08-22),知识库侧见
+[omnigraph](https://github.com/simpleqt/omnigraph)。

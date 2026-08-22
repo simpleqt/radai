@@ -1,6 +1,6 @@
 # RAG (检索增强生成) 模块详解
 
-> **最后同步**：2026-05-31
+> **最后同步**：2026-07-14
 
 RAG 模块是「核电子学智能助手」的核心数据引擎。它负责将非结构化的专业文档（如 PDF、Markdown）转化为可检索的知识向量，并提供高效的高精度混合检索服务。
 
@@ -9,24 +9,46 @@ RAG 模块是「核电子学智能助手」的核心数据引擎。它负责将�
 > 本文档侧重 **代码模块结构** 与 **开发接入**；算法细节与消融结论以算法主文档为准。  
 > 📊 面试向流程图 → [plans/qa/03_rag_retrieval.md](../../plans/qa/03_rag_retrieval.md) · [00_architecture_diagrams.md](../../plans/qa/00_architecture_diagrams.md) 图 9–11
 
-### 入库总览
+### 入库总览（双轨）
+
+当前知识库入库采用 **legacy_lightrag / self_ingestion 长期双轨** 策略。历史知识库默认 legacy；新建知识库可在创建弹窗选择后端。上传先写 `kb_pending_files`，启动入库后置 `status=1`，Worker 统一经 `PendingIngestUseCase` 按后端分流，两套索引命名空间隔离。
 
 ```text
 上传/Admin ──► MinIO
      │
-     └──► kb_pending_files (status 0→1)
+     └──► kb_pending_files (status 0→1, ingestion_backend)
                 │
                 ▼
-          IngestWorker
+          IngestWorker / StartupTaskProcessor
                 │
+       ┌────────┴────────┐
+       ▼                 ▼
+ legacy_lightrag    self_ingestion
+       │                 │
+       ▼                 ▼
+ RAGAnything 解析   SelfIngestionPipeline
+       │            ParserRouter → BlockBuilder
+       ▼            → LLM/VLM 抽取 → Staging
+ LightRAG 入库      → CommitWriter
+       │                 ▼
+       ▼            MySQL job/chunk metadata
+ Milvus + Nebula          + Nebula v2 + Redis BM25
+ + Redis             + Milvus chunks/entities v2
+       │                 │
+       └────────┬────────┘
                 ▼
-          RAGAnything 解析
-                │
-                ▼
-          LightRAG 入库 ──► Milvus + NebulaGraph + Redis
-                │
-                └──► status=2
+        kb_pending_files status=2 / 3
+        self job status=success / partial_success / failed
 ```
+
+| 后端 | 代码入口 | 适用场景 |
+| :--- | :--- | :--- |
+| `legacy_lightrag` | `RAGService.process_multimodal()` / `process_md_content()` | 存量知识库、默认新库 |
+| `self_ingestion` | `SelfIngestionPipeline.ingest_pending_file()` | 需 `SELF_INGESTION_ENABLED` + KB `self_ingestion_enabled` + 可选白名单；支持学科 Schema、质量门控、版本化提交 |
+
+若 KB 声明 self 但开关/白名单不满足，路由结果为 `blocked`，`kb_pending_files.status=3`，对应 `kb_self_ingest_jobs.status` 记录失败/阻断原因，不会回退 legacy。
+
+详细设计与落地审计 → [入库实现方案.md](../入库实现方案.md) · [入库实现方案审查.md](../入库实现方案审查.md)
 ---
 
 ## 🔍 已有项目模块说明 (Existing Module)
@@ -252,19 +274,20 @@ MMR = λ × Sim(d_i, q) - (1-λ) × max[Sim(d_i, d_j)]  (j ∈ S)
 ### 5. 索引同步调度 (`rag/sync/`)
 
 #### 5.1 索引同步管理器 (`rag_index_sync_manager.py`)
--   确保 Milvus 向量库、NebulaGraph 图数据库与 MySQL 元数据的一致性。
--   支持增量同步与全量同步。
+-   面向 legacy LightRAG 索引的补充同步工具：入库后可从旧 Milvus chunks collection 找到 `chunk_id`，再从旧 Nebula 节点拉实体并批量补入。
+-   支持入库后异步增量同步；状态保存在进程内 `_sync_status`。
+-   **不负责** self_ingestion v2 的一致性修复。self v2 的 Milvus/Nebula/Redis 补偿由 `backend/rag/ingestion/repair_worker.py` 基于 `staging_uri` 重放。
 
 #### 5.2 定时同步调度器 (`rag_index_sync_scheduler.py`)
 -   默认凌晨 2:00 执行定时同步。
 -   支持手动触发同步。
--   心跳监测：检测索引服务的健康状态。
+-   调度器只负责任务编排；健康检查请使用 `/api/v1/admin/self-ingestion/health` 或 `/api/v1/health/self-ingestion`（self v2）。
 
 ---
 
 ### 6. 文档处理器 (`rag/document_processor.py`)
 
-**定位**: 文档处理 of 统一入口，复用 `RagService` 的初始化逻辑。
+**定位**: legacy 文档处理统一入口，复用 `RagService` 的初始化逻辑。
 
 **核心流程**:
 1.  懒加载 `RAGAnything` 实例（复用 `RagService` 单例）。
@@ -297,11 +320,11 @@ MMR = λ × Sim(d_i, q) - (1-λ) × max[Sim(d_i, d_j)]  (j ∈ S)
 
 | 用途 | kb_id | Profile |
 | :--- | :--- | :--- |
-| 核电子学主库 | `<kb_id_ne>` | `domain` |
-| 期刊论文库 | `<kb_id_paper>` | `domain` |
-| CSH 水文地质库 | `<kb_id_csh>` | `domain` |
-| GraphRAG-Bench medical | `<kb_id_bench_medical>` | `domain`（评测库，**未**写入 `_KNOWN_KB_PROFILES`） |
-| GraphRAG-Bench novel | `<kb_id_bench_novel>` | `general_qa`（同上，需 `RAG_KB_RETRIEVAL_PROFILE_MAP` 或 `kb_code` 前缀） |
+| 核电子学主库 | `c056bf59-6091-45ed-98cb-e2e860580a69` | `domain` |
+| 期刊论文库 | `de4ccde7-b286-4e49-bd8c-9dd37bd61878` | `domain` |
+| CSH 水文地质库 | `b4c3f145-de5f-42fb-88de-2d4856d57460` | `domain` |
+| GraphRAG-Bench medical | `aab46593-1a67-4917-a1c7-376c0af5ccaa` | `domain`（评测库，**未**写入 `_KNOWN_KB_PROFILES`） |
+| GraphRAG-Bench novel | `4163d2a5-3bfb-4c83-ab61-dc9221044ad0` | `general_qa`（同上，需 `RAG_KB_RETRIEVAL_PROFILE_MAP` 或 `kb_code` 前缀） |
 
 生产三库硬编码于 `retrieval_profile.py` 的 `_KNOWN_KB_PROFILES`；评测/临时库通过环境变量 **`RAG_KB_RETRIEVAL_PROFILE_MAP`**（JSON：`kb_id → profile`）或 **`kb_code` 前缀** 解析：
 
@@ -328,7 +351,7 @@ MMR = λ × Sim(d_i, q) - (1-λ) × max[Sim(d_i, d_j)]  (j ∈ S)
 
 ### 9. 多库 Agent 检索（`multi_kb_search_tool.py`）
 
-- 默认双库：核电子学 `<kb_id_ne>` + 期刊 `<kb_id_paper>`；CSH Agent 绑定 `<kb_id_csh>`。
+- 默认双库：核电子学 `c056bf59-…` + 期刊 `de4ccde7-…`；CSH Agent 绑定 `b4c3f145-…`。
 - 进程内调用 `retrieve_context`；未传 hl/ll 时共享一次关键词提取与 query embedding。
 - 环境变量：`MULTI_KB_PATH_A_QUERY_ONLY`（默认 1）、`MULTI_KB_SEARCH_DEFAULT_TOP_K`（10）、`MULTI_KB_SEARCH_DEFAULT_CHUNK_TOP_K`（6）等，详见算法主文档 §8。
 
@@ -336,13 +359,17 @@ MMR = λ × Sim(d_i, q) - (1-λ) × max[Sim(d_i, d_j)]  (j ∈ S)
 
 ## 📄 Markdown 直入库
 
-`.md` 文件可通过现有上传接口入库，Worker 自动识别 MIME/扩展名并跳过 MinerU：
+`.md` 文件可通过现有上传接口入库。当前没有直接 POST Markdown 文本内容的生产路由。
 
 ```text
 POST /api/v1/uploads/batch  →  PendingFile (status=0)
 POST /api/v1/uploads/ingest  →  status=1
-ingest-worker: PendingIngestProcessor → route=md-direct → MDIngestor
+ingest-worker:
+  legacy_lightrag + .md  → route=legacy-md-direct → MDIngestor
+  self_ingestion + .md   → SelfIngestionPipeline → markdown_parser.py / BlockBuilder
 ```
+
+self 链路的 staging/commit 会写入 `kb_self_ingest_jobs.staging_uri`、`kb_self_chunks`、Milvus `{kb_code}_chunks_v2` / `{kb_code}_entities_v2`、Redis BM25/metadata、NebulaGraph `entity_v2/relation_v2/evidence_v2`。MySQL 不再保存自研图谱事实表或质量事实表。
 
 详见 [md_ingestion_api.md](../md_ingestion_api.md)、[md_ingestion_design.md](../md_ingestion_design.md)。
 
@@ -365,11 +392,12 @@ ingest-worker: PendingIngestProcessor → route=md-direct → MDIngestor
 
 ### 4. 实时网页检索集成
 -   **落地**: 将 Web Search 结果实时转换为 RAG 临时索引，使智能体具备"即搜即用"的实时知识处理能力。
--   **实现路径**: 在 `multi_kb_search_tool` 中增加 `web_search_and_index` 选项，将 DuckDuckGo 搜索结果作为临时文档插入 LightRAG。
+-   **实现路径**: 在 `multi_kb_search_tool` 中增加 `web_search_and_index` 选项，将本地 Firecrawl 搜索结果作为临时文档插入 LightRAG。
 
 ### 5. 多模态查询增强
--   **现状**: `RAGAnything.aquery_with_multimodal()` 已支持图片/表格/公式查询。
--   **优化方向**: 支持用户上传图片作为查询输入（如"分析这张电路图"），通过 VLM 提取图片语义后进行检索。
+-   **现状**: `RAGAnything.aquery_with_multimodal()` 已支持图片/表格/公式查询；统一 Agent Runtime 的 `POST /api/v2/agent-runtime/query` 也已支持 `attachments`（`base64` 或 HTTP(S) `image_url`），由运行时将图片内容注入支持视觉的模型。
+-   **边界**: 直接调用 legacy `/api/v1/rag` 检索接口时，图片查询仍需由上层先完成视觉语义提取；不要把 Agent Runtime 的附件能力误认为所有 RAG HTTP 路由都自动支持图片输入。
+-   **输出安全**: legacy RAG 与 Agent Runtime 的 `message.replace` 出口会清理答案正文中误泄露的内部 `/api/v2/files/kb-image?...` 代理地址，同时保留 Markdown/HTML 图片和代码块中的合法图片引用。
 
 ### 6. Rerank 模型优化
 -   **现状**: 使用 `Qwen3-Reranker-8B` 远程 API。

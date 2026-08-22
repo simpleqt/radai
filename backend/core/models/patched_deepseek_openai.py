@@ -400,6 +400,13 @@ class PatchedDeepSeekOpenAI(ChatOpenAI):
                 for generation in result.generations:
                     yield self._to_generation_chunk(generation)
                 return
+            if late_tool_chunks:
+                # 出现过工具增量,但本轮以 stop/length 而非 tool_calls 收尾:
+                # 这些被缓冲的块其实是工具增量之后继续输出的正文与末尾 usage,
+                # 不补吐会让答案在工具片段处静默截断(R4-LM-4)。按序补吐。
+                for pending in late_tool_chunks:
+                    yield pending
+                late_tool_chunks.clear()
             logger.info(
                 "[ReasoningCompatibleChatOpenAI] provider stream completed: "
                 "chunks=%d visible_chunks=%d finish_reason=%s",
@@ -494,8 +501,10 @@ class PatchedDeepSeekOpenAI(ChatOpenAI):
                 message=default_chunk_class(content="", usage_metadata=usage_metadata),
                 generation_info=base_generation_info,
             )
+            # 与上游 1.3.4 对齐:保持 content 为 ""、不再置 []——空列表会让
+            # merge_content 静默吞掉后续字符串正文,并触发 content_blocks 的
+            # isinstance(list) 短路丢失 tool_call_chunks(R4-LM-10)。
             if self.output_version == "v1":
-                generation_chunk.message.content = []
                 generation_chunk.message.response_metadata["output_version"] = "v1"
             return generation_chunk
 

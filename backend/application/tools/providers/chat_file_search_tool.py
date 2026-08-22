@@ -97,7 +97,7 @@ def create_scoped_chat_file_search_tool(thread_id: str, *, user_id: str):
             # 注册该文件的图片 URL
             fid = getattr(r, 'file_id', '')
             if fid and fid not in registered_file_images:
-                meta = get_file_meta(fid)
+                meta = await asyncio.to_thread(get_file_meta, fid)
                 if meta:
                     doc_imgs = meta.get("image_urls") or []
                     tokens = []

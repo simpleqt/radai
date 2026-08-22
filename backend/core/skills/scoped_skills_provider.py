@@ -38,9 +38,43 @@ _SKILL_CACHE_TTL_SECONDS = _positive_float_env(
     30.0,
 )
 
+# Providers are request-scoped, so an instance-level cache alone never survives
+# to the next request and every agent build re-walked the skill directories.
+# The scan result is shared process-wide per root pair; catalog changes go
+# through invalidate_all_skill_caches (management service + Redis event).
+_GLOBAL_SKILLS_CACHE_LOCK = threading.RLock()
+_GLOBAL_SKILLS_CACHE: dict[tuple[str, str], tuple[float, list[Skill]]] = {}
+
+
+def _load_skills_shared(base_path: Path) -> list[Skill]:
+    """Load and merge skill roots through the process-wide scan cache."""
+
+    managed_root = get_managed_skills_root_path()
+    key = (str(base_path), str(managed_root))
+    now = time.monotonic()
+    with _GLOBAL_SKILLS_CACHE_LOCK:
+        entry = _GLOBAL_SKILLS_CACHE.get(key)
+        if entry is not None and now - entry[0] < _SKILL_CACHE_TTL_SECONDS:
+            return entry[1]
+    by_name = {skill.name: skill for skill in load_skills(skills_path=base_path)}
+    if managed_root != base_path and managed_root.exists():
+        for skill in load_skills(skills_path=managed_root):
+            by_name[skill.name] = skill
+    skills = sorted(by_name.values(), key=lambda item: item.name)
+    with _GLOBAL_SKILLS_CACHE_LOCK:
+        _GLOBAL_SKILLS_CACHE[key] = (time.monotonic(), skills)
+    logger.info(
+        "[ScopedSkillsProvider] 已扫描 Skills 总数=%d, 根目录=%s",
+        len(skills),
+        base_path,
+    )
+    return skills
+
 
 def invalidate_all_skill_caches() -> None:
-    """Invalidate every live provider in this process after a catalog change."""
+    """Invalidate every skill cache in this process after a catalog change."""
+    with _GLOBAL_SKILLS_CACHE_LOCK:
+        _GLOBAL_SKILLS_CACHE.clear()
     with _PROVIDER_LOCK:
         providers = list(_PROVIDER_INSTANCES)
     for provider in providers:
@@ -77,7 +111,7 @@ class ScopedSkillsProvider:
             self._skills_cache_loaded_at = 0.0
 
     def _load_all_skills(self) -> list[Skill]:
-        """加载所有 Skills（带缓存）。"""
+        """加载所有 Skills（实例缓存之下共享进程级扫描缓存）。"""
         with self._cache_lock:
             cache_expired = (
                 self._skills_cache is not None
@@ -85,21 +119,8 @@ class ScopedSkillsProvider:
                 >= _SKILL_CACHE_TTL_SECONDS
             )
             if self._skills_cache is None or cache_expired:
-                by_name = {
-                    skill.name: skill
-                    for skill in load_skills(skills_path=self._skills_base_path)
-                }
-                managed_root = get_managed_skills_root_path()
-                if managed_root != self._skills_base_path and managed_root.exists():
-                    for skill in load_skills(skills_path=managed_root):
-                        by_name[skill.name] = skill
-                self._skills_cache = sorted(by_name.values(), key=lambda item: item.name)
+                self._skills_cache = _load_skills_shared(self._skills_base_path)
                 self._skills_cache_loaded_at = time.monotonic()
-                logger.info(
-                    "[ScopedSkillsProvider] 已加载 Skills 总数=%d, 根目录=%s",
-                    len(self._skills_cache),
-                    self._skills_base_path,
-                )
             return list(self._skills_cache)
 
     def get_available_skills_for_user(

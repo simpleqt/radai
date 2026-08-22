@@ -39,6 +39,7 @@ from backend.core.agents.runtime_store import (
 )
 
 _IN_MEMORY_RUNTIME_STORE: InMemoryAgentRuntimeStore | None = None
+_IN_MEMORY_RUNTIME_STORE_LOCK = threading.Lock()
 _LIVE_RUNTIME_MANAGERS: weakref.WeakValueDictionary[str, AgentRuntimeManager] = (
     weakref.WeakValueDictionary()
 )
@@ -109,9 +110,12 @@ def create_agent_runtime_store_from_env(
         return None
     if backend == "memory":
         global _IN_MEMORY_RUNTIME_STORE
-        if _IN_MEMORY_RUNTIME_STORE is None:
-            _IN_MEMORY_RUNTIME_STORE = InMemoryAgentRuntimeStore()
-        return _IN_MEMORY_RUNTIME_STORE
+        # 每个流式请求都会走到这里;加锁防止并发首建两个 store 导致运行时
+        # 快照分裂(输家线程建的 store 只被自己那次请求使用后丢弃)。
+        with _IN_MEMORY_RUNTIME_STORE_LOCK:
+            if _IN_MEMORY_RUNTIME_STORE is None:
+                _IN_MEMORY_RUNTIME_STORE = InMemoryAgentRuntimeStore()
+            return _IN_MEMORY_RUNTIME_STORE
     if backend == "sqlite":
         default_path = (
             Path(__file__).resolve().parents[2]

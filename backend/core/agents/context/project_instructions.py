@@ -104,13 +104,6 @@ def load_project_instructions(
     return result
 
 
-def invalidate_project_instructions_cache() -> None:
-    """Drop cached instruction snapshots after an explicit file change."""
-
-    with _CACHE_LOCK:
-        _CACHE.clear()
-
-
 def _resolve_workspace(
     cwd: str | os.PathLike[str],
     *,

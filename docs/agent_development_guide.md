@@ -1,7 +1,7 @@
 # 智能体开放框架开发指南与扩展规范
 
-> 适用仓库：`RadAI`  
-> 基线日期：2026-06-10  
+> 适用仓库：`langchian_project`
+> 基线日期：2026-07-14
 > 适用范围：新增领域智能体、Prompt、Skill、Tool、Workflow、MCP 服务及对应前端接入
 
 ## 1. 文档目标
@@ -44,6 +44,58 @@ HTTP Request
 | Workflow 注册 | `backend/config/workflows/registry.yaml` |
 | MCP 服务绑定 | `backend/config/mcp/registry.yaml` |
 | 标准运行入口 | `POST /api/v2/agent-runtime/query` |
+| 子智能体 manifest（task 委派） | `backend/config/agents/runtime_agents.yaml` |
+| 运行预算与协调默认值 | `AgentRuntimeBudget`（`backend/domain/agents/runtime_budget.py`） |
+| 子智能体生命周期与请求树控制 | `AgentControl`（`backend/core/agents/control.py`） |
+| Trace / Replay / Eval | `AgentTraceStore`、`python -m backend.cli agent replay/eval` |
+
+当前仓库内置的运行时 Profile：
+
+| Profile | domain | 默认 workflow | ToolPolicy | 默认 Skill | 特殊上下文 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `ne` | `nuclear-electronics` | `lightweight` | `ne_default` | `nuclear-electronics`、`general-table-analysis` | 无 |
+| `csh` | `csh-hydrogeology` | `full` | `csh_default` | `csh-hydrogeology`、`general-table-analysis` | 无 |
+| `groundwater` | `groundwater-project-analysis` | `full` | `groundwater_default` | `groundwater-project-analysis` | `backend.application.groundwater.runtime_context:resolve_groundwater_domain_context` |
+
+`ne` 允许 `lightweight/full/deep_research/plan_solve/multi_agent_parallel/multi_agent_alternating`；`csh` 允许除 `lightweight` 外的上述工作流；`groundwater` 当前只允许 `full/multi_agent_parallel/multi_agent_alternating`，并依赖项目上下文与 `groundwater_project_bootstrap` 约束 SQL 工具链路。
+
+### 1.1 子智能体 Runtime Manifest
+
+除领域 Profile（`backend/config/agents/<agent_code>.yaml`）外，平台还通过 **`backend/config/agents/runtime_agents.yaml`** 声明可执行的运行时角色。该 manifest 同时服务 `task` 工具委派和协同工作流单元，当前包含 `planner`、`domain_analyst`、`data_analyst`、`evidence_researcher`、`risk_reviewer`、`solution_architect`、`report_writer`、`reviewer`、`deep-research`、`general-purpose` 等角色。`RuntimeAgentLoader` 位于 `backend/application/agents/runtime_agent_loader.py`，领域模型 `RuntimeAgentSpec` 位于 `backend/domain/agents/runtime_agent.py`。每条 `RuntimeAgentSpec` 包含：
+
+- `description`、`system_prompt`：角色说明与隔离上下文指令；
+- `allowed_tools` / `required_tools` / `disallowed_tools`：工具白名单、必需工具和黑名单（如禁止嵌套 `task`）；
+- `max_turns`、`timeout_seconds`、`model`、`reasoning_effort`、`output_schema`：运行预算、模型覆盖和输出契约；
+- `tool_access`、`can_use_network`、`can_read_kb`：是否构建隔离子图、是否继承搜索和知识库能力。
+
+协调工作流（`deep_research`、`plan_solve`、`multi_agent_*`）的并发数、超时、事件队列和 partial handoff 由每个 `CoordinatedAgentWorkflow` 实例持有的不可变 **`AgentRuntimeBudget`** 快照控制。显式注入预算优先；未注入时在实例创建阶段读取环境。模块常量仅保留兼容用途；新增参数时应先扩展预算对象，再由 workflow 实例读取，不要恢复 import-time 环境固化或分散硬编码。
+
+`task` 委派与协同工作流单元共用请求树控制：`AgentStreamRuntime` 或独立的 `CoordinatedAgentWorkflow` 为根请求创建 `AgentRuntimeManager`（`AgentControl` 兼容名称），当前 `task` 限制为总委派数 16、活动数按 `max_concurrent_subagents` 限制在 1–5、最大深度 1。超额任务进入 FIFO 队列，根流结束时级联中断后代；旧 ContextVar semaphore 只兼容不经过平台运行时的直接调用，扩展代码不得同时获取两套并发控制。`task` 的角色配置继续从 manifest 加载，不再维护 `_SUBAGENT_CONFIGS`。
+
+不要绕过 `AgentStreamRuntime.aquery_stream()` 跨 Task 驱动内部 `_aquery_stream_impl()`。公开入口通过稳定 producer task 保证工具预算、Skill 状态和 `AgentControl` 的 `ContextVar` 在整个执行期一致。
+
+> 完整演进路线与 Phase 落地状态见 [codex_like_agent_runtime_optimization_plan.md](./codex_like_agent_runtime_optimization_plan.md)。
+
+### 1.2 Trace、Replay 与调试接口
+
+当 `trace_enabled=True` 时，标准工作流与协调工作流会写入运行追踪（run / event / unit / handoff / tool call / context pack）。`AgentService` 默认使用本次 `request_id` 作为 `run_id`，环境变量 `AGENT_TRACE_ENABLED=1` 或可信内部 metadata `_trace_enabled=true` 可开启追踪。默认 `AGENT_TRACE_BACKEND=jsonl`，也支持 `indexed`（SQLite 索引 + 本地/MinIO 对象）和 `sql`（共享 MySQL 索引 + 本地/MinIO 对象）；`AGENT_TRACE_ROOT` 可覆盖默认 JSONL 目录。Trace Recorder 会对常见 Token、密码和 API key 字段做脱敏。支持：
+
+- CLI：`python -m backend.cli agent replay`（dry-run / tool-cache / full 离线复现）；
+- CLI：`python -m backend.cli agent eval`（JSONL 回归集评分、历史趋势、版本对比）；
+- API：`GET /api/v2/agent-runtime/runs/{run_id}` 系列（events、units、tool-calls、context-packs、handoffs）和 `POST /api/v2/agent-runtime/runs/{run_id}/replay`。
+- API：`POST /api/v2/agent-runtime/runs/{run_id}/cancel` 可取消当前 API Worker 中仍存活的运行树；跨 Worker 取消不能仅依赖进程内运行树注册表。
+
+Handoff V2 使用机器可读 JSON 交接块（含 `schema_version`、`source_coverage`、`validation_warnings`），writer 前经 `CitationVerifier` 预校验。大工具结果通过 `ContextArtifactStore`（本地 / MinIO）与 `read_context_artifact` 工具按需恢复，详见 [dynamic_context_management_design.md](./dynamic_context_management_design.md)。
+
+### 1.3 业务域智能体团队（非 Profile）
+
+部分业务模块采用 **Agent-shaped 多角色编排**，与 Profile + Workflow 主链路并行存在，例如：
+
+| 模块 | 编排类 | 角色示例 | 说明 |
+| :--- | :--- | :--- | :--- |
+| 自定义学习 | `CustomLearningAgentTeam` | `CurriculumPlannerAgent`、`LearningStyleCoachAgent`、`ExploreBridgeAgent` 等 | 规则版计划生成与节点编排；接口 `/api/v1/custom-learning`，详见 [custom_learning_closed_loop_design.md](./custom_learning_closed_loop_design.md) |
+
+这类团队当前以确定性逻辑实现，类边界按智能体角色拆分，后续可替换为 LLM 驱动而不改变路由契约。
 
 ## 2. 核心原则
 
@@ -136,7 +188,7 @@ request.metadata
 `agent_code` 必须：
 
 - 使用小写 ASCII；
-- 仅包含字母、数字、下划线；
+- 仅包含小写字母、数字和连字符；
 - 简短且全局唯一；
 - 与 Profile 文件名一致。
 
@@ -144,8 +196,8 @@ request.metadata
 
 ```text
 geology
-chemical_safety
-medical_qa
+chemical-safety
+medical-qa
 ```
 
 不推荐：
@@ -153,7 +205,7 @@ medical_qa
 ```text
 GeologyAgent
 地质智能体
-geology-full-feature
+geology_full_feature
 ```
 
 ### 3.2 Domain
@@ -184,17 +236,38 @@ Tool 名称必须与 LangChain `BaseTool.name` 一致，否则策略审计可能
 
 ## 4. 最小新增流程
 
-新增一个只复用现有 Workflow 和 Tool 的领域智能体，至少需要完成：
+新增一个只复用现有 Workflow 和公共 Tool 的领域智能体，先从项目源码根目录运行：
 
-1. 创建 Agent Profile；
-2. 创建并注册 Prompt；
-3. 创建领域 Skill；
-4. 创建 Tool Policy；
-5. 扩展所需 ToolSpec 的 `domains`；
-6. 如访问请求级业务资源，创建 Domain Context Provider 和运行时权限策略；
-7. 增加契约测试；
-8. 验证标准 API；
-9. 完成前端 agent code 与 metadata 接入。
+```bash
+doc-agent agent init geology \
+  --name "工程地质智能助手" \
+  --domain engineering-geology \
+  --default-workflow full
+
+doc-agent agent validate geology
+```
+
+`agent init` 会一次性生成 Profile、Prompt provider、领域 Skill 和最小 ToolPolicy，
+并使用目标源码树自己的 Profile/Prompt/ToolPolicy/Skill/Workflow 注册表执行统一验证。
+注册表采用原子语义更新；任何生成或验证失败都会回滚文件。CLI 不会修改 wheel 安装目录；
+操作其他兼容源码树时使用 `--project-root <path>`，验证也使用同名参数。
+
+统一验证器输出 `ResolvedAgentDefinition`，只有以下引用全部可解析且相互兼容时才通过：
+
+```text
+Profile -> Prompt -> ToolPolicy -> Tool provider
+        -> Skill dependency closure -> Workflow provider
+        -> KB policy -> Guardrail -> Domain Context provider
+```
+
+随后至少需要完成：
+
+1. 按业务需求细化脚手架生成的 Prompt 和 Skill；
+2. 复用公共 wildcard Tool，或显式注册领域 Tool；
+3. 如访问请求级业务资源，创建 Domain Context Provider 和运行时权限策略；
+4. 增加第四领域契约测试；
+5. 验证标准 API；
+6. 完成前端从 Profile Info 动态读取能力的接入。
 
 以下以 `geology` 为示例。
 
@@ -278,7 +351,7 @@ request.selected_skills 非空
 - 当前协议不支持用空列表显式关闭 Profile 默认 Skill；
 - 用户显式选择 Skill 时，不会与默认 Skill 合并，而是使用用户提交列表；
 - `WorkflowRegistry` 的 Skill preferred/full 自动选择依据仍是请求中显式提交的 Skill；
-- `lightweight` Workflow 会主动清空 Skill，以保持轻量执行。
+- `lightweight` Workflow 不再清空有效 Skill。它会保留 Profile 默认或用户选择的 Skill，用于 ToolPolicy 和 Prompt 约束，但执行器只装配轻量 workflow 允许的工具。
 
 前端仍应调用 `/profiles/{agent_code}/info` 初始化选中状态，确保 UI 展示与实际运行时一致。
 
@@ -554,7 +627,13 @@ Skill 声明的每个 Tool 必须同时满足：
 4. ToolSpec 支持目标 Workflow；
 5. `required_skills` 与实际选择条件一致。
 
-否则 Skill 虽能加载，工具仍不会进入执行器。
+否则 Skill 虽能加载，工具仍不会进入执行器。装配阶段会对声明工具做审计：
+
+- `chat_file_search` 只有当前 `thread_id` 已建立文件索引时才允许缺失，否则视为声明错误；
+- `multi_kb_search` 在 `kb_ids` 为空时允许缺失；
+- `web_search` 在 `use_search=false` 时允许缺失；
+- ToolSpec 不支持当前 domain/workflow/skill 时允许缺失；
+- 其他未授权或未装配的业务工具会直接抛出运行时错误，避免 Prompt 或 Skill 声称可用但实际不可调用。
 
 ## 8. 注册和开发 Tool
 
@@ -668,7 +747,7 @@ tools:
 | `domains` | 空表示不限领域；推荐显式配置 |
 | `workflows` | 使用 capability 匹配，不要只考虑字面名称 |
 | `required_skills` | 非空时，选择其中任一 Skill 即可通过当前实现 |
-| `risk_level` | 仅允许 `safe/network/write/sandbox` |
+| `risk_level` | 仅允许 `safe/network/write` |
 | `enabled_by_default` | 当前不替代 ToolPolicy 准入 |
 
 注意：当前 `required_skills` 使用集合相交判断。如果一个工具要求多个 Skill 同时满足，现有模型无法表达，必须先扩展契约和测试，不能误用列表表达 AND 语义。
@@ -704,6 +783,15 @@ policies:
 ToolPolicy 是业务工具的第一层准入来源。`enabled_by_default` 不能绕过 Policy。
 工具装配完成后，`RuntimePolicyGuardrailProvider` 还会按实际 allowlist、KB 权限和领域权限执行第二层校验。
 
+当前内置策略注意事项：
+
+- `web_search` 已支持 `lightweight`、`full`、`deep_research` 和 `plan_solve`，但仍需 `use_search=true` 且被 ToolPolicy 选中；
+- `academic_search` 可由 `academic-search` 或 `paper-review` Skill 触发，Registry 的 `required_skills` 使用 OR 语义；
+- `save_deep_research_report` 由深研 Skill/Workflow 通过策略装配，协同工作流保存报告时也通过运行时工具调用链执行；
+- `chat_file_search` 由会话文件索引决定是否注入，不能只靠 Policy include 强制启用。
+
+编排代码如果需要主动调用工具，应使用 `backend/application/tools/runtime_invoker.py` 中的 `RuntimeToolInvoker`，不要直接 import provider 函数。`RuntimeToolInvoker` 会基于 `AgentRuntimeContext` 重建 `ToolRuntimeContext`、按 ToolPolicy 装配工具，并再次经过 `RuntimePolicyGuardrailProvider` 校验。
+
 ### 8.5 扩展已有 Tool 的领域
 
 如新智能体复用 `multi_kb_search`，需要把新 domain 加入该 ToolSpec：
@@ -723,7 +811,7 @@ domains:
 
 优先使用：
 
-- `lightweight`：低开销问答，不加载 Skill 工具；
+- `lightweight`：低开销问答，保留有效 Skill 参与策略约束，只装配 lightweight workflow 允许的检索/文件工具；
 - `full`：完整模型、Skill、Tool、KB 能力；
 - `deep_research`：计划、多分支证据收集、Writer 汇总和报告工件生成；
 - `plan_solve`：计划、多分支求解和 Reviewer 汇总；
@@ -732,8 +820,8 @@ domains:
 
 不要仅因 Prompt 不同就创建新 Workflow。
 
-当前协同 Workflow 全部在本次 SSE 请求中执行。旧版后台研究任务已经移除，
-`/task/{task_id}/status|stream|cancel` 端点返回 HTTP 410，不得继续依赖旧任务协议。
+协同 Workflow 的底层执行统一由当前请求创建的 `CoordinatedAgentWorkflow` 完成；但 HTTP 路由会将 `deep_research` 与 `plan_solve` 包装为可重连后台任务。此时 `POST /api/v2/agent-runtime/query` 只返回启动确认，必须通过
+`/api/v2/agent-runtime/{agent_code}/task/{task_id}/status|stream|cancel` 查询、订阅和取消；`lightweight`、`full` 与 `multi_agent_*` 仍在 `/query` 的当前 SSE 中直接返回完整结果。
 
 ### 9.2 新 Workflow 协议
 
@@ -974,7 +1062,7 @@ settings.redis_host
 - KB 访问范围；
 - 文件路径和对象存储 key 校验；
 - ToolPolicy 准入；
-- network/write/sandbox 风险控制；
+- network/write 工具范围和副作用控制；
 - 子智能体并发、递归和超时限制；
 - 日志脱敏；
 - 错误信息脱敏。
@@ -983,19 +1071,16 @@ Prompt 中的“禁止访问”不能代替后端权限控制。
 
 ## 14. 当前已知平台限制
 
-截至 2026-06-10，新增领域时必须关注以下限制。
+截至 2026-07-20，新增领域时必须关注以下限制。
 
-### 14.1 执行器诊断行为仍存在领域映射
+### 14.1 未知领域已 fail-fast，领域扩展不得依赖兼容回退
 
-`ProfiledAgentExecutor._domain_key` 已显式支持 NE、CSH 和 groundwater，但其他新领域仍默认归入 NE，用于：
+Profile、Prompt、ToolPolicy、Skill、Workflow 或 Tool provider 缺失时，运行时和
+`doc-agent agent validate` 都会明确失败，不再静默回退到 NE。未知领域保留自身 code/domain，
+graph label/name 由通用规则生成；公共检索 Tool 通过 `domains: ["*"]` 显式开放。
 
-- graph label；
-- graph name；
-- `prompt_domain`；
-- KB 检索调用次数默认值；
-- 部分输出诊断行为。
-
-因此新增第四类领域时，应先将这些运行参数配置化，或明确扩展映射并增加测试，不能静默依赖 NE 默认行为。
+新增领域不得重新引入 `or "ne"`、未知 code 映射 NE、Prompt 拼错后按 domain 回退等兼容逻辑。
+若需要专有 Tool 或 Guardrail，应先注册并通过统一验证器，再开放 Profile。
 
 ### 14.2 Guardrail Policy 尚未配置化注册
 
@@ -1024,10 +1109,9 @@ backend/core/agents/middlewares/runtime_policy.py
 
 在统一绑定来源前，正式默认 KB 应同时维护 Profile 与数据库展示绑定，并增加真实请求测试。
 
-### 14.4 旧后台 Deep Research API 已移除
+### 14.4 协同 Deep Research 的 HTTP 生命周期
 
-协同深研现在直接输出标准 SSE 和报告工件。旧任务状态、任务事件流和取消端点返回 410。
-前端不得再以 `task_id` 作为深研完成条件，应以当前 SSE 的 `done` 和工件事件为准。
+协同深研底层直接输出标准 AgentEvent 和报告工件，但 `deep_research` / `plan_solve` 的 HTTP 入口使用可重连后台任务保护长耗时执行。`POST /query` 返回启动事件后结束，前端应读取其中的 `task_id`，再订阅 task stream 获取最终答案，并以 task 状态 `completed/failed/cancelled` 和流中的 `done`/工件事件作为完成依据。`task_id` 不是旧协议，而是当前长任务恢复契约。
 
 ### 14.5 Domain Context Provider 是同步契约
 
@@ -1076,6 +1160,10 @@ def test_geology_profile_loads():
 - Tool 不直接使用原始 metadata 扩大资源范围；
 - network/write 工具有权限和失败路径测试。
 
+`doc-agent agent validate` 对 Tool provider 执行的是静态结构校验：验证可导入对象是
+`BaseTool` 或签名兼容的同步工厂，但不会执行工厂代码。因而新增 provider 仍必须有上面的
+materialize/smoke 测试，证明其实际返回 `BaseTool` 或 `list[BaseTool]`。
+
 ### 15.4 Workflow 测试
 
 必须验证：
@@ -1109,7 +1197,10 @@ def test_geology_profile_loads():
 
 ```bash
 ./venv314/bin/python -m compileall -q backend
+./venv314/bin/python -m backend.cli agent validate
 ./venv314/bin/python -m pytest -q \
+  backend/tests/test_agent_definition_contracts.py \
+  backend/tests/test_executor_domain_extensibility.py \
   backend/tests/test_agent_platform_standardization.py \
   backend/tests/test_agent_runtime_policies.py \
   backend/tests/test_groundwater_project_runtime.py
@@ -1141,7 +1232,7 @@ def test_geology_profile_loads():
 ```bash
 curl -sS \
   -H "Authorization: Bearer <API_KEY>" \
-  http://<guest_frontend_host>:<guest_frontend_port>/api/v2/agent-runtime/profiles/geology
+  http://127.0.0.1:8082/api/v2/agent-runtime/profiles/geology
 ```
 
 查询烟测：
@@ -1157,7 +1248,7 @@ curl -N \
     "selected_skills": ["engineering-geology"],
     "use_search": true
   }' \
-  http://<guest_frontend_host>:<guest_frontend_port>/api/v2/agent-runtime/query
+  http://127.0.0.1:8082/api/v2/agent-runtime/query
 ```
 
 ## 16. 代码审查标准
@@ -1214,7 +1305,8 @@ curl -N \
 - [ ] API SSE smoke 通过；
 - [ ] 日志中无密钥、Token 和敏感文档内容；
 - [ ] 前端没有硬编码错误的 `agent_code`；
-- [ ] 新领域已处理执行器默认归入 NE 的诊断映射限制；
+- [ ] `doc-agent agent validate <code>` 返回 `valid: true`；
+- [ ] 第四领域契约证明中央运行时 Python 零修改；
 - [ ] 项目型入口正确提交 metadata 且拒绝越权资源。
 
 ## 17. 完成定义

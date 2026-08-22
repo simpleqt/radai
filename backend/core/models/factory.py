@@ -1,9 +1,9 @@
 """Unified model factory — creates chat model instances.
 
-``create_chat_model`` resolution order depends on ``MODEL_CONFIG_SOURCE`` (default: ``db``):
+``create_chat_model`` resolution depends on ``MODEL_CONFIG_SOURCE`` (default: ``db``):
 
-- **db** (default): active row in MySQL ``llm_models`` (``usage_scope='chat'``) →
-  ``config.yaml`` via ``get_app_config()`` → ``BaseLLMProvider`` / ``settings``.
+- **db** (default): an active row in MySQL ``llm_models`` for the requested
+  usage scope. The database catalog is authoritative and fails closed.
 - **yaml** (or any value other than ``db``): skip the database → ``config.yaml`` →
   ``settings``.
 """
@@ -15,15 +15,20 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Union
 
-import httpx
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult, ChatGenerationChunk
 from langchain_core.language_models.chat_models import BaseChatModel
 
 from backend.config.loggers import get_logger
+from backend.core.models.base_llm import get_shared_http_clients
 
 logger = get_logger(__name__)
+
+_MODEL_FACTORY_ASYNC_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("MODEL_FACTORY_ASYNC_TIMEOUT_SECONDS", "10") or "10"),
+)
 
 
 def _is_cancelled_error(error: BaseException) -> bool:
@@ -222,9 +227,6 @@ class LLMPerformanceCallback(BaseCallbackHandler):
         self._finish_run(run_id)
 
 _CONFIG_AVAILABLE: bool | None = None
-_DB_FAILURE_BACKOFF_SECONDS = 60.0
-_db_unavailable_until = 0.0
-
 _REASONING_COMPAT_CHAT_OPENAI = (
     "backend.core.models.patched_deepseek_openai:PatchedDeepSeekOpenAI"
 )
@@ -351,13 +353,21 @@ def _create_from_settings(name: str | None, **kwargs: Any) -> BaseChatModel:
     return BaseLLMProvider.get_model(model_name=name, **kwargs)
 
 
-def _load_from_db(name: str | None) -> dict | None:
+def _load_from_db(name: str | None, usage_scope: str = "chat") -> dict | None:
     """从数据库加载模型配置（带进程内缓存 + TTL）"""
-    from backend.core.models.model_cache import get_cached_model_config, set_cached_model_config
-    
-    cached = get_cached_model_config(name)
+    from backend.core.models.model_cache import (
+        current_cache_generation,
+        get_cached_model_config,
+        set_cached_model_config,
+    )
+
+    cached = get_cached_model_config(name, usage_scope)
     if cached:
         return cached
+
+    # 在发起 DB 读取前捕获失效代数:读取期间若发生 invalidate,回填会被
+    # set_cached_model_config 拒绝,避免旧配置复活(R4-LM-5)。
+    generation = current_cache_generation()
 
     # 同步查询数据库
     from backend.db.connection import get_session
@@ -370,7 +380,7 @@ def _load_from_db(name: str | None) -> dict | None:
             stmt = (
                 select(LlmModel)
                 .where(
-                    LlmModel.usage_scope == "chat",
+                    LlmModel.usage_scope == usage_scope,
                     LlmModel.is_active == True,
                 )
                 .order_by(LlmModel.is_default.desc(), LlmModel.sort_order)
@@ -379,7 +389,7 @@ def _load_from_db(name: str | None) -> dict | None:
         else:
             stmt = select(LlmModel).where(
                 LlmModel.name == name,
-                LlmModel.usage_scope == "chat",
+                LlmModel.usage_scope == usage_scope,
                 LlmModel.is_active == True,
             ).limit(1)
 
@@ -387,7 +397,9 @@ def _load_from_db(name: str | None) -> dict | None:
         model = result.scalar_one_or_none()
         if model:
             config = model.to_model_config_dict()
-            set_cached_model_config(name or "__default__", config)
+            set_cached_model_config(
+                name or "__default__", config, usage_scope, generation=generation
+            )
             return config
     finally:
         session.close()
@@ -446,10 +458,9 @@ def _inject_no_proxy_http_clients(model_settings: dict, *, model_use: str) -> No
     normalized_use = str(model_use).lower()
     if "chatopenai" not in normalized_use and "patcheddeepseekopenai" not in normalized_use:
         return
-    if "http_client" not in model_settings:
-        model_settings["http_client"] = httpx.Client(trust_env=False)
-    if "http_async_client" not in model_settings:
-        model_settings["http_async_client"] = httpx.AsyncClient(trust_env=False)
+    sync_client, async_client = get_shared_http_clients()
+    model_settings.setdefault("http_client", sync_client)
+    model_settings.setdefault("http_async_client", async_client)
 
 
 def _build_model_settings(model_config_obj: Any, thinking_enabled: bool, kwargs: dict) -> dict[str, Any]:
@@ -474,27 +485,40 @@ def _build_model_settings(model_config_obj: Any, thinking_enabled: bool, kwargs:
 def create_chat_model(
     name: str | None = None,
     thinking_enabled: bool = False,
+    *,
+    usage_scope: str = "chat",
     **kwargs: Any,
 ) -> BaseChatModel:
     """Create a chat model instance.
 
-    Uses ``MODEL_CONFIG_SOURCE`` (default ``db``): when ``db``, tries MySQL
-    ``llm_models`` first, then ``config.yaml``, then ``BaseLLMProvider`` /
-    ``settings``. When not ``db``, skips the database and uses ``config.yaml``
-    then ``settings``.
+    Uses ``MODEL_CONFIG_SOURCE`` (default ``db``). When it is ``db``, MySQL
+    ``llm_models`` is authoritative and the requested ``usage_scope`` must
+    match. Otherwise, the legacy YAML/settings fallback is retained for
+    development compatibility and supports only the ``chat`` scope.
     """
-    global _db_unavailable_until
-
     config_source = os.environ.get("MODEL_CONFIG_SOURCE", "db").lower()
 
-    if config_source == "db" and time.monotonic() >= _db_unavailable_until:
+    if config_source == "db":
         try:
-            db_config = _load_from_db(name)
+            db_config = _load_from_db(name, usage_scope)
             if db_config:
                 return _create_from_db_config(db_config, thinking_enabled, **kwargs)
         except Exception as e:
-            _db_unavailable_until = time.monotonic() + _DB_FAILURE_BACKOFF_SECONDS
-            logger.debug("DB-based model creation unavailable for '%s', falling back to config.yaml: %s", name, e)
+            logger.error(
+                "DB-based model creation unavailable for '%s' in scope '%s'",
+                name,
+                usage_scope,
+                exc_info=e,
+            )
+            raise RuntimeError("数据库模型目录暂不可用") from e
+        raise ValueError(
+            f"Active model {name or '<default>'} not found in usage scope {usage_scope}"
+        )
+
+    if usage_scope != "chat":
+        raise ValueError(
+            f"Usage scope {usage_scope} requires MODEL_CONFIG_SOURCE=db"
+        )
 
     if _check_config_available():
         try:
@@ -508,13 +532,78 @@ def create_chat_model(
 async def create_chat_model_async(
     name: str | None = None,
     thinking_enabled: bool = False,
+    *,
+    usage_scope: str = "chat",
     **kwargs: Any,
 ) -> BaseChatModel:
-    """Create a model without blocking an async caller on DB/config I/O."""
-    return await asyncio.to_thread(
-        create_chat_model,
-        name,
-        thinking_enabled,
+    """Create a model without blocking an async caller on DB/config I/O.
+
+    构造被丢进 to_thread,工作线程内没有运行循环——若不干预,注入的 async HTTP
+    client 会退回进程级兜底而非本循环的 per-loop client(R4-LM-1)。这里在调用方
+    循环上取到 per-loop client 并经 ContextVar 预置(to_thread 传播 contextvars),
+    让线程内的 get_shared_http_clients 优先取用它。仅当调用方未显式传入
+    http_async_client 时生效。
+    """
+    from backend.core.models.base_llm import (
+        get_shared_http_clients,
+        reset_preferred_async_http_client,
+        set_preferred_async_http_client,
+    )
+
+    token = None
+    if "http_async_client" not in kwargs:
+        try:
+            _sync_client, async_client = get_shared_http_clients()
+            token = set_preferred_async_http_client(async_client)
+        except Exception:
+            logger.debug("预置 per-loop async client 失败,回退线程内解析", exc_info=True)
+            token = None
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                create_chat_model,
+                name,
+                thinking_enabled,
+                usage_scope=usage_scope,
+                **kwargs,
+            ),
+            timeout=_MODEL_FACTORY_ASYNC_TIMEOUT_SECONDS,
+        )
+    finally:
+        if token is not None:
+            reset_preferred_async_http_client(token)
+
+
+def create_scoped_chat_model(
+    usage_scope: str,
+    name: str | None = None,
+    thinking_enabled: bool = False,
+    **kwargs: Any,
+) -> BaseChatModel:
+    """Create an internal-purpose model without a chat-scope fallback."""
+
+    if usage_scope == "chat":
+        raise ValueError("Use create_chat_model for frontend chat models")
+    return create_chat_model(
+        name=name,
+        thinking_enabled=thinking_enabled,
+        usage_scope=usage_scope,
+        **kwargs,
+    )
+
+
+async def create_scoped_chat_model_async(
+    usage_scope: str,
+    name: str | None = None,
+    thinking_enabled: bool = False,
+    **kwargs: Any,
+) -> BaseChatModel:
+    """Async internal-purpose model factory."""
+
+    return await create_chat_model_async(
+        name=name,
+        thinking_enabled=thinking_enabled,
+        usage_scope=usage_scope,
         **kwargs,
     )
 

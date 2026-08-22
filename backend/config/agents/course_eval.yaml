@@ -1,0 +1,18 @@
+code: course_eval
+name: 课程达成度评价智能体
+domain: course-outcome-evaluation
+description: 面向试卷分析、课程目标达成度评价与持续改进报告生成的只读辅助智能体
+default_model: null
+default_kb_ids: []
+default_skills:
+  - course-outcome-eval
+default_workflow: full
+allowed_workflows:
+  - lightweight
+  - full
+  - plan_solve
+prompt_profile: course_eval
+tool_policy: course_eval_default
+kb_policy: bound_or_selected
+guardrail_policy: default
+ui_profile: course_eval

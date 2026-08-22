@@ -159,26 +159,26 @@ watch(() => props.show, (newVal) => {
 
 <template>
   <Transition name="fade">
-    <div v-if="show" class="fixed inset-0 z-[100] flex items-center justify-center p-4">
+    <div v-if="show" class="fixed inset-0 z-[100] flex items-center justify-center p-4" role="dialog" aria-modal="true" aria-label="选择我的文件">
       <!-- Backdrop with premium blur effect -->
-      <div class="absolute inset-0 bg-slate-900/60 dark:bg-slate-950/70 backdrop-blur-md" @click="emit('close')"></div>
+      <div class="absolute inset-0 bg-slate-950/20 backdrop-blur-md dark:bg-black/45" aria-hidden="true" @click="emit('close')"></div>
       
       <!-- Modal window -->
-      <div class="relative w-full max-w-3xl bg-white dark:bg-[#0f172a] border border-slate-200 dark:border-slate-800 rounded-2xl shadow-2xl flex flex-col overflow-hidden max-h-[85vh] animate-scale-up">
+      <div class="relative flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-white/55 bg-surface/90 shadow-2xl backdrop-blur-2xl animate-scale-up dark:border-white/10 dark:bg-surface/95">
         <!-- Header -->
-        <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+        <div class="px-6 py-4 border-b border-border-subtle flex items-center justify-between">
           <div class="flex items-center space-x-2.5">
-            <div class="w-8 h-8 rounded-lg bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-indigo-600 dark:text-indigo-400">
+            <div class="w-8 h-8 rounded-lg bg-accent-soft flex items-center justify-center text-accent">
               <svg class="w-4.5 h-4.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
                 <path stroke-linecap="round" stroke-linejoin="round" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z" />
               </svg>
             </div>
             <div>
-              <h3 class="text-base font-bold text-slate-800 dark:text-slate-100">选择个人文件库文件</h3>
-              <p class="text-xs text-slate-400 dark:text-slate-500 mt-0.5">可复用历史已上传及系统生成的文件，避免重复解析</p>
+              <h3 class="text-base font-bold text-text-primary">选择个人文件库文件</h3>
+              <p class="text-xs text-text-tertiary mt-0.5">可复用历史已上传及系统生成的文件，避免重复解析</p>
             </div>
           </div>
-          <button @click="emit('close')" class="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 transition-colors">
+          <button @click="emit('close')" class="p-1.5 rounded-lg text-text-tertiary hover:text-text-secondary transition-colors">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
               <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" />
             </svg>
@@ -186,16 +186,16 @@ watch(() => props.show, (newVal) => {
         </div>
 
         <!-- Filter bar -->
-        <div class="p-4 bg-slate-50 dark:bg-slate-900/40 border-b border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row gap-3">
+        <div class="p-4 bg-surface-sunken border-b border-border-subtle flex flex-col sm:flex-row gap-3">
           <div class="flex-1 relative">
             <input
               type="text"
               v-model="keyword"
               placeholder="搜索文件名..."
               @keyup.enter="handleSearch"
-              class="w-full h-9 pl-9 pr-4 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm focus:outline-none focus:border-indigo-500 text-slate-700 dark:text-slate-200"
+              class="w-full h-9 pl-9 pr-4 rounded-lg border border-border-subtle bg-surface text-sm focus:outline-none focus:border-accent text-text-secondary"
             />
-            <svg class="absolute left-3 top-2.5 w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+            <svg class="absolute left-3 top-2.5 w-4 h-4 text-text-tertiary" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
               <path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
           </div>
@@ -203,18 +203,18 @@ watch(() => props.show, (newVal) => {
             <select
               v-model="fileType"
               @change="handleSearch"
-              class="h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm focus:outline-none text-slate-700 dark:text-slate-200"
+              class="h-9 px-3 rounded-lg border border-border-subtle bg-surface text-sm focus:outline-none text-text-secondary"
             >
               <option v-for="opt in typeOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
             </select>
             <select
               v-model="source"
               @change="handleSearch"
-              class="h-9 px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-sm focus:outline-none text-slate-700 dark:text-slate-200"
+              class="h-9 px-3 rounded-lg border border-border-subtle bg-surface text-sm focus:outline-none text-text-secondary"
             >
               <option v-for="opt in sourceOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
             </select>
-            <button @click="handleSearch" class="px-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-sm font-semibold transition-colors flex items-center justify-center">
+            <button @click="handleSearch" class="px-4 bg-accent hover:bg-accent-hover text-white rounded-lg text-sm font-semibold transition-colors flex items-center justify-center">
               筛选
             </button>
           </div>
@@ -223,18 +223,18 @@ watch(() => props.show, (newVal) => {
         <!-- File List -->
         <div class="flex-1 min-h-[300px] overflow-y-auto p-4">
           <div v-if="loading" class="flex flex-col items-center justify-center h-64">
-            <svg class="animate-spin h-8 w-8 text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <svg class="animate-spin h-8 w-8 text-accent" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
               <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
               <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
             </svg>
-            <span class="text-sm text-slate-400 mt-2">加载文件列表中...</span>
+            <span class="text-sm text-text-tertiary mt-2">加载文件列表中...</span>
           </div>
 
           <div v-else-if="files.length === 0" class="flex flex-col items-center justify-center h-64 text-center">
-            <svg class="w-12 h-12 text-slate-300 dark:text-slate-700" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <svg class="w-12 h-12 text-text-tertiary" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
               <path stroke-linecap="round" stroke-linejoin="round" d="M9 13h6m-3-3v6m-9 1V4a2 2 0 012-2h6l2 2h6a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2z" />
             </svg>
-            <p class="text-slate-400 text-sm mt-3">没有找到任何匹配的文件</p>
+            <p class="text-text-tertiary text-sm mt-3">没有找到任何匹配的文件</p>
           </div>
 
           <div v-else class="space-y-1.5">
@@ -243,17 +243,15 @@ watch(() => props.show, (newVal) => {
               :key="file.file_id"
               @click="toggleSelectFile(file)"
               class="group flex items-center justify-between p-3 rounded-xl border transition-all cursor-pointer"
-              :class="isSelected(file.file_id)
-                ? 'border-indigo-500 bg-indigo-50/40 dark:bg-indigo-900/10'
-                : 'border-slate-100 hover:border-slate-200 dark:border-slate-800 dark:hover:border-slate-700 bg-white dark:bg-slate-900/50'"
+              :class="isSelected(file.file_id) ? 'border-accent bg-accent-soft'
+                : 'border-border-subtle hover:border-border-subtle bg-surface'"
             >
               <div class="flex items-center space-x-3 min-w-0">
                 <!-- Checkbox -->
                 <div
                   class="w-5 h-5 rounded border flex items-center justify-center transition-colors flex-shrink-0"
-                  :class="isSelected(file.file_id)
-                    ? 'bg-indigo-600 border-indigo-600 text-white'
-                    : 'border-slate-300 dark:border-slate-700 dark:bg-slate-800 text-transparent'"
+                  :class="isSelected(file.file_id) ? 'bg-accent border-accent text-white'
+                    : 'border-border-subtle text-transparent'"
                 >
                   <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3">
                     <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
@@ -261,7 +259,7 @@ watch(() => props.show, (newVal) => {
                 </div>
 
                 <!-- File Icon -->
-                <div class="w-9 h-9 rounded-lg bg-slate-50 dark:bg-slate-800/80 flex items-center justify-center text-slate-400 dark:text-slate-500 group-hover:text-indigo-500 transition-colors flex-shrink-0">
+                <div class="w-9 h-9 rounded-lg bg-surface-sunken flex items-center justify-center text-text-tertiary group-hover:text-accent transition-colors flex-shrink-0">
                   <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
                     <path stroke-linecap="round" stroke-linejoin="round" :d="getFileIconPath(file.display_name)" />
                   </svg>
@@ -269,10 +267,10 @@ watch(() => props.show, (newVal) => {
 
                 <!-- File info -->
                 <div class="min-w-0">
-                  <p class="text-sm font-semibold text-slate-700 dark:text-slate-200 truncate" :title="file.display_name">
+                  <p class="text-sm font-semibold text-text-secondary truncate" :title="file.display_name">
                     {{ file.display_name }}
                   </p>
-                  <div class="flex items-center space-x-3 text-xs text-slate-400 mt-0.5">
+                  <div class="flex items-center space-x-3 text-xs text-text-tertiary mt-0.5">
                     <span>{{ formatBytes(file.size_bytes) }}</span>
                     <span>•</span>
                     <span>{{ formatDate(file.created_at) }}</span>
@@ -284,8 +282,7 @@ watch(() => props.show, (newVal) => {
               <div class="flex items-center space-x-2 flex-shrink-0">
                 <span 
                   class="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider"
-                  :class="file.source_type === 'minio'
-                    ? 'bg-indigo-50 text-indigo-600 dark:bg-indigo-950/40 dark:text-indigo-400'
+                  :class="file.source_type === 'minio' ? 'bg-accent-soft text-accent'
                     : 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-400'"
                 >
                   {{ file.source_type === 'minio' ? '上传' : '自动生成' }}
@@ -296,25 +293,25 @@ watch(() => props.show, (newVal) => {
         </div>
 
         <!-- Footer / Action bar -->
-        <div class="px-6 py-4 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between bg-slate-50/50 dark:bg-slate-900/10">
+        <div class="px-6 py-4 border-t border-border-subtle flex items-center justify-between bg-surface-sunken">
           <!-- Pagination -->
           <div class="flex items-center space-x-2">
             <button
               @click="prevPage"
               :disabled="offset === 0 || loading"
-              class="p-1.5 rounded-lg border border-slate-200 dark:border-slate-800 disabled:opacity-50 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800/80 transition-colors"
+              class="p-1.5 rounded-lg border border-border-subtle disabled:opacity-50 text-text-secondary hover:bg-surface-hover transition-colors"
             >
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
               </svg>
             </button>
-            <span class="text-xs text-slate-400 dark:text-slate-500 font-medium">
+            <span class="text-xs text-text-tertiary font-medium">
               第 {{ Math.floor(offset / limit) + 1 }} 页 / 共 {{ Math.ceil(total / limit) || 1 }} 页
             </span>
             <button
               @click="nextPage"
               :disabled="offset + limit >= total || loading"
-              class="p-1.5 rounded-lg border border-slate-200 dark:border-slate-800 disabled:opacity-50 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800/80 transition-colors"
+              class="p-1.5 rounded-lg border border-border-subtle disabled:opacity-50 text-text-secondary hover:bg-surface-hover transition-colors"
             >
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
@@ -323,13 +320,13 @@ watch(() => props.show, (newVal) => {
           </div>
 
           <div class="flex items-center space-x-2">
-            <button @click="emit('close')" class="px-4 py-2 border border-slate-200 dark:border-slate-800 rounded-xl text-sm font-semibold text-slate-500 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
+            <button @click="emit('close')" class="px-4 py-2 border border-border-subtle rounded-xl text-sm font-semibold text-text-secondary hover:bg-surface-hover transition-colors">
               取消
             </button>
             <button
               @click="confirmSelection"
               :disabled="selectedFileIds.length === 0"
-              class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 dark:disabled:bg-slate-800 disabled:text-slate-400 text-white rounded-xl text-sm font-semibold transition-colors flex items-center space-x-2 shadow-lg shadow-indigo-200/40 dark:shadow-none"
+              class="px-5 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-sunken disabled:text-text-tertiary text-white rounded-xl text-sm font-semibold transition-colors flex items-center space-x-2 shadow-sm dark:shadow-none"
             >
               <span>确认添加 (已选 {{ selectedFileIds.length }} 个)</span>
             </button>

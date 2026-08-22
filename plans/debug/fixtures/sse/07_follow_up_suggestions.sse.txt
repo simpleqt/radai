@@ -1,4 +1,0 @@
-data: {"type": "follow_up_suggestions", "suggestions": ["问题A", "问题B"], "metadata": {"source": "llm"}}
-
-data: [DONE]
-

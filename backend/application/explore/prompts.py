@@ -15,24 +15,6 @@ def _context_block(context: str) -> str:
     return ctx
 
 
-def build_topics_prompt(*, subject: str, count: int, context: str, seed: str = "") -> str:
-    """发现态：生成可供探索的主题气泡。"""
-    seed_hint = f"用户希望聚焦于「{seed}」相关方向。\n" if seed.strip() else ""
-    return f"""你是「{subject}」领域的学习路径规划专家。请基于下方知识库内容，提炼 {count} 个适合学习者**探究式学习**的核心主题。
-
-{seed_hint}要求：
-1. 主题应覆盖该领域的关键知识点，由浅入深、彼此尽量不重复。
-2. 每个主题 title 不超过 12 个汉字；hint 为一句话引导（不超过 24 字）。
-3. 只能基于知识库内容与学科常识，不要编造不存在的概念。
-4. 严格只输出 JSON，不要任何额外说明文字。
-
-知识库内容：
-{_context_block(context)}
-
-输出 JSON 格式：
-{{"topics": [{{"title": "主题名", "hint": "一句话引导"}}]}}"""
-
-
 def build_map_prompt(*, subject: str, topic: str, max_children: int, context: str) -> str:
     """脑图态：为根主题生成第一层子知识点。"""
     return f"""你是「{subject}」领域的课程设计专家。学习者想以「{topic}」为主题开展探究式学习。

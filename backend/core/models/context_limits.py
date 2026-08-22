@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -25,7 +26,42 @@ _LIMITS_CACHE_TTL_SECONDS = max(
     float(os.getenv("MODEL_CONTEXT_LIMITS_CACHE_SECONDS", "60") or "60"),
 )
 _LIMITS_CACHE_LOCK = threading.RLock()
+# 过期条目保留在缓存里作为"陈旧值":事件循环线程过期时直接返回陈旧值并由
+# 后台线程刷新,避免在 loop 上做同步 MySQL 往返(冷启动首查仍是同步一次)。
 _LIMITS_CACHE: dict[tuple[str, str], tuple[float, tuple[int | None, int | None]]] = {}
+_LIMITS_REFRESH_INFLIGHT: set[tuple[str, str]] = set()
+
+
+def _has_running_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _schedule_limits_refresh(
+    cache_key: tuple[str, str],
+    *,
+    name: str | None,
+    api_model: str | None,
+) -> None:
+    """Single-flight background refresh so expiry never blocks the event loop."""
+    with _LIMITS_CACHE_LOCK:
+        if cache_key in _LIMITS_REFRESH_INFLIGHT:
+            return
+        _LIMITS_REFRESH_INFLIGHT.add(cache_key)
+
+    def _refresh() -> None:
+        try:
+            _query_model_limits_from_db(cache_key, name=name, api_model=api_model)
+        finally:
+            with _LIMITS_CACHE_LOCK:
+                _LIMITS_REFRESH_INFLIGHT.discard(cache_key)
+
+    threading.Thread(
+        target=_refresh, name="model-limits-refresh", daemon=True
+    ).start()
 
 
 def _lookup_model_limits_from_db(
@@ -41,8 +77,28 @@ def _lookup_model_limits_from_db(
     if _LIMITS_CACHE_TTL_SECONDS > 0:
         with _LIMITS_CACHE_LOCK:
             cached = _LIMITS_CACHE.get(cache_key)
-            if cached is not None and cached[0] > now:
+        if cached is not None:
+            if cached[0] > now:
                 return cached[1]
+            if _has_running_loop():
+                _schedule_limits_refresh(cache_key, name=name, api_model=api_model)
+                return cached[1]
+        elif _has_running_loop():
+            # 冷启动首查同样不得在事件循环上做同步 MySQL 往返——DB 故障时该
+            # 调用会按连接超时阻塞整个 loop(R4-LM-6)。后台单飞刷新,本次
+            # 返回"未知"让上层走保守默认;不写负缓存,刷新完成后即拿到真值。
+            _schedule_limits_refresh(cache_key, name=name, api_model=api_model)
+            return (None, None)
+    return _query_model_limits_from_db(cache_key, name=name, api_model=api_model)
+
+
+def _query_model_limits_from_db(
+    cache_key: tuple[str, str],
+    *,
+    name: str | None,
+    api_model: str | None,
+) -> tuple[int | None, int | None]:
+    """同步 MySQL 查询并写缓存;只应在非事件循环线程或冷启动时调用。"""
     try:
         from sqlalchemy import select
 
@@ -81,6 +137,13 @@ def _lookup_model_limits_from_db(
             session.close()
     except Exception as exc:
         logger.debug("lookup model limits from DB failed: %s", exc)
+        # DB 异常绝不能覆盖最后已知好值——这是 stale-serve 的前提。仅当缓存里
+        # 尚无任何条目(冷启动)时才写入保守负结果;已有条目(哪怕已过期)保留，
+        # 让上层继续用旧的大窗口，而不是每个 TTL 周期都塌缩到保守 fallback。
+        with _LIMITS_CACHE_LOCK:
+            existing = _LIMITS_CACHE.get(cache_key)
+        if existing is not None:
+            return existing[1]
         _cache_model_limits(cache_key, (None, None))
     return None, None
 

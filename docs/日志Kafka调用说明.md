@@ -1,8 +1,8 @@
 # 日志 Kafka 调用说明
 
-> 版本：v1.0  
-> 日期：2026-05-26  
-> 集群地址：`<kafka_server_ip>:9092`
+> 版本：v1.0
+> 日期：2026-07-09
+> 集群地址：由 `KAFKA_BOOTSTRAP_SERVERS` 配置；Docker Compose 内为 `kafka:9092`，宿主机访问 compose 暴露端口通常为 `localhost:9093`
 
 本文档介绍项目中 Kafka Topic / 分区的用途，以及日志管理后台如何消费、查询日志。
 
@@ -221,11 +221,12 @@
 
 ```python
 import json
+import os
 from kafka import KafkaConsumer
 
 consumer = KafkaConsumer(
     "application-logs",
-    bootstrap_servers="<kafka_server_ip>:9092",
+    bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9093"),
     group_id="log-management-consumers",   # 消费组名，同组内分区负载均衡
     auto_offset_reset="latest",            # 首次消费从最新开始；历史用 earliest
     enable_auto_commit=True,
@@ -249,7 +250,7 @@ for msg in consumer:
 ```python
 consumer = KafkaConsumer(
     "application-logs-error",
-    bootstrap_servers="<kafka_server_ip>:9092",
+    bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9093"),
     group_id="log-error-alert-consumers",
     auto_offset_reset="latest",
     value_deserializer=lambda v: json.loads(v.decode("utf-8")),
@@ -299,14 +300,14 @@ for msg in consumer:
 ```bash
 # 查看最新 20 条业务日志
 kafka-console-consumer.sh \
-  --bootstrap-server <kafka_server_ip>:9092 \
+  --bootstrap-server "${KAFKA_BOOTSTRAP_SERVERS:-localhost:9093}" \
   --topic application-logs \
   --from-beginning \
   --max-messages 20
 
 # 只看错误 Topic
 kafka-console-consumer.sh \
-  --bootstrap-server <kafka_server_ip>:9092 \
+  --bootstrap-server "${KAFKA_BOOTSTRAP_SERVERS:-localhost:9093}" \
   --topic application-logs-error \
   --from-beginning
 ```
@@ -334,7 +335,7 @@ kafka-console-consumer.sh \
 
 ```dotenv
 # Kafka 集群
-KAFKA_BOOTSTRAP_SERVERS=<kafka_server_ip>:9092
+KAFKA_BOOTSTRAP_SERVERS=kafka:9092       # compose 内部；宿主机调试可用 localhost:9093
 
 # 日志 Kafka 开关与 Topic
 LOG_KAFKA_ENABLED=true                  # true=启用，false=仅写本地文件
@@ -389,7 +390,7 @@ logger.info("任务提交", extra={"task_id": "task-001", "document_id": "doc-00
 ### 8.1 创建 Topic
 
 ```bash
-cd <project_root>
+cd /home/inspur/myenv/langchian_project
 venv314/bin/python -m backend.kafka.admin create-topics
 ```
 

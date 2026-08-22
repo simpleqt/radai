@@ -1,0 +1,35 @@
+[Unit]
+Description=Document Agent Production API (8082)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/inspur/myenv/runtime/doc-agent-production/current
+EnvironmentFile=/home/inspur/myenv/runtime/doc-agent-production/config/service.env
+Environment=LOG_SERVICE_NAME=agent-api
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/test -x /home/inspur/myenv/runtime/doc-agent-production/current/.venv/bin/python
+ExecStart=/home/inspur/myenv/runtime/doc-agent-production/current/.venv/bin/python -m backend.cli run-api --service-role agent --host 0.0.0.0 --port 8082 --workers 1
+Restart=on-failure
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=60s
+LimitNOFILE=65536
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictRealtime=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=doc-agent-prod-agent-api
+
+[Install]
+WantedBy=doc-agent-production.target

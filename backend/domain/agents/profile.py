@@ -7,6 +7,7 @@ single request execution; that belongs in AgentRuntimeContext.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from backend.domain.agents.workflows import SUPPORTED_WORKFLOWS
 
@@ -28,6 +29,7 @@ class AgentProfile:
     guardrail_policy: str = "default"
     ui_profile: str | None = None
     domain_context_provider: str | None = None
+    stream_timeout_policy: dict[str, Any] | None = None
 
     def allows_workflow(self, workflow_name: str) -> bool:
         return workflow_name in set(self.allowed_workflows)

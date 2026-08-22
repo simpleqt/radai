@@ -1,0 +1,43 @@
+[Unit]
+Description=Document Agent Production Guest API (8083)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/inspur/myenv/runtime/doc-agent-production/current
+EnvironmentFile=/home/inspur/myenv/runtime/doc-agent-production/config/service.env
+Environment=LOG_SERVICE_NAME=guest-api
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=GUEST_API_SERVICE=1
+Environment=GUEST_SERVER_PORT=8083
+Environment=GUEST_SERVER_WORKERS=1
+Environment=GUEST_CHECKPOINT_DB=guest_checkpoints.db
+Environment=STARTUP_TASK_PROCESSOR_ENABLED=false
+Environment=STARTUP_RAG_PREWARM_ENABLED=false
+Environment=GUEST_RAG_STARTUP_ENABLED=true
+Environment=SERVER_HOST=0.0.0.0
+ExecStartPre=/usr/bin/test -x /home/inspur/myenv/runtime/doc-agent-production/current/.venv/bin/python
+ExecStart=/home/inspur/myenv/runtime/doc-agent-production/current/.venv/bin/python -m backend.api.guest_http_server
+Restart=always
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=30s
+LimitNOFILE=65536
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictRealtime=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=doc-agent-prod-guest-api
+
+[Install]
+WantedBy=doc-agent-production.target

@@ -26,8 +26,14 @@ from backend.core.agents.context.ledger import (
     context_item_to_record,
     make_evidence_record,
 )
+from backend.core.agents.context.object_store import ContextObjectStore
 from backend.core.agents.context.policy import ContextPolicy
+from backend.core.agents.context.projection import ProjectionCompiler
 from backend.core.agents.context.result_sink import ResultSink
+from backend.core.agents.context.segmenters import (
+    SegmenterRegistry,
+    create_default_segmenter_registry,
+)
 from backend.core.agents.context.state_adapter import ContextStateAdapter
 from backend.core.agents.context.types import (
     CompiledContextRequest,
@@ -57,6 +63,7 @@ DEFAULT_SEMANTIC_SUMMARY_SKIP_TOOLS = frozenset(
         "groundwater_quality_check",
         "multi_kb_search",
         "read_context_artifact",
+        "context_read",
         "web_search",
         "task",
     }
@@ -80,6 +87,10 @@ class ContextEngine:
     capture_registry: ContextCaptureRegistry
     state_adapter: ContextStateAdapter
     semantic_summary_skip_tools: frozenset[str]
+    context_object_mode: str = "off"
+    object_store: ContextObjectStore | None = None
+    projection_compiler: ProjectionCompiler | None = None
+    segmenter_registry: SegmenterRegistry | None = None
 
     @classmethod
     def create(
@@ -99,6 +110,7 @@ class ContextEngine:
         ).with_capture_overrides(
             char_threshold=char_threshold,
         )
+        context_object_mode = resolved_policy.context_object_mode
         store = artifact_store or create_context_artifact_store()
         normalized_user_id = str(user_id or "").strip() or None
         normalized_thread_id = str(thread_id or "").strip() or None
@@ -106,6 +118,7 @@ class ContextEngine:
             store,
             persist_threshold=resolved_policy.large_result_threshold_chars,
             summary_max_chars=resolved_policy.context_item_summary_chars,
+            persist_large_results=context_object_mode != "on",
             artifact_attributes=(
                 {"owner_user_id": normalized_user_id}
                 if normalized_user_id
@@ -118,6 +131,24 @@ class ContextEngine:
             else project_evidence_tools
         )
         token_counter = TokenCounter(model_name or resolved_policy.model_name)
+        object_store = (
+            ContextObjectStore(
+                store,
+                object_ttl_seconds=resolved_policy.context_object_ttl_seconds,
+            )
+            if context_object_mode != "off"
+            else None
+        )
+        segmenter_registry = (
+            create_default_segmenter_registry()
+            if context_object_mode != "off"
+            else None
+        )
+        projection_compiler = (
+            ProjectionCompiler(token_counter=token_counter)
+            if context_object_mode != "off"
+            else None
+        )
         capture_registry = ContextCaptureRegistry(
             [
                 SkillCaptureHandler(
@@ -158,25 +189,26 @@ class ContextEngine:
                 enforce_artifact_scope=True,
                 token_counter=token_counter,
                 raw_ref_char_limit=resolved_policy.raw_ref_injection_chars,
-                retrieval_raw_window_max_results=(
-                    resolved_policy.retrieval_raw_window_max_results
-                ),
-                retrieval_raw_window_budget_share=(
-                    resolved_policy.retrieval_raw_window_budget_percent / 100.0
-                ),
             ),
             history_compactor=HistoryCompactor(
                 model_name=model_name or resolved_policy.model_name,
                 trigger_tokens=resolved_policy.compaction_trigger_tokens,
-                retained_user_tokens=resolved_policy.compaction_retained_user_tokens,
+                retained_window_tokens=(
+                    resolved_policy.compaction_retained_window_tokens
+                ),
                 summary_input_chars=resolved_policy.compaction_summary_input_chars,
                 summary_output_chars=resolved_policy.compaction_summary_output_chars,
+                summary_max_chunks=resolved_policy.compaction_summary_max_chunks,
                 timeout_seconds=resolved_policy.compaction_timeout_seconds,
                 token_counter=token_counter,
             ),
             capture_registry=capture_registry,
             state_adapter=ContextStateAdapter(resolved_policy),
             semantic_summary_skip_tools=DEFAULT_SEMANTIC_SUMMARY_SKIP_TOOLS,
+            context_object_mode=context_object_mode,
+            object_store=object_store,
+            projection_compiler=projection_compiler,
+            segmenter_registry=segmenter_registry,
         )
 
     def compile_request(

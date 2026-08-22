@@ -98,7 +98,7 @@ class EvidenceCompletenessEvaluator:
         project_evidence: str,
         retrieved_evidence: str,
     ) -> EvidenceEvaluation:
-        from backend.core.models import create_chat_model
+        from backend.core.models import create_chat_model_async
 
         prompt = f"""
 判断现有证据是否足以让另一个无工具撰写模型完整、准确地回答用户问题。
@@ -132,7 +132,9 @@ JSON 格式：
 {self._trim(retrieved_evidence, max_chars=12000)}
 </reference_evidence>
 """.strip()
-        model = create_chat_model(name=self._model_name or None, thinking_enabled=False)
+        model = await create_chat_model_async(
+            name=self._model_name or None, thinking_enabled=False
+        )
         response = await asyncio.wait_for(
             model.ainvoke(
                 [

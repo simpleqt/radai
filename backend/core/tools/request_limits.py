@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import os
+import asyncio
 import json
+import os
 import re
 import threading
+from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -20,6 +22,11 @@ _WEB_SEARCH_MAX_RESULTS: ContextVar[int | None] = ContextVar(
     default=None,
 )
 
+_WEB_SEARCH_NO_PROGRESS_STREAK: ContextVar[int] = ContextVar(
+    "web_search_no_progress_streak",
+    default=0,
+)
+
 
 @dataclass
 class RequestToolBudget:
@@ -32,6 +39,7 @@ class RequestToolBudget:
     """
 
     remaining: dict[str, int]
+    web_search_no_progress_streak: int = 0
 
 
 _REQUEST_TOOL_BUDGET: ContextVar[RequestToolBudget | None] = ContextVar(
@@ -72,10 +80,74 @@ class TurnKbContextScope:
     max_chars: int
 
 
-@dataclass
-class RetrievalCacheEntry:
-    value: Any
-    cache_hit: str = "exact"
+@dataclass(eq=False)
+class _CapacityWaiter:
+    loop: asyncio.AbstractEventLoop
+    future: asyncio.Future[None]
+    granted: bool = False
+
+
+class _CrossLoopCapacityLimiter:
+    """FIFO async limiter whose capacity can be shared by multiple event loops."""
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = max(1, int(capacity))
+        self._available = self._capacity
+        self._lock = threading.Lock()
+        self._waiters: deque[_CapacityWaiter] = deque()
+
+    async def acquire(self) -> None:
+        loop = asyncio.get_running_loop()
+        waiter = _CapacityWaiter(loop=loop, future=loop.create_future())
+        with self._lock:
+            if self._available > 0:
+                self._available -= 1
+                return
+            self._waiters.append(waiter)
+
+        try:
+            await waiter.future
+        except BaseException:
+            release_grant = False
+            with self._lock:
+                if waiter.granted:
+                    release_grant = True
+                else:
+                    try:
+                        self._waiters.remove(waiter)
+                    except ValueError:
+                        pass
+            if release_grant:
+                self.release()
+            raise
+
+    def release(self) -> None:
+        while True:
+            waiter: _CapacityWaiter | None = None
+            with self._lock:
+                while self._waiters:
+                    candidate = self._waiters.popleft()
+                    if candidate.future.done() or candidate.loop.is_closed():
+                        continue
+                    candidate.granted = True
+                    waiter = candidate
+                    break
+                if waiter is None:
+                    if self._available >= self._capacity:
+                        raise ValueError("capacity limiter released too many times")
+                    self._available += 1
+                    return
+            try:
+                waiter.loop.call_soon_threadsafe(self._complete_waiter, waiter)
+                return
+            except RuntimeError:
+                with self._lock:
+                    waiter.granted = False
+
+    @staticmethod
+    def _complete_waiter(waiter: _CapacityWaiter) -> None:
+        if not waiter.future.done():
+            waiter.future.set_result(None)
 
 
 @dataclass
@@ -140,10 +212,7 @@ class RetrievalRequestCache:
                 self.in_flight.pop(key, None)
 
     async def acquire_provider_slot(self) -> None:
-        import asyncio
-
-        while not _KB_PROVIDER_LIMITER.acquire(blocking=False):
-            await asyncio.sleep(0.005)
+        await _KB_PROVIDER_LIMITER.acquire()
 
     def release_provider_slot(self) -> None:
         _KB_PROVIDER_LIMITER.release()
@@ -164,10 +233,6 @@ _TURN_KB_CONTEXT_SCOPE: ContextVar[TurnKbContextScope | None] = ContextVar(
     default=None,
 )
 
-_MULTI_KB_REQUEST_LOCK: ContextVar[threading.RLock | None] = ContextVar(
-    "multi_kb_request_lock",
-    default=None,
-)
 _RETRIEVAL_REQUEST_CACHE: ContextVar[RetrievalRequestCache | None] = ContextVar(
     "retrieval_request_cache",
     default=None,
@@ -177,8 +242,14 @@ TURN_MAX_EVIDENCE_CHARS = max(
     1000, int(os.getenv("MULTI_KB_SEARCH_TURN_MAX_EVIDENCE_CHARS", "14000"))
 )
 _REQUEST_LIMITS_LOCK = threading.RLock()
-_KB_PROVIDER_CAPACITY = max(1, int(os.getenv("MULTI_KB_PROVIDER_CAPACITY", "1") or "1"))
-_KB_PROVIDER_LIMITER = threading.BoundedSemaphore(_KB_PROVIDER_CAPACITY)
+try:
+    _KB_PROVIDER_CAPACITY = max(
+        1,
+        int(os.getenv("MULTI_KB_PROVIDER_CAPACITY", "8") or "8"),
+    )
+except (TypeError, ValueError):
+    _KB_PROVIDER_CAPACITY = 8
+_KB_PROVIDER_LIMITER = _CrossLoopCapacityLimiter(_KB_PROVIDER_CAPACITY)
 
 
 def set_tool_budgets(budgets: dict[str, int]):
@@ -207,6 +278,49 @@ def reset_web_search_max_results(token) -> None:
         if "different Context" not in str(exc):
             raise
         _WEB_SEARCH_MAX_RESULTS.set(None)
+
+
+def get_web_search_no_progress_streak() -> int:
+    """Return consecutive web searches that produced no relevant results."""
+
+    request_budget = _REQUEST_TOOL_BUDGET.get()
+    if request_budget is not None:
+        return max(0, int(request_budget.web_search_no_progress_streak or 0))
+    return max(0, int(_WEB_SEARCH_NO_PROGRESS_STREAK.get() or 0))
+
+
+def increment_web_search_no_progress_streak() -> int:
+    """Count one more consecutive low-quality web search and return the total."""
+
+    request_budget = _REQUEST_TOOL_BUDGET.get()
+    if request_budget is not None:
+        request_budget.web_search_no_progress_streak += 1
+        streak = request_budget.web_search_no_progress_streak
+    else:
+        streak = get_web_search_no_progress_streak() + 1
+        _WEB_SEARCH_NO_PROGRESS_STREAK.set(streak)
+    return streak
+
+
+def reset_web_search_no_progress_streak() -> None:
+    """Reset the low-quality streak (a relevant result or a new request)."""
+
+    request_budget = _REQUEST_TOOL_BUDGET.get()
+    if request_budget is not None:
+        request_budget.web_search_no_progress_streak = 0
+    _WEB_SEARCH_NO_PROGRESS_STREAK.set(0)
+
+
+def exhaust_tool_budget(tool_name: str) -> None:
+    """Force a tool's effective remaining budget to zero in every scope."""
+
+    with _REQUEST_LIMITS_LOCK:
+        budgets = _TOOL_BUDGETS.get()
+        if budgets is not None:
+            budgets[tool_name] = 0
+        request_budget = _REQUEST_TOOL_BUDGET.get()
+        if request_budget is not None:
+            request_budget.remaining[tool_name] = 0
 
 
 def set_request_tool_budget(budgets: dict[str, int]):
@@ -262,14 +376,6 @@ def reset_subagent_execution_limit(token) -> None:
 
 def get_subagent_execution_budget() -> SubagentExecutionBudget | None:
     return _SUBAGENT_EXECUTION_BUDGET.get()
-
-
-def set_tool_budget(tool_name: str, remaining: int) -> None:
-    budgets = _TOOL_BUDGETS.get()
-    if budgets is None:
-        return
-    with _REQUEST_LIMITS_LOCK:
-        budgets[tool_name] = max(0, int(remaining))
 
 
 def consume_tool_budget(tool_name: str) -> tuple[bool, Optional[int]]:
@@ -332,7 +438,6 @@ def reset_turn_kb_context_budget(max_chars: int | None = None) -> None:
     resolved_max = None if max_chars is None else max(1, int(max_chars))
     _TURN_KB_CONTEXT_BUDGET.set(TurnKbContextBudget(max_chars=resolved_max))
     _TURN_KB_CONTEXT_SCOPE.set(None)
-    _MULTI_KB_REQUEST_LOCK.set(threading.RLock())
     _RETRIEVAL_REQUEST_CACHE.set(RetrievalRequestCache())
 
 
@@ -424,14 +529,6 @@ def record_turn_kb_chars(char_count: int) -> int:
     with _REQUEST_LIMITS_LOCK:
         budget.used_chars += max(0, int(char_count))
         return budget.used_chars
-
-
-def get_multi_kb_request_lock() -> threading.RLock:
-    lock = _MULTI_KB_REQUEST_LOCK.get()
-    if lock is None:
-        lock = threading.RLock()
-        _MULTI_KB_REQUEST_LOCK.set(lock)
-    return lock
 
 
 def get_retrieval_request_cache() -> RetrievalRequestCache:

@@ -67,9 +67,12 @@ coverage.xml
 tmp/
 temp/
 *.tmp
+*.rar
 *.bak
 *.swp
 node_modules/
+# TypeScript 增量构建缓存：由 vue-tsc -b 生成，不入库
+*.tsbuildinfo
 frontend\ copy/
 deer-flow-main/
 .roo/
@@ -87,7 +90,7 @@ data/cache/
 data/uploads_temp/
 
 # 本地计划与项目副本（用户要求排除）
-# plans/
+plans/
 
 # MinIO
 minio_data/
@@ -127,13 +130,40 @@ docs/_build/
 .docker/
 *.tar.gz
 *.zip
-backend/scripts/
+# backend/scripts contains local operational state, but a small set of reusable
+# source modules is versioned explicitly. Keep certificates, PID files and local
+# one-off scripts out of Git by default.
+backend/scripts/*
+!backend/scripts/__init__.py
+!backend/scripts/milvus_admin_common.py
+!backend/scripts/openai_proxy_common.py
+!backend/scripts/openai_proxy.py
+!backend/scripts/openai_https_proxy.py
+!backend/scripts/download_cdut_share.py
+!backend/scripts/import_university_audit_kb.py
+!backend/scripts/reingest_schema_misrouted_kbs.py
 
 # 忽略代理目录（本地敏感或代理配置）
 代理/
 CAS对接资料/
-eval/
+# Evaluation outputs and datasets are local runtime artefacts.  Keep only the
+# reusable evaluator source required by the tracked unit tests.
+eval/*
+!eval/datasets/
+eval/datasets/*
+!eval/datasets/self_kb/
+eval/datasets/self_kb/*
+!eval/datasets/self_kb/eval_ragas_ablation.py
+!eval/course_eval/
+eval/course_eval/*
+!eval/course_eval/*.py
 .github/
 .trae/
 成都理工大学2026证书/
 六塘项目数据信息/
+skill_packages/
+/home/inspur/myenv/langchian_project/.gitignore
+
+# 本地 Codex/Agent 工具目录，禁止上传
+.agents/
+.codex/

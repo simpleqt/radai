@@ -1,22 +1,38 @@
 # 移动端 + 网页端（访客/登录）前端实施清单
 
-> **实施状态**（2026-05-31）：  
-> - ✅ Sprint 1：`/app`、`/m` 路由、`useUiMode`、`useDeviceProfile`（`frontend/`）  
-> - ✅ Sprint 2：RadAI 登录用户 SSE（`/api/v2/agent/query`）、`AbortSignal` 停止生成、`cancelTask` 深研取消  
-> - ✅ 访客独立工程：`guest/`（`:8085`）+ IndexedDB + `:8083` `/api/v2/guest/query`（见 [访客独立API端点实施方案](../访客独立API端点实施方案.md)）  
-> - ✅ 探索式学习：`/explore`、`/m/explore`  
-> - ⚠️ 未做：RadAI **主前端内** guest/user 双模式合一、登录后会话从 IndexedDB 迁移到 MySQL
+> **实施状态**（2026-07-14）：
+> - ✅ Sprint 1：`/app`、`/m` 路由、`useUiMode`、`useDeviceProfile`（`frontend/`）
+> - ✅ Sprint 2：RadAI 登录用户 SSE（`/api/v2/agent-runtime/query`）、`AbortSignal` 停止当前 SSE；`deep_research`/`plan_solve` 通过 `cancelTask` 和后台 task stream 支持续接与取消，普通工作流直接消费当前 SSE
+> - ✅ 主前端内访客模式：未登录访问 `/app`/`/m` 时走 `/api/v2/guest/query`，历史保存在 IndexedDB
+> - ✅ 访客独立工程：`guest/`（`:8085`）复用 `frontend/src` 核心组件；支持账号登录、注册、短信登录，默认代理 `:8083` `/api/v2/guest/query`（见 [访客独立API端点实施方案](../访客独立API端点实施方案.md)）
+> - ✅ 探索式学习：`/explore`、`/m/explore`
+> - ⚠️ 未做：登录后会话从 IndexedDB 迁移到 MySQL；独立 guest 工程与主前端内访客模式仍是两条入口链路
 
 ## 1. 文档目标
 
-本清单用于将“自动识别设备 + 手动切换 + 访客与登录双模式”方案落地到开发，强调可执行、可验收、可回归。
+本清单最初用于将“自动识别设备 + 手动切换 + 访客与登录双模式”方案落地到开发。当前代码已完成主要功能，因此本文同时记录现状和仍可回归的检查项。
+
+## 1.1 当前实现基线
+
+| 应用 | 入口 | 实现现状 |
+| :--- | :--- | :--- |
+| RadAI 主前端 | `frontend/`，5173 | Vue Router；`/app` 与 `/m` 共用 `views/ne-full/index.vue`；未登录自动进入主前端访客模式 |
+| CSH-AI 前端 | `frontend_csh_ai/`，5174 | 路由结构与主前端相近，额外提供 `/groundwater/:threadId?` 与 `/admin/groundwater-projects` |
+| Guest 独立前端 | `guest/`，8085 | 无 Vue Router；`App.vue` 内管理登录、历史、聊天；alias `@` 指向 `../frontend/src` 复用 `useAgentChat`、`MessageList`、`request` 等 |
+
+当前访客身份分两层：
+
+| 场景 | 身份与存储 |
+| :--- | :--- |
+| 主前端未登录访问 `/app`/`/m` | `useAgentChat.isGuestMode=true`，请求 `/api/v2/guest/query`，会话落 IndexedDB |
+| `guest/` 独立工程 | 先展示 `GuestLogin.vue`；支持账号、短信注册、短信登录。认证后优先走登录态 conversations API；无 token 的 fallback 服务仍保留 `X-Device-ID` 与 IndexedDB |
 
 ## 2. 总体实施原则
 
-- 一套前端工程，两个体验层：移动布局（/m）与桌面布局（/app）。
+- 主前端一套工程，两个体验层：移动布局（/m）与桌面布局（/app）。
 - 业务逻辑统一复用：消息流、状态管理、接口协议尽量共用。
 - 自动识别仅作默认入口，用户手动选择优先级最高。
-- 访客对话主存储在浏览器 IndexedDB，服务端只提供对话能力与短期上下文。
+- 主前端访客对话主存储在浏览器 IndexedDB，服务端只提供对话能力与短期上下文。
 - 登录用户沿用现有用户体系与会话能力。
 
 ## 3. 路由与模式设计
@@ -35,7 +51,7 @@
 
 ### 3.3 身份模式
 
-- guest：访客模式（无需登录）
+- guest：主前端内访客模式（无需登录）或独立 guest 工程登录前 fallback 模式
 - user：登录模式（持 token）
 
 ## 4. Sprint 拆解（可直接进入迭代）
@@ -74,7 +90,7 @@
   - Conversation、Message、ThreadState、SendPayload
 - 抽象 ChatServiceAdapter
   - GuestAdapter -> /api/v2/guest/query
-  - UserAdapter -> /api/v2/agent/query
+  - UserAdapter -> /api/v2/agent-runtime/query
 - 统一 SSE 事件解析层
   - chunk/status/event/error/done
 - 统一消息渲染组件接口
@@ -170,34 +186,23 @@
 - 真机测试（Android/iOS 各 2 台以上）。
 - Lighthouse 与 Web Vitals 指标达标。
 
-## 5. 代码结构建议
+## 5. 当前代码结构
 
 ```text
 frontend/src/
-  app/
-    router/
-      guards/
-      routes.app.ts
-      routes.mobile.ts
-    layouts/
-      MobileShell.vue
-      DesktopShell.vue
-    stores/
-      uiMode.ts
-      authMode.ts
-      chatDomain.ts
-    services/
-      chat/
-        adapters/
-          guestAdapter.ts
-          userAdapter.ts
-        sseParser.ts
-      storage/
-        guestIndexedDb.ts
-    views/
-      mobile/
-      desktop/
-      shared/
+  router/index.ts                         # /app、/m、公开学习页、settings、admin 守卫
+  views/ne-full/index.vue                 # 桌面/移动专家模式共用入口
+  views/ne-full/composables/useAgentChat.ts
+  services/storage/guestIndexedDb.ts      # 主前端访客历史
+  composables/useUiMode.ts
+  composables/useDeviceProfile.ts
+
+guest/src/
+  App.vue                                 # 独立访客应用状态机
+  components/GuestLogin.vue               # 账号、注册、短信登录
+  components/GuestChatBox.vue
+  components/GuestHistorySidebar.vue
+  services/guestChatService.js            # fallback 访客请求 + device_id
 ```
 
 ## 6. API 协议约定（前端侧）
@@ -211,20 +216,27 @@ frontend/src/
   - question
   - thread_id
   - model（可选）
-  - use_search（可选）
   - kb_ids（可选）
+  - use_search=false
+  - selected_skills=[]
+  - subagent_enabled=false
+  - thinking=false
+  - mode=lightweight
 
 ### 6.2 用户请求
 
-- endpoint: /api/v2/agent/query
+- endpoint: /api/v2/agent-runtime/query
 - headers:
   - Authorization: Bearer <token>
 - body:
+  - agent_code
   - question
   - thread_id
   - model（可选）
   - use_search（可选）
   - kb_ids（可选）
+  - selected_skills（可选）
+  - metadata.file_ids（对话附件）
 
 ## 7. 风险与预案
 

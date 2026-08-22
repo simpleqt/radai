@@ -15,6 +15,8 @@ from weakref import WeakKeyDictionary
 import httpx
 from langchain.tools import tool
 
+from backend.config.log_privacy import text_fingerprint
+
 logger = logging.getLogger(__name__)
 
 SEARCH_PROVIDER = "firecrawl"
@@ -27,9 +29,20 @@ FIRECRAWL_API_URL = os.getenv(
 ).strip()
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "").strip()
 FIRECRAWL_LOCATION = os.getenv("FIRECRAWL_SEARCH_LOCATION", "China").strip()
-FIRECRAWL_RESULT_CONTENT_CHARS = 4000
+FIRECRAWL_RESULT_CONTENT_CHARS = max(
+    500,
+    int(os.getenv("FIRECRAWL_RESULT_CONTENT_CHARS", "2000") or "2000"),
+)
 FIRECRAWL_SEARCH_CONCURRENCY = 3
 MAX_SEARCH_QUERY_CHARS = 2000
+WEB_SEARCH_MIN_RELEVANCE = float(
+    os.getenv("WEB_SEARCH_MIN_RELEVANCE", "0.02") or "0.02"
+)
+WEB_SEARCH_NO_PROGRESS_LIMIT = max(
+    1,
+    int(os.getenv("WEB_SEARCH_NO_PROGRESS_LIMIT", "2") or "2"),
+)
+_RELEVANCE_CONTENT_CHARS = 1200
 _SEARCH_LIMITERS_LOCK = threading.Lock()
 _SEARCH_LIMITERS: WeakKeyDictionary[
     asyncio.AbstractEventLoop,
@@ -75,6 +88,36 @@ def _sanitize_search_query(query: str) -> str:
     )
     lines = [line.strip(" \t-:：") for line in cleaned.splitlines() if line.strip()]
     return (lines[-1] if lines else "").strip()
+
+
+def _filter_relevant_results(
+    query: str,
+    results: list[dict[str, str]],
+    *,
+    min_relevance: float = WEB_SEARCH_MIN_RELEVANCE,
+) -> tuple[list[dict[str, str]], int]:
+    """Drop results with no meaningful term overlap with the query.
+
+    Firecrawl can return hot-topic/dictionary/off-topic pages that are
+    unrelated to a research intent (observed as 虎牙/网络用语/词典 pages).
+    The filter reuses the ledger's CJK-aware n-gram overlap so a page must
+    share at least one substantive term with the query to enter context.
+    """
+
+    from backend.core.agents.context.ledger import _token_overlap
+
+    kept: list[dict[str, str]] = []
+    for result in results:
+        title = str(result.get("title") or "")
+        url = str(result.get("url") or "")
+        content = str(result.get("content") or "")[:_RELEVANCE_CONTENT_CHARS]
+        score = max(
+            _token_overlap(str(query or ""), f"{title} {url}"),
+            _token_overlap(str(query or ""), content),
+        )
+        if score >= max(0.0, float(min_relevance)):
+            kept.append(result)
+    return kept, max(0, len(results) - len(kept))
 
 
 def _firecrawl_search_endpoint() -> str:
@@ -184,7 +227,10 @@ async def _search_web_async(
                     SEARCH_ATTEMPTS,
                     exc,
                 )
-    logger.warning("Firecrawl 两次尝试后仍无可用结果: %s", query)
+    logger.warning(
+        "Firecrawl 两次尝试后仍无可用结果: query_meta=%s",
+        text_fingerprint(query),
+    )
     return []
 
 
@@ -228,12 +274,30 @@ async def execute_web_search(
             {"error": "No results found or search timeout", "query": sanitized_query},
             ensure_ascii=False,
         )
+    kept_results, filtered_count = _filter_relevant_results(
+        sanitized_query,
+        results,
+    )
+    if not kept_results:
+        return json.dumps(
+            {
+                "error": (
+                    "搜索结果与查询相关性过低，已全部过滤（共 "
+                    f"{len(results)} 条）。请停止继续联网检索，"
+                    "基于已有知识库与网页证据整理结论。"
+                ),
+                "query": sanitized_query,
+                "filtered_count": filtered_count,
+            },
+            ensure_ascii=False,
+        )
     return json.dumps(
         {
             "query": sanitized_query,
             "engine": SEARCH_PROVIDER,
-            "total_results": len(results),
-            "results": results,
+            "total_results": len(kept_results),
+            "filtered_count": filtered_count,
+            "results": kept_results,
         },
         indent=2,
         ensure_ascii=False,
@@ -256,7 +320,10 @@ async def async_web_search_tool(
     """
     from backend.core.tools.request_limits import (
         consume_tool_budget,
+        exhaust_tool_budget,
         get_web_search_max_results,
+        increment_web_search_no_progress_streak,
+        reset_web_search_no_progress_streak,
     )
 
     allowed, _remaining = consume_tool_budget("web_search")
@@ -278,6 +345,28 @@ async def async_web_search_tool(
         max_results=max_results,
         timelimit=timelimit,
     )
+    try:
+        payload = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict) and payload.get("error"):
+        streak = increment_web_search_no_progress_streak()
+        if streak >= WEB_SEARCH_NO_PROGRESS_LIMIT:
+            exhaust_tool_budget("web_search")
+            return json.dumps(
+                {
+                    "error": (
+                        f"连续 {streak} 次联网检索未获得相关结果，已停止联网；"
+                        "请基于已有知识库与网页证据作答，不要再次调用 web_search。"
+                    ),
+                    "query": _sanitize_search_query(query),
+                    "no_progress_streak": streak,
+                    "retrieval_budget": {"remaining": 0, "exhausted": True},
+                },
+                ensure_ascii=False,
+            )
+    elif isinstance(payload, dict) and payload.get("results"):
+        reset_web_search_no_progress_streak()
     if _remaining == 0:
         try:
             payload = json.loads(result)

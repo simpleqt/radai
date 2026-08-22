@@ -32,6 +32,7 @@ function trimCache<K, V>(cache: Map<K, V>, max = MAX_CACHE_ENTRIES) {
 
 export interface DetailCacheEntry {
   content: string;
+  reasoning?: string;
   sources: Array<{
     doc_id?: string;
     doc_name?: string;

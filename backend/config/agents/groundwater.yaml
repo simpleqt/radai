@@ -6,6 +6,18 @@ default_model: null
 default_kb_ids: []
 default_skills:
   - groundwater-project-analysis
+stream_timeout_policy:
+  stream_idle_timeout_seconds: 180
+  model_round_idle_timeout_seconds: 180
+  heartbeat_interval_seconds: 30
+  incomplete_round_retry_max: 2
+  normal_stream_total_timeout_seconds: 600
+  deep_research_stream_timeout_seconds: 1800
+  deep_research_idle_timeout_seconds: 600
+  deep_research_finalize_idle_timeout_seconds: 300
+  deep_research_finalize_grace_seconds: 300
+  deep_research_task_stall_grace_seconds: 300
+  recursion_limit: null
 default_workflow: full
 allowed_workflows:
   - full

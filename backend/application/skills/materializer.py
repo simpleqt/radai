@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
 import tempfile
-import re
 import threading
-import json
 from pathlib import Path
 
-from backend.application.skills.package_validator import SkillPackageValidator
+from backend.application.skills.package_validator import (
+    SKILL_KEY_RE,
+    SkillPackageValidator,
+)
 from backend.core.skills.loader import get_managed_skills_root_path
 
 
@@ -37,7 +40,7 @@ class SkillMaterializer:
         root_prefix: str,
         owner_id: str | None = None,
     ) -> Path:
-        if not re.fullmatch(r"[a-z][a-z0-9-]{2,63}", str(skill_key or "")):
+        if not SKILL_KEY_RE.fullmatch(str(skill_key or "")):
             raise ValueError("非法 Skill key")
         category_root = self.root / "custom"
         category_root.mkdir(parents=True, exist_ok=True)

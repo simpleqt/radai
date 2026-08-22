@@ -1,0 +1,21 @@
+[Unit]
+Description=RADAI production read-only health and public endpoint check
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsSymbolicLink=/home/inspur/myenv/runtime/doc-agent-production/current
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/inspur/myenv/runtime/doc-agent-production
+Environment=DOC_AGENT_PRODUCTION_RUNTIME_ROOT=/home/inspur/myenv/runtime/doc-agent-production
+ExecStart=/home/inspur/myenv/runtime/doc-agent-production/bin/production-healthcheck.sh
+TimeoutStartSec=3min
+UMask=0077
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

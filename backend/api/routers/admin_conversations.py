@@ -5,7 +5,6 @@
 """
 
 from datetime import datetime
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -13,12 +12,17 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.dependencies.auth import ApiKeyAuth, require_admin
+from backend.application.blocking import run_blocking
+from backend.application.checkpointing.checkpointer import get_checkpointer_from_request
+from backend.application.conversations.local_catalog import (
+    get_local_conversation_catalog,
+)
+from backend.application.conversations.message_serializer import (
+    serialize_checkpoint_messages,
+)
 from backend.config.loggers import get_logger
 from backend.core.config import build_internal_thread_key, get_paths
 from backend.core.thread_key import parse_internal_thread_key
-from backend.application.checkpointing.checkpointer import get_checkpointer_from_request
-from backend.application.blocking import run_blocking
-from backend.application.conversations.message_serializer import serialize_checkpoint_messages
 from backend.db.connection import get_async_session
 from backend.db.models import Conversation, User
 from backend.services.admin_audit import write_admin_audit
@@ -39,7 +43,7 @@ class AdminConversationItem(BaseModel):
     user_id: str
     username: str
     title: str
-    metadata: Optional[dict] = None
+    metadata: dict | None = None
     is_deleted: bool = False
     created_at: str
     updated_at: str
@@ -58,7 +62,7 @@ class AdminMessageItem(BaseModel):
     role: str
     content: str
     metadata: dict = {}
-    id: Optional[str] = None
+    id: str | None = None
 
 
 class AdminConversationDetail(BaseModel):
@@ -73,7 +77,7 @@ class ConversationStatsResponse(BaseModel):
     active_conversations: int  # 未删除
     deleted_conversations: int
     unique_users: int
-    latest_conversation_at: Optional[str] = None
+    latest_conversation_at: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +91,21 @@ async def get_conversation_stats(
     _admin: ApiKeyAuth = Depends(require_admin),
 ):
     """获取会话统计信息"""
+    local_catalog = get_local_conversation_catalog()
+    if local_catalog is not None:
+        stats = await local_catalog.stats()
+        return ConversationStatsResponse(
+            total_conversations=stats.total,
+            active_conversations=stats.active,
+            deleted_conversations=stats.deleted,
+            unique_users=stats.unique_users,
+            latest_conversation_at=(
+                stats.latest_updated_at.isoformat()
+                if stats.latest_updated_at
+                else None
+            ),
+        )
+
     stats = (
         await session.execute(
             select(
@@ -116,13 +135,73 @@ async def get_conversation_stats(
 async def list_all_conversations(
     limit: int = Query(20, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    user_id: Optional[str] = Query(None, description="按用户 ID 筛选"),
-    username: Optional[str] = Query(None, description="按用户名模糊搜索"),
+    user_id: str | None = Query(None, description="按用户 ID 筛选"),
+    username: str | None = Query(None, description="按用户名模糊搜索"),
     include_deleted: bool = Query(False, description="是否包含已删除的会话"),
     session: AsyncSession = Depends(get_async_session),
     _admin: ApiKeyAuth = Depends(require_admin),
 ):
     """获取所有用户的会话列表（管理员）"""
+    local_catalog = get_local_conversation_catalog()
+    if local_catalog is not None:
+        has_user_filter = bool(user_id or username)
+        username_by_id: dict[str, str] = {}
+        selected_user_ids: list[str] | None = None
+        if has_user_filter:
+            user_stmt = select(User.user_id, User.username)
+            if user_id:
+                user_stmt = user_stmt.where(User.user_id == user_id)
+            if username:
+                user_stmt = user_stmt.where(User.username.ilike(f"%{username}%"))
+            user_rows = (await session.execute(user_stmt)).all()
+            username_by_id = {
+                str(row.user_id): str(row.username or "") for row in user_rows
+            }
+            selected_user_ids = list(username_by_id)
+        conversations, total = await local_catalog.list_all(
+            limit=limit,
+            offset=offset,
+            include_deleted=include_deleted,
+            user_ids=selected_user_ids,
+        )
+        if not has_user_filter:
+            page_user_ids = sorted(
+                {conversation.user_id for conversation in conversations}
+            )
+            if page_user_ids:
+                rows = (
+                    await session.execute(
+                        select(User.user_id, User.username).where(
+                            User.user_id.in_(page_user_ids)
+                        )
+                    )
+                ).all()
+                username_by_id.update(
+                    {
+                        str(row.user_id): str(row.username or "")
+                        for row in rows
+                    }
+                )
+        return AdminConversationListResponse(
+            items=[
+                AdminConversationItem(
+                    id=conversation.id,
+                    thread_id=conversation.thread_id,
+                    user_id=conversation.user_id,
+                    username=username_by_id.get(conversation.user_id, ""),
+                    title=conversation.title,
+                    metadata=conversation.metadata_,
+                    is_deleted=conversation.is_deleted,
+                    created_at=conversation.created_at.isoformat(),
+                    updated_at=conversation.updated_at.isoformat(),
+                )
+                for conversation in conversations
+            ],
+            total=total,
+            limit=limit,
+            offset=offset,
+        )
+
     # 构建基础查询
     stmt = (
         select(Conversation, User.username)
@@ -178,25 +257,30 @@ async def get_user_conversation_messages(
     _admin: ApiKeyAuth = Depends(require_admin),
 ):
     """获取任意用户的会话详情及消息历史"""
-    # 查询会话元数据
-    result = await session.execute(
-        select(Conversation, User.username)
-        .join(User, Conversation.user_id == User.user_id)
-        .where(
-            Conversation.thread_id == thread_id,
-            Conversation.user_id == user_id,
+    local_catalog = get_local_conversation_catalog()
+    if local_catalog is not None:
+        conv = await local_catalog.get(user_id=user_id, thread_id=thread_id)
+        username = await session.scalar(
+            select(User.username).where(User.user_id == user_id)
         )
-    )
-    row = result.first()
-    if not row:
+    else:
+        result = await session.execute(
+            select(Conversation, User.username)
+            .join(User, Conversation.user_id == User.user_id)
+            .where(
+                Conversation.thread_id == thread_id,
+                Conversation.user_id == user_id,
+            )
+        )
+        row = result.first()
+        conv, username = row if row else (None, None)
+    if not conv:
         raise HTTPException(status_code=404, detail="会话不存在")
-
-    conv, username = row
     conv_item = AdminConversationItem(
         id=conv.id,
         thread_id=conv.thread_id,
         user_id=conv.user_id,
-        username=username,
+        username=str(username or ""),
         title=conv.title,
         metadata=conv.metadata_,
         is_deleted=conv.is_deleted,
@@ -239,17 +323,28 @@ async def delete_user_conversation(
     admin: ApiKeyAuth = Depends(require_admin),
 ):
     """删除任意用户的会话（逻辑删除 + 清理 checkpointer + 清理沙箱目录）"""
-    result = await session.execute(
-        select(Conversation).where(
-            Conversation.thread_id == thread_id,
-            Conversation.user_id == user_id,
+    local_catalog = get_local_conversation_catalog()
+    if local_catalog is not None:
+        conv = await local_catalog.get(user_id=user_id, thread_id=thread_id)
+    else:
+        result = await session.execute(
+            select(Conversation).where(
+                Conversation.thread_id == thread_id,
+                Conversation.user_id == user_id,
+            )
         )
-    )
-    conv = result.scalar_one_or_none()
+        conv = result.scalar_one_or_none()
     if not conv:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    conv.is_deleted = True
+    if local_catalog is not None:
+        await local_catalog.set_deleted(
+            user_id=user_id,
+            thread_id=thread_id,
+            deleted=True,
+        )
+    else:
+        conv.is_deleted = True
     await write_admin_audit(
         session,
         request,
@@ -280,13 +375,6 @@ async def delete_user_conversation(
         cleanup_errors.append(f"background_task: {type(exc).__name__}")
 
     try:
-        checkpointer = get_checkpointer_from_request(request)
-        await checkpointer.adelete_thread(internal_thread_id)
-    except Exception as exc:
-        logger.exception("[Admin] 清理 checkpointer 失败: thread=%s", internal_thread_id)
-        cleanup_errors.append(f"checkpointer: {type(exc).__name__}")
-
-    try:
         from backend.core.storage.scoped_storage import ScopedStorage
 
         storage = ScopedStorage(user_id=user_id, thread_id=thread_id)
@@ -305,20 +393,61 @@ async def delete_user_conversation(
         logger.exception("[Admin] 清理沙箱线程目录失败: thread=%s", internal_thread_id)
         cleanup_errors.append(f"sandbox: {type(exc).__name__}")
 
+    # checkpoint 删除唯一不可逆，放在可重试清理之后（与用户端删除同序），
+    # 避免清理失败自动恢复出「标题在、历史已丢」的空壳会话。
+    if not cleanup_errors:
+        try:
+            checkpointer = get_checkpointer_from_request(request)
+            await checkpointer.adelete_thread(internal_thread_id)
+        except Exception as exc:
+            logger.exception("[Admin] 清理 checkpointer 失败: thread=%s", internal_thread_id)
+            cleanup_errors.append(f"checkpointer: {type(exc).__name__}")
+
     if cleanup_errors:
-        conv.is_deleted = False
-        metadata = dict(conv.metadata_ or {})
-        metadata["deletion_cleanup_error"] = {
+        # Merge rather than write back the pre-cleanup snapshot: cleanup takes
+        # seconds and concurrent writers' metadata must not be overwritten.
+        cleanup_marker = {
             "components": cleanup_errors,
             "updated_at": datetime.now().isoformat(),
         }
-        conv.metadata_ = metadata
+        if local_catalog is not None:
+            # Restore first: merge_metadata_value only matches a live row.
+            await local_catalog.set_deleted(
+                user_id=user_id,
+                thread_id=thread_id,
+                deleted=False,
+            )
+            await local_catalog.merge_metadata_value(
+                user_id=user_id,
+                thread_id=thread_id,
+                key="deletion_cleanup_error",
+                value=cleanup_marker,
+            )
+        else:
+            await session.refresh(conv)
+            metadata = dict(conv.metadata_ or {})
+            metadata["deletion_cleanup_error"] = cleanup_marker
+            conv.is_deleted = False
+            conv.metadata_ = metadata
         await session.commit()
         raise HTTPException(status_code=503, detail="会话清理未完成，请稍后重试")
 
-    metadata = dict(conv.metadata_ or {})
-    metadata.pop("deletion_cleanup_error", None)
-    conv.metadata_ = metadata
+    if local_catalog is not None:
+        await local_catalog.discard_metadata_value(
+            user_id=user_id,
+            thread_id=thread_id,
+            key="deletion_cleanup_error",
+        )
+        await local_catalog.set_deleted(
+            user_id=user_id,
+            thread_id=thread_id,
+            deleted=True,
+        )
+    else:
+        await session.refresh(conv)
+        metadata = dict(conv.metadata_ or {})
+        metadata.pop("deletion_cleanup_error", None)
+        conv.metadata_ = metadata
     await session.commit()
 
     return {

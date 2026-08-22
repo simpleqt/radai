@@ -4,43 +4,89 @@ import asyncio
 import json
 import logging
 import os
-from typing import Dict, Optional
+import threading
+import time
 
 from backend.db.redis import get_redis
 
 logger = logging.getLogger(__name__)
 
-_DB_CACHE: Dict[str, dict] = {}       # f"{usage_scope}:{name}" → config_dict
-_DB_CACHE_TS: float = 0               # 上次刷新时间
-_DB_CACHE_TTL: float = 30.0           # 缓存 TTL（秒）
+# key → (expires_at, generation, config)。逐条目过期时间:旧实现用单一全局
+# 时间戳,任意一次 set 会为所有旧条目"续命",热点模型抢先回填时冷门条目可
+# 远超 TTL 无上界(R4-LM-5)。generation 用于关闭 invalidate/回填竞态:先于
+# invalidate 开始的 DB 读取不得用旧行复活缓存。
+_DB_CACHE: dict[str, tuple[float, int, dict]] = {}
+_DB_CACHE_TTL: float = 30.0  # 缓存 TTL（秒）
+_DB_CACHE_GENERATION: int = 0
+_DB_CACHE_LOCK = threading.RLock()
 
-def set_cached_model_config(name: str, config: dict, usage_scope: str = "chat"):
-    """存入缓存"""
-    global _DB_CACHE_TS
+
+def current_cache_generation() -> int:
+    """当前失效代数。回填方在发起 DB 读取前捕获,写入时校验。"""
+    with _DB_CACHE_LOCK:
+        return _DB_CACHE_GENERATION
+
+
+def set_cached_model_config(
+    name: str,
+    config: dict,
+    usage_scope: str = "chat",
+    *,
+    generation: int | None = None,
+):
+    """存入缓存。
+
+    ``generation`` 为回填方在 DB 读取前捕获的失效代数:期间发生过
+    invalidate 则丢弃本次写入——否则一个先于失效开始的读取会用旧行回填,
+    让已失效的配置复活一个 TTL 周期(R4-LM-5 竞态)。
+    """
     key = f"{usage_scope}:{name}"
-    _DB_CACHE[key] = config
-    import time
-    _DB_CACHE_TS = time.time()
+    with _DB_CACHE_LOCK:
+        if generation is not None and generation != _DB_CACHE_GENERATION:
+            return
+        _DB_CACHE[key] = (
+            time.time() + _DB_CACHE_TTL,
+            _DB_CACHE_GENERATION,
+            config,
+        )
 
-def get_cached_model_config(name: str | None, usage_scope: str = "chat") -> Optional[dict]:
-    """带 TTL 的进程内缓存"""
-    global _DB_CACHE_TS
-    import time
+
+def get_cached_model_config(name: str | None, usage_scope: str = "chat") -> dict | None:
+    """带逐条目 TTL 的进程内缓存"""
+    key = f"{usage_scope}:{name or '__default__'}"
     now = time.time()
-    if _DB_CACHE and (now - _DB_CACHE_TS) < _DB_CACHE_TTL:
-        key = f"{usage_scope}:{name or '__default__'}"
-        return _DB_CACHE.get(key)
-    return None
+    with _DB_CACHE_LOCK:
+        entry = _DB_CACHE.get(key)
+        if entry is None:
+            return None
+        expires_at, generation, config = entry
+        if now >= expires_at or generation != _DB_CACHE_GENERATION:
+            _DB_CACHE.pop(key, None)
+            return None
+        return config
+
 
 def invalidate_cache(name: str | None = None, usage_scope: str = "chat"):
     """主动失效（增删改时调用）"""
-    global _DB_CACHE, _DB_CACHE_TS
-    if name:
-        key = f"{usage_scope}:{name}"
-        _DB_CACHE.pop(key, None)
-    else:
-        _DB_CACHE.clear()
-    _DB_CACHE_TS = 0
+    global _DB_CACHE_GENERATION
+    with _DB_CACHE_LOCK:
+        if name:
+            key = f"{usage_scope}:{name}"
+            _DB_CACHE.pop(key, None)
+        else:
+            prefix = f"{usage_scope}:"
+            for key in [item for item in _DB_CACHE if item.startswith(prefix)]:
+                _DB_CACHE.pop(key, None)
+        # 代数推进使所有存量条目失效并拒绝先于本次失效开始的回填。配置
+        # 增删改是低频管理操作,全量重拉一轮的代价可接受。
+        _DB_CACHE_GENERATION += 1
+    try:
+        from backend.core.agents.config_compat import invalidate_model_catalog_cache
+
+        invalidate_model_catalog_cache()
+    except ImportError:
+        pass
+
 
 async def notify_model_change(name: str | None = None, usage_scope: str = "chat"):
     """通过 Redis 通知其他 Worker 更新缓存"""
@@ -49,12 +95,15 @@ async def notify_model_change(name: str | None = None, usage_scope: str = "chat"
         try:
             await r.publish(
                 "model_config_changed",
-                json.dumps({"name": name, "usage_scope": usage_scope, "action": "update"}),
+                json.dumps(
+                    {"name": name, "usage_scope": usage_scope, "action": "update"}
+                ),
             )
         finally:
             await r.aclose()
     except Exception as e:
         logger.error(f"通知模型配置变更失败: {e}")
+
 
 async def _subscribe_model_changes_once() -> None:
     """Open one Redis subscription and listen until it disconnects."""

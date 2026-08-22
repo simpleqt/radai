@@ -1,0 +1,12 @@
+[Unit]
+Description=Deploy RADAI origin/production every day at 03:00 Asia/Shanghai
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 Asia/Shanghai
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=false
+Unit=doc-agent-production-auto-deploy.service
+
+[Install]
+WantedBy=timers.target

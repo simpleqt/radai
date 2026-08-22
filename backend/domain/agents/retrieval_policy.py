@@ -2,7 +2,18 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+
+
+def _context_navigator_tokens() -> int:
+    """Read the per-request context_read token allowance (bounded)."""
+
+    try:
+        value = int(os.getenv("CONTEXT_NAVIGATOR_TOKENS", "10000") or "10000")
+    except (TypeError, ValueError):
+        value = 10000
+    return max(0, min(200000, value))
 
 
 @dataclass(frozen=True)
@@ -17,6 +28,7 @@ class RetrievalRuntimePolicy:
     web_calls: int = 10
     academic_calls: int = 2
     context_artifact_calls: int = 1
+    context_navigator_tokens: int = 10000
 
     @classmethod
     def for_mode(
@@ -26,6 +38,7 @@ class RetrievalRuntimePolicy:
         deep_research: bool = False,
         academic_enabled: bool = False,
     ) -> "RetrievalRuntimePolicy":
+        navigator_tokens = _context_navigator_tokens()
         if deep_research:
             return cls(
                 kb_top_k=8,
@@ -34,6 +47,7 @@ class RetrievalRuntimePolicy:
                 kb_calls=3,
                 web_calls=5,
                 academic_calls=5 if academic_enabled else 2,
+                context_navigator_tokens=navigator_tokens,
             )
         if lightweight:
             return cls(
@@ -41,12 +55,14 @@ class RetrievalRuntimePolicy:
                 kb_chunk_top_k=6,
                 kb_calls=2,
                 academic_calls=2,
+                context_navigator_tokens=navigator_tokens,
             )
         return cls(
             kb_top_k=10,
             kb_chunk_top_k=6,
             kb_calls=2,
             academic_calls=5 if academic_enabled else 2,
+            context_navigator_tokens=navigator_tokens,
         )
 
     def tool_budgets(self) -> dict[str, int]:
@@ -54,6 +70,11 @@ class RetrievalRuntimePolicy:
             "multi_kb_search": self.kb_calls,
             "web_search": self.web_calls,
             "read_context_artifact": self.context_artifact_calls,
+            "context_read": (
+                max(1, self.context_navigator_tokens // 2000)
+                if self.context_navigator_tokens > 0
+                else 0
+            ),
         }
         if self.academic_calls > 0:
             budgets["academic_search"] = self.academic_calls

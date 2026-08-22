@@ -94,6 +94,7 @@ class EvidenceRecord(TypedDict, total=False):
     raw_ref: str | None
     fallback_raw_ref: str | None
     materialized_ref: str | None
+    object_ref: str | None
     tags: list[str]
     content: str
     owner_record_id: str
@@ -128,7 +129,6 @@ class ContextCapabilities(TypedDict, total=False):
     """Capabilities derived from selected records, independent of rendering."""
 
     artifact_refs: list[str]
-    materialized_refs: list[str]
 
 
 class ContextPack(TypedDict, total=False):

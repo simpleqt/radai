@@ -5,7 +5,12 @@
 """
 
 import asyncio
+import json
 import logging
+import mimetypes
+import os
+import tempfile
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,11 +21,17 @@ from .base_ocr import BaseOCR, OCRConfig, OCRResult, OCRStatus
 
 logger = logging.getLogger(__name__)
 
+# 显式请求级超时：aiohttp 默认 total=300s 会让单次轮询挂满整个轮询预算，
+# 网络半死时表现为整体超时而非快速失败重试。
+_SUBMIT_TIMEOUT = aiohttp.ClientTimeout(total=120, connect=10, sock_connect=10, sock_read=60)
+_STATUS_TIMEOUT = aiohttp.ClientTimeout(total=30, connect=10, sock_connect=10, sock_read=15)
+_RESULT_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=120)
+
 
 class MinerUOCR(BaseOCR):
-    """MinerU OCR 服务实现
+    """MinerU v2 OCR 服务实现。
 
-    封装 MinerU Tianshu API Server 的调用，支持：
+    封装 MinerU 3.4+ FastAPI 的异步任务接口，支持：
     - 文档上传与解析任务提交
     - 任务状态查询
     - 解析结果获取（支持选择性获取字段）
@@ -29,7 +40,7 @@ class MinerUOCR(BaseOCR):
 
     def __init__(
         self,
-        api_url: str = "http://localhost:8009",
+        api_url: str = "http://localhost:8000",
         config: OCRConfig | None = None,
         **kwargs: Any,
     ):
@@ -42,7 +53,6 @@ class MinerUOCR(BaseOCR):
         """
         super().__init__(config=config, provider_name="MinerU", **kwargs)
         self.api_url = api_url.rstrip("/")
-        self.api_base = f"{self.api_url}/api/v1"
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -54,6 +64,43 @@ class MinerUOCR(BaseOCR):
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+
+    @staticmethod
+    def _connector_retry_settings() -> tuple[int, float, float]:
+        """Return bounded retry settings for short MinerU restart windows."""
+        try:
+            attempts = max(int(os.getenv("MINERU_CONNECT_RETRY_ATTEMPTS", "12")), 1)
+        except (TypeError, ValueError):
+            attempts = 12
+        try:
+            base_delay = max(float(os.getenv("MINERU_CONNECT_RETRY_BASE_SECONDS", "2")), 0)
+        except (TypeError, ValueError):
+            base_delay = 2.0
+        try:
+            max_delay = max(float(os.getenv("MINERU_CONNECT_RETRY_MAX_SECONDS", "10")), 0)
+        except (TypeError, ValueError):
+            max_delay = 10.0
+        return attempts, base_delay, max_delay
+
+    async def _connector_retry_delay(
+        self,
+        *,
+        operation: str,
+        attempt: int,
+        attempts: int,
+        error: aiohttp.ClientConnectorError,
+    ) -> None:
+        _, base_delay, max_delay = self._connector_retry_settings()
+        delay = min(base_delay * (2 ** max(attempt - 1, 0)), max_delay)
+        logger.warning(
+            "MinerU %s connection failed, retrying %d/%d in %.1fs: %s",
+            operation,
+            attempt,
+            attempts,
+            delay,
+            error,
+        )
+        await asyncio.sleep(delay)
 
     def _parse_status(self, status_str: str) -> OCRStatus:
         """解析状态字符串为枚举"""
@@ -95,48 +142,74 @@ class MinerUOCR(BaseOCR):
         if not await asyncio.to_thread(file_path_obj.exists):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        session = await self._get_session()
+        attempts, _, _ = self._connector_retry_settings()
+        return_images = bool(kwargs.pop("return_images", True))
+        response_format_zip = bool(kwargs.pop("response_format_zip", False))
+        for attempt in range(1, attempts + 1):
+            session = await self._get_session()
+            # aiohttp 发送 FormData 里的文件句柄会在事件循环线程同步
+            # read()（几十 MB 的 PDF），先在工作线程读入 bytes。
+            file_bytes = await asyncio.to_thread(file_path_obj.read_bytes)
+            data = aiohttp.FormData()
+            data.add_field(
+                "files",
+                file_bytes,
+                filename=file_path_obj.name,
+                content_type="application/pdf",
+            )
+            data.add_field("backend", ocr_config.backend)
+            data.add_field("lang_list", ocr_config.lang)
+            data.add_field("parse_method", ocr_config.method)
+            data.add_field("formula_enable", str(ocr_config.formula_enable).lower())
+            data.add_field("table_enable", str(ocr_config.table_enable).lower())
+            data.add_field("return_md", "true")
+            data.add_field("return_content_list", "true")
+            data.add_field("return_middle_json", "true")
+            data.add_field("return_images", str(return_images).lower())
+            data.add_field("response_format_zip", str(response_format_zip).lower())
 
-        file_handle = await asyncio.to_thread(open, file_path, "rb")
-
-        data = aiohttp.FormData()
-        data.add_field(
-            "file",
-            file_handle,
-            filename=file_path_obj.name,
-            content_type="application/octet-stream",
-        )
-        data.add_field("backend", ocr_config.backend)
-        data.add_field("lang", ocr_config.lang)
-        data.add_field("method", ocr_config.method)
-        data.add_field("formula_enable", str(ocr_config.formula_enable).lower())
-        data.add_field("table_enable", str(ocr_config.table_enable).lower())
-
-        for key, value in ocr_config.extra_params.items():
-            data.add_field(key, str(value))
-
-        for key, value in kwargs.items():
-            if key not in [
-                "backend",
-                "lang",
-                "method",
-                "formula_enable",
-                "table_enable",
-            ]:
+            for key, value in ocr_config.extra_params.items():
                 data.add_field(key, str(value))
 
-        try:
-            async with session.post(f"{self.api_base}/tasks/submit", data=data) as resp:
-                if resp.status == 200:
-                    result = await resp.json()
-                    task_id = result.get("task_id")
-                    logger.info(f"Task submitted successfully: {task_id}")
-                    return task_id
-                else:
+            for key, value in kwargs.items():
+                if key not in [
+                    "backend",
+                    "lang",
+                    "method",
+                    "parse_method",
+                    "lang",
+                    "lang_list",
+                    "formula_enable",
+                    "table_enable",
+                ]:
+                    data.add_field(key, str(value))
+
+            try:
+                async with session.post(
+                    f"{self.api_url}/tasks",
+                    data=data,
+                    timeout=_SUBMIT_TIMEOUT,
+                ) as resp:
+                    if resp.status in {200, 202}:
+                        result = await resp.json()
+                        task_id = result.get("task_id")
+                        if not task_id:
+                            raise RuntimeError(f"MinerU task response missing task_id: {result}")
+                        logger.info(f"Task submitted successfully: {task_id}")
+                        return task_id
                     error = await resp.text()
                     raise Exception(f"Failed to submit task: {error}")
-        finally:
-            await asyncio.to_thread(file_handle.close)
+            except aiohttp.ClientConnectorError as exc:
+                if attempt >= attempts:
+                    raise
+                await self._connector_retry_delay(
+                    operation="task submission",
+                    attempt=attempt,
+                    attempts=attempts,
+                    error=exc,
+                )
+
+        raise RuntimeError("unreachable MinerU submission retry state")
 
     def submit_task(
         self, file_path: str, config: OCRConfig | None = None, **kwargs: Any
@@ -159,37 +232,48 @@ class MinerUOCR(BaseOCR):
 
     async def get_task_status_async(self, task_id: str, **kwargs: Any) -> OCRResult:
         """异步查询任务状态"""
-        session = await self._get_session()
+        attempts, _, _ = self._connector_retry_settings()
+        for attempt in range(1, attempts + 1):
+            session = await self._get_session()
+            try:
+                async with session.get(
+                    f"{self.api_url}/tasks/{task_id}", timeout=_STATUS_TIMEOUT
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        file_names = data.get("file_names") or []
+                        file_name = file_names[0] if file_names else ""
 
-        async with session.get(f"{self.api_base}/tasks/{task_id}") as resp:
-            if resp.status == 200:
-                data = await resp.json()
+                        result = OCRResult(
+                            task_id=task_id,
+                            status=self._parse_status(data.get("status", "pending")),
+                            file_name=file_name,
+                            error_message=data.get("error"),
+                            created_at=self._parse_datetime(data.get("created_at")),
+                            completed_at=self._parse_datetime(data.get("completed_at")),
+                            metadata={
+                                "backend": data.get("backend"),
+                                "started_at": data.get("started_at"),
+                                "queued_ahead": data.get("queued_ahead"),
+                                "status_url": data.get("status_url"),
+                                "result_url": data.get("result_url"),
+                            },
+                        )
 
-                result = OCRResult(
-                    task_id=task_id,
-                    status=self._parse_status(data.get("status", "pending")),
-                    file_name=data.get("file_name", ""),
-                    error_message=data.get("error_message"),
-                    created_at=self._parse_datetime(data.get("created_at")),
-                    completed_at=self._parse_datetime(data.get("completed_at")),
-                    metadata={
-                        "backend": data.get("backend"),
-                        "priority": data.get("priority"),
-                        "worker_id": data.get("worker_id"),
-                        "retry_count": data.get("retry_count"),
-                        "result_path": data.get("result_path"),
-                    },
+                        return result
+                    error = await resp.text()
+                    raise Exception(f"Failed to get task status: {error}")
+            except aiohttp.ClientConnectorError as exc:
+                if attempt >= attempts:
+                    raise
+                await self._connector_retry_delay(
+                    operation="task status query",
+                    attempt=attempt,
+                    attempts=attempts,
+                    error=exc,
                 )
 
-                if result.status == OCRStatus.COMPLETED and "data" in data:
-                    result_data = data["data"]
-                    if "content" in result_data:
-                        result.markdown = result_data["content"]
-
-                return result
-            else:
-                error = await resp.text()
-                raise Exception(f"Failed to get task status: {error}")
+        raise RuntimeError("unreachable MinerU status retry state")
 
     def get_task_status(self, task_id: str, **kwargs: Any) -> OCRResult:
         """同步查询任务状态（已废弃，请使用 get_task_status_async）"""
@@ -220,61 +304,206 @@ class MinerUOCR(BaseOCR):
         if include_fields is None:
             include_fields = self.config.include_fields
 
-        params = {
-            "include_fields": ",".join(include_fields),
-            "upload_images": str(upload_images).lower(),
-            "include_metadata": str(include_metadata).lower(),
-        }
-
         async with session.get(
-            f"{self.api_base}/tasks/{task_id}/data", params=params
+            f"{self.api_url}/tasks/{task_id}/result", timeout=_RESULT_TIMEOUT
         ) as resp:
             if resp.status == 200:
+                headers = getattr(resp, "headers", {}) or {}
+                content_type = str(headers.get("Content-Type") or "").lower()
+                disposition = str(headers.get("Content-Disposition") or "").lower()
+                if "application/zip" in content_type or ".zip" in disposition:
+                    return await self._read_streamed_zip_result(
+                        resp,
+                        task_id=task_id,
+                        upload_images=upload_images,
+                        image_object_prefix=str(
+                            kwargs.get("image_object_prefix")
+                            or f"ocr/{task_id}/images"
+                        ),
+                        image_bucket_name=kwargs.get("image_bucket_name"),
+                    )
+
                 data = await resp.json()
+                result_map = data.get("results") or {}
+                file_name, result_data = next(iter(result_map.items()), ("", {}))
+                if not isinstance(result_data, dict):
+                    result_data = {}
 
                 result = OCRResult(
                     task_id=task_id,
-                    status=self._parse_status(data.get("status", "pending")),
-                    file_name=data.get("file_name", ""),
-                    created_at=self._parse_datetime(data.get("created_at")),
-                    completed_at=self._parse_datetime(data.get("completed_at")),
+                    status=OCRStatus.COMPLETED,
+                    file_name=file_name,
+                    metadata={
+                        "backend": data.get("backend"),
+                        "version": data.get("version"),
+                    },
                 )
 
-                if "data" in data:
-                    result_data = data["data"]
-
-                    if "md" in result_data:
-                        result.markdown = result_data["md"].get("content")
-                        result.md_url = result_data["md"].get("url")
-                    elif "markdown" in result_data:
-                        result.markdown = result_data["markdown"].get("content")
-                        result.md_url = result_data["markdown"].get("url")
-
-                    if "content_list" in result_data:
-                        result.content_list = result_data["content_list"].get("content")
-
-                    if "middle_json" in result_data:
-                        result.middle_json = result_data["middle_json"].get("content")
-
-                    if "model_output" in result_data:
-                        result.model_output = result_data["model_output"].get("content")
-
-                    if "images" in result_data:
-                        result.images = result_data["images"]
-
-                    if "layout_pdf" in result_data:
-                        result.layout_pdf = result_data["layout_pdf"]
-
-                    if "span_pdf" in result_data:
-                        result.span_pdf = result_data["span_pdf"]
-
-                    if "origin_pdf" in result_data:
-                        result.origin_pdf = result_data["origin_pdf"]
+                result.markdown = result_data.get("md_content")
+                result.content_list = self._decode_json_field(
+                    result_data.get("content_list"), expected_type=list
+                )
+                result.middle_json = self._decode_json_field(
+                    result_data.get("middle_json"), expected_type=dict
+                )
+                result.model_output = self._decode_json_field(
+                    result_data.get("model_output"), expected_type=dict
+                )
+                images = result_data.get("images")
+                if isinstance(images, dict):
+                    result.images = {
+                        name: self._strip_data_url(value)
+                        for name, value in images.items()
+                    }
 
                 return result
             else:
                 error = await resp.text()
                 raise Exception(f"Failed to get task data: {error}")
+
+    async def _read_streamed_zip_result(
+        self,
+        response: Any,
+        *,
+        task_id: str,
+        upload_images: bool,
+        image_object_prefix: str,
+        image_bucket_name: str | None,
+    ) -> OCRResult:
+        """Stream a large MinerU ZIP result to disk and normalize its contents."""
+
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f"mineru-{task_id}-",
+            suffix=".zip",
+        )
+        os.close(fd)
+        temporary_path = Path(temporary_name)
+        try:
+            with temporary_path.open("wb") as output:
+                async for chunk in response.content.iter_chunked(1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+            return await asyncio.to_thread(
+                self._normalize_zip_result,
+                temporary_path,
+                task_id=task_id,
+                upload_images=upload_images,
+                image_object_prefix=image_object_prefix,
+                image_bucket_name=image_bucket_name,
+            )
+        finally:
+            await asyncio.to_thread(temporary_path.unlink, missing_ok=True)
+
+    @staticmethod
+    def _normalize_zip_result(
+        zip_path: Path,
+        *,
+        task_id: str,
+        upload_images: bool,
+        image_object_prefix: str,
+        image_bucket_name: str | None,
+    ) -> OCRResult:
+        """Read small JSON/text members and stream image members into MinIO."""
+
+        from backend.config.settings import settings
+        from backend.storage import _get_minio_client, get_presigned_url
+
+        markdown: str | None = None
+        content_list: list[Any] | None = None
+        middle_json: dict[str, Any] | None = None
+        model_output: dict[str, Any] | None = None
+        images: dict[str, Any] = {}
+        file_name = ""
+        target_bucket = image_bucket_name or settings.minio_bucket_name
+        prefix = image_object_prefix.strip().strip("/") or f"ocr/{task_id}/images"
+
+        with zipfile.ZipFile(zip_path) as archive:
+            members = [item for item in archive.infolist() if not item.is_dir()]
+            for info in members:
+                member = Path(info.filename.replace("\\", "/"))
+                name = member.name
+                lower_name = name.lower()
+                if not file_name and len(member.parts) >= 2:
+                    file_name = member.parts[0]
+
+                if lower_name.endswith("_content_list.json") and not lower_name.endswith(
+                    "_content_list_v2.json"
+                ):
+                    decoded = json.loads(archive.read(info).decode("utf-8"))
+                    if isinstance(decoded, list):
+                        content_list = decoded
+                elif lower_name.endswith("_middle.json"):
+                    decoded = json.loads(archive.read(info).decode("utf-8"))
+                    if isinstance(decoded, dict):
+                        middle_json = decoded
+                elif lower_name.endswith("_model.json"):
+                    decoded = json.loads(archive.read(info).decode("utf-8"))
+                    if isinstance(decoded, dict):
+                        model_output = decoded
+                elif lower_name.endswith(".md"):
+                    markdown = archive.read(info).decode("utf-8")
+
+            if upload_images:
+                client = _get_minio_client()
+                for info in members:
+                    member = Path(info.filename.replace("\\", "/"))
+                    if "images" not in member.parts:
+                        continue
+                    mime_type = mimetypes.guess_type(member.name)[0]
+                    if not mime_type or not mime_type.startswith("image/"):
+                        continue
+                    object_name = f"{prefix}/{member.name}"
+                    with archive.open(info) as source:
+                        client.put_object(
+                            target_bucket,
+                            object_name,
+                            source,
+                            length=info.file_size,
+                            content_type=mime_type,
+                        )
+                    url = get_presigned_url(
+                        object_name,
+                        bucket_name=target_bucket,
+                    )
+                    images[member.name] = {
+                        "url": url,
+                        "object_key": object_name,
+                        "size": info.file_size,
+                    }
+
+        return OCRResult(
+            task_id=task_id,
+            status=OCRStatus.COMPLETED,
+            file_name=file_name,
+            markdown=markdown,
+            content_list=content_list,
+            middle_json=middle_json,
+            model_output=model_output,
+            images=images or None,
+            metadata={
+                "transport": "zip_stream",
+                "images_uploaded": len(images),
+            },
+        )
+
+    @staticmethod
+    def _decode_json_field(value: Any, *, expected_type: type) -> Any:
+        if isinstance(value, expected_type):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                return None
+            return decoded if isinstance(decoded, expected_type) else None
+        return None
+
+    @staticmethod
+    def _strip_data_url(value: Any) -> Any:
+        if not isinstance(value, str) or not value.startswith("data:"):
+            return value
+        marker = ";base64,"
+        return value.split(marker, 1)[1] if marker in value else value
 
     def get_task_data(
         self,
@@ -363,7 +592,7 @@ class MinerUOCR(BaseOCR):
         """异步健康检查"""
         session = await self._get_session()
 
-        async with session.get(f"{self.api_base}/health") as resp:
+        async with session.get(f"{self.api_url}/health") as resp:
             if resp.status == 200:
                 return await resp.json()
             else:

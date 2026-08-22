@@ -1,15 +1,21 @@
-import { computed, reactive, ref } from 'vue';
-import { AgentAPI, ChatMessage, AgentInfo, type AgentProcessEvent, type ResearchPlanPayload, type BackgroundTaskInfo, type FollowUpSuggestion } from '@/api/agent-v2';
+import { computed, getCurrentInstance, onUnmounted, reactive, ref, watch } from 'vue';
+import { AgentAPI, ChatMessage, AgentInfo, DEFAULT_AGENT_CODE, resolveAgentWorkflow, type AgentProcessEvent, type ResearchPlanPayload, type BackgroundTaskInfo, type FollowUpSuggestion } from '@/api/agent-v2';
 import { ConversationAPI } from '@/api/conversations';
+import { FeedbackAPI, feedbackKeysForMessages } from '@/api/feedback';
 import { authState } from '@/utils/request';
 import {
   getOrCreateGuestDeviceId,
   loadGuestMessages,
   saveGuestConversation,
 } from '@/services/storage/guestIndexedDb';
+import { readComposerPrefs, writeComposerPrefs } from './useComposerPrefs';
+import {
+  ensureNotificationPermission,
+  flashTitleWhileHidden,
+  notifyTaskFinished,
+} from './useTaskNotifications';
 const PENDING_STREAM_STORAGE_KEY = 'agent_v2_pending_stream';
 const PENDING_STREAM_TTL_MS = 10 * 60 * 1000;
-const MAX_PENDING_RESUME_ATTEMPTS = 2;
 const FOLLOW_UP_SUGGESTIONS_ENABLED = import.meta.env.VITE_FOLLOW_UP_SUGGESTIONS !== 'false';
 const FOLLOW_UP_SUGGESTIONS_TIMEOUT_MS = 12000;
 
@@ -41,6 +47,30 @@ const mapFollowUpSuggestions = (items: string[] | FollowUpSuggestion[]): FollowU
     .filter(Boolean) as FollowUpSuggestion[];
 };
 
+const processEventDedupeKey = (event: AgentProcessEvent): string => {
+  const eventId = String(event.id || '').trim();
+  if (!eventId) return '';
+
+  const metadata = event.metadata || {};
+  const rawInput = metadata.input;
+  const input = rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput)
+    ? rawInput as Record<string, unknown>
+    : {};
+  const invocationKey = String(
+    metadata.tool_run_id
+      || metadata.tool_call_id
+      || metadata.task_id
+      || metadata.query
+      || input.query
+      || '',
+  ).trim();
+  const timestamp = event.timestamp == null ? '' : String(event.timestamp);
+
+  // Older backends could reuse the same id for multiple web-search results.
+  // Keep SSE replay protection without dropping a later, distinct invocation.
+  return [eventId, invocationKey, timestamp].join(':');
+};
+
 const hidePreviousAssistantSuggestions = (source: ChatMessage[]) => {
   for (let i = source.length - 1; i >= 0; i -= 1) {
     const msg = source[i];
@@ -60,6 +90,7 @@ type SendMessageOptions = {
   thinking?: boolean;
   kbIds?: string[];
   useSearch?: boolean;
+  deepRetrieval?: boolean;
   intentMode?: 'auto' | 'manual';
   draftId?: string;
   confirmationStatus?: 'pending' | 'confirmed' | 'revised' | 'cancelled';
@@ -76,6 +107,7 @@ type PendingStreamState = {
   selectedSkills: string[];
   kbIds: string[];
   useSearch: boolean;
+  deepRetrieval?: boolean;
   intentMode?: 'auto' | 'manual';
   draftId?: string;
   confirmationStatus?: 'pending' | 'confirmed' | 'revised' | 'cancelled';
@@ -85,8 +117,85 @@ type PendingStreamState = {
   resumeAttempts: number;
 };
 
+type ThinkingMarkupSplitState = {
+  buffer: string;
+  inThinking: boolean;
+};
+
 const isUserRole = (role: string) => role === 'human' || role === 'user';
 const isAssistantRole = (role: string) => role === 'ai' || role === 'assistant';
+const THINKING_TAG_CARRY_CHARS = 16;
+
+const createThinkingMarkupSplitState = (): ThinkingMarkupSplitState => ({
+  buffer: '',
+  inThinking: false,
+});
+
+const appendUniqueText = (current: string, next: string): string => {
+  const existing = String(current || '');
+  const addition = String(next || '');
+  if (!addition) return existing;
+  if (!existing) return addition;
+  if (existing.includes(addition)) return existing;
+  if (addition.includes(existing)) return addition;
+  return `${existing}${addition}`;
+};
+
+const splitThinkingMarkupChunk = (
+  state: ThinkingMarkupSplitState,
+  chunk: string,
+  flush = false,
+): { content: string; reasoning: string } => {
+  state.buffer += String(chunk || '');
+  let content = '';
+  let reasoning = '';
+
+  while (state.buffer) {
+    if (state.inThinking) {
+      const closeMatch = state.buffer.match(/<\/(?:think|thought)>/i);
+      if (!closeMatch || closeMatch.index === undefined) {
+        if (flush) {
+          reasoning += state.buffer;
+          state.buffer = '';
+        } else {
+          const emitLength = Math.max(0, state.buffer.length - THINKING_TAG_CARRY_CHARS);
+          reasoning += state.buffer.slice(0, emitLength);
+          state.buffer = state.buffer.slice(emitLength);
+        }
+        break;
+      }
+
+      reasoning += state.buffer.slice(0, closeMatch.index);
+      state.buffer = state.buffer.slice(closeMatch.index + closeMatch[0].length);
+      state.inThinking = false;
+      continue;
+    }
+
+    const openMatch = state.buffer.match(/<(?:think|thought)>/i);
+    if (!openMatch || openMatch.index === undefined) {
+      if (flush) {
+        content += state.buffer;
+        state.buffer = '';
+      } else {
+        const emitLength = Math.max(0, state.buffer.length - THINKING_TAG_CARRY_CHARS);
+        content += state.buffer.slice(0, emitLength);
+        state.buffer = state.buffer.slice(emitLength);
+      }
+      break;
+    }
+
+    content += state.buffer.slice(0, openMatch.index);
+    state.buffer = state.buffer.slice(openMatch.index + openMatch[0].length);
+    state.inThinking = true;
+  }
+
+  return { content, reasoning };
+};
+
+const splitCompleteAssistantContent = (content: string): { content: string; reasoning: string } => {
+  const state = createThinkingMarkupSplitState();
+  return splitThinkingMarkupChunk(state, content, true);
+};
 
 const resolveModelSupportsThinking = (
   agentInfo: AgentInfo | null,
@@ -140,6 +249,36 @@ const normalizeDisplayedUserQuestion = (content: string): string => {
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
 
   return cleaned || text.trim();
+};
+
+const normalizeCompactionSummary = (content: string): string => {
+  const text = String(content || '').trim();
+  if (!text.startsWith('Another language model started to solve this problem')) {
+    return text;
+  }
+  const newline = text.indexOf('\n');
+  return newline >= 0 ? text.slice(newline + 1).trim() : text;
+};
+
+const compactionHistoryEvent = (msg: any): AgentProcessEvent => {
+  const metadata = {
+    ...((msg?.metadata?.context_compaction || {}) as Record<string, unknown>),
+  };
+  const windowId = String(metadata.window_id || msg?.id || 'context-window');
+  const before = Number(metadata.tokens_before || 0);
+  const after = Number(metadata.tokens_after || 0);
+  const removed = Number(metadata.removed_messages || 0);
+  const metrics = before && after ? `约 ${before} → ${after} tokens` : '历史已归档';
+  return {
+    id: `context-compaction:${windowId}`,
+    kind: 'context_compaction',
+    title: '上下文窗口已压缩',
+    detail: `${metrics}${removed ? `，归档 ${removed} 条历史消息` : ''}`,
+    level: 'success',
+    tool: 'context_compression',
+    summary: normalizeCompactionSummary(String(msg?.content || '')),
+    metadata,
+  };
 };
 
 const normalizeArtifactDownloadUrl = (url: string) => {
@@ -196,10 +335,41 @@ const upsertArtifact = (artifactList: any[], nextArtifact: any) => {
   return artifactList;
 };
 
+const extractFallbackAnswerFromEvent = (event: AgentProcessEvent): string => {
+  const detail = String(event.detail || '').trim();
+  if (!detail) return '';
+
+  const kind = String(event.kind || '').toLowerCase();
+  if (kind === 'answer') return detail;
+
+  const metadata = event.metadata || {};
+  const runtimeType = String(metadata.runtime_type || '').toLowerCase();
+  const role = String(metadata.role || '').toLowerCase();
+  const finalRoles = new Set(['reviewer', 'report_writer', 'final_writer', 'coordinator']);
+
+  if (runtimeType === 'coordination.unit.completed' && finalRoles.has(role)) {
+    return detail;
+  }
+
+  return '';
+};
+
+const applyFallbackAnswerFromEvent = (event: AgentProcessEvent, assistantMsg: ChatMessage) => {
+  if (String(assistantMsg.content || '').trim()) return;
+
+  const fallbackAnswer = extractFallbackAnswerFromEvent(event);
+  if (fallbackAnswer) {
+    const split = splitCompleteAssistantContent(fallbackAnswer);
+    assistantMsg.content = split.content;
+    assistantMsg.reasoning = appendUniqueText(assistantMsg.reasoning || '', split.reasoning);
+  }
+};
+
 const normalizeHistoryMessages = (history: any[]): ChatMessage[] => {
   const normalized: ChatMessage[] = [];
   let pendingAssistant: ChatMessage | null = null;
   let pendingStatuses: string[] = [];
+  let pendingCompactionEvents: AgentProcessEvent[] = [];
 
   const appendStatus = (status: string) => {
     const prev = pendingStatuses[pendingStatuses.length - 1];
@@ -221,6 +391,11 @@ const normalizeHistoryMessages = (history: any[]): ChatMessage[] => {
     const content = String(msg?.content || '');
     const id = msg?.id || Math.random().toString();
 
+    if (role === 'context_compaction') {
+      pendingCompactionEvents.push(compactionHistoryEvent(msg));
+      continue;
+    }
+
     if (isUserRole(role)) {
       flushPendingAssistant();
 
@@ -239,23 +414,64 @@ const normalizeHistoryMessages = (history: any[]): ChatMessage[] => {
         continue;
       }
 
-      pendingAssistant = {
-        id,
-        role: 'assistant',
-        content,
-        reasoning: msg?.metadata?.reasoning || '',
-        statusHistory: [...pendingStatuses],
-        processEvents: [],
-        followUpSuggestions: mapFollowUpSuggestions(
+      const splitAssistant = splitCompleteAssistantContent(content);
+      if (!splitAssistant.content && !splitAssistant.reasoning) {
+        // 纯工具调用轮的空 AI 消息：没有可展示内容，跳过。
+        continue;
+      }
+      if (pendingAssistant) {
+        // 同一轮的多段模型输出（工具轮预告 + 最终答案）直播时累积在同一个气泡，
+        // 历史回放必须同样拼接；直接覆盖会让刷新后的正文比直播短一大截。
+        pendingAssistant.content = pendingAssistant.content
+          ? `${pendingAssistant.content}\n\n${splitAssistant.content}`
+          : splitAssistant.content;
+        pendingAssistant.reasoning = appendUniqueText(
+          pendingAssistant.reasoning || '',
+          splitAssistant.reasoning,
+        );
+        const followUps = mapFollowUpSuggestions(
           msg?.metadata?.follow_up_suggestions || msg?.metadata?.followUpSuggestions || [],
-        ),
-      };
+        );
+        if (followUps.length > 0) {
+          pendingAssistant.followUpSuggestions = followUps;
+        }
+        // 两段 AI 消息之间积累的压缩过程事件并入同一气泡，不能随清空丢弃
+        // （首段分支带 processEvents，续段分支此前直接丢掉）。
+        if (pendingCompactionEvents.length > 0) {
+          pendingAssistant.processEvents = [
+            ...(pendingAssistant.processEvents || []),
+            ...pendingCompactionEvents,
+          ];
+        }
+      } else {
+        pendingAssistant = {
+          id,
+          role: 'assistant',
+          content: splitAssistant.content,
+          reasoning: appendUniqueText(String(msg?.metadata?.reasoning || ''), splitAssistant.reasoning),
+          statusHistory: [...pendingStatuses],
+          processEvents: [...pendingCompactionEvents],
+          followUpSuggestions: mapFollowUpSuggestions(
+            msg?.metadata?.follow_up_suggestions || msg?.metadata?.followUpSuggestions || [],
+          ),
+        };
+      }
+      pendingCompactionEvents = [];
 
       appendStatus('回答生成完成');
     }
   }
 
   flushPendingAssistant();
+
+  if (pendingCompactionEvents.length > 0) {
+    normalized.push({
+      id: `context-compaction-tail-${Date.now()}`,
+      role: 'assistant',
+      content: '',
+      processEvents: pendingCompactionEvents,
+    });
+  }
 
   return normalized;
 };
@@ -281,71 +497,185 @@ const trimMessagesByUserTurns = (source: ChatMessage[], keepUserTurns: number): 
   return trimmed;
 };
 
-const readPendingStreamState = (): PendingStreamState | null => {
+const readPendingStreamState = (storageKey: string): PendingStreamState | null => {
   if (typeof window === 'undefined') return null;
   try {
-    const raw = sessionStorage.getItem(PENDING_STREAM_STORAGE_KEY);
+    const raw = sessionStorage.getItem(storageKey);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as PendingStreamState;
     if (!parsed?.threadId || !parsed?.question || !parsed?.savedAt) {
-      sessionStorage.removeItem(PENDING_STREAM_STORAGE_KEY);
+      sessionStorage.removeItem(storageKey);
       return null;
     }
     if (Date.now() - parsed.savedAt > PENDING_STREAM_TTL_MS) {
-      sessionStorage.removeItem(PENDING_STREAM_STORAGE_KEY);
+      sessionStorage.removeItem(storageKey);
       return null;
     }
     return parsed;
   } catch {
-    sessionStorage.removeItem(PENDING_STREAM_STORAGE_KEY);
+    sessionStorage.removeItem(storageKey);
     return null;
   }
 };
 
-const writePendingStreamState = (state: PendingStreamState) => {
+const writePendingStreamState = (storageKey: string, state: PendingStreamState) => {
   if (typeof window === 'undefined') return;
-  sessionStorage.setItem(PENDING_STREAM_STORAGE_KEY, JSON.stringify(state));
+  sessionStorage.setItem(storageKey, JSON.stringify(state));
 };
 
-const clearPendingStreamState = (threadId?: string) => {
+const clearPendingStreamState = (storageKey: string, threadId?: string) => {
   if (typeof window === 'undefined') return;
-  const current = readPendingStreamState();
+  const current = readPendingStreamState(storageKey);
   if (!current) return;
   if (threadId && current.threadId !== threadId) return;
-  sessionStorage.removeItem(PENDING_STREAM_STORAGE_KEY);
+  sessionStorage.removeItem(storageKey);
 };
 
 const normalizeSelectedSkills = (skills?: string[]): string[] => {
   if (!Array.isArray(skills)) return [];
-  return skills.filter((skill) => skill && skill !== 'nuclear-electronics');
+  return Array.from(new Set(skills.map((skill) => String(skill || '').trim()).filter(Boolean)));
 };
 
-export function useAgentChat() {
+export function useAgentChat(config: { agentCode?: string } = {}) {
+  const agentCode = config.agentCode || DEFAULT_AGENT_CODE;
+  const pendingStreamStorageKey = `${PENDING_STREAM_STORAGE_KEY}:${agentCode}`;
+  const readAgentPendingStreamState = (): PendingStreamState | null => {
+    const scopedState = readPendingStreamState(pendingStreamStorageKey);
+    if (scopedState || agentCode !== DEFAULT_AGENT_CODE || typeof window === 'undefined') {
+      return scopedState;
+    }
+
+    // Migrate the pre-agent-namespace key once so an interrupted conversation
+    // created before this feature remains recoverable by the default agent.
+    const legacyState = readPendingStreamState(PENDING_STREAM_STORAGE_KEY);
+    if (!legacyState) return null;
+    writePendingStreamState(pendingStreamStorageKey, legacyState);
+    sessionStorage.removeItem(PENDING_STREAM_STORAGE_KEY);
+    return legacyState;
+  };
+  const clearAgentPendingStreamState = (threadId?: string) => {
+    clearPendingStreamState(pendingStreamStorageKey, threadId);
+    if (agentCode === DEFAULT_AGENT_CODE) {
+      clearPendingStreamState(PENDING_STREAM_STORAGE_KEY, threadId);
+    }
+  };
   const messages = ref<ChatMessage[]>([]);
   const isBusy = ref(false);
   const status = ref('');
   const agentInfo = ref<AgentInfo | null>(null);
   const selectedModel = ref<string>('');
-  const selectedKbs = ref<string[]>((import.meta.env.VITE_DEFAULT_KB_IDS || '').split(',').filter(Boolean));
+  const selectedKbs = ref<string[]>([]);
   const searchEnabled = ref(false);
+  const deepRetrievalEnabled = ref(false);
   const selectedSkills = ref<string[]>([]);
-  const researchMode = computed({
-    get: () => selectedSkills.value.includes('deep-research') ? 'deep_research' : 'normal',
-    set: (mode) => {
-      const idx = selectedSkills.value.indexOf('deep-research');
-      if (mode === 'deep_research') {
-        if (idx === -1) selectedSkills.value.push('deep-research');
-      } else {
-        if (idx !== -1) selectedSkills.value.splice(idx, 1);
+  const normalizeWorkflowName = (value: unknown) =>
+    String(value || '').trim().toLowerCase().replace(/-/g, '_');
+  const deepResearchAvailable = computed(() =>
+    (agentInfo.value?.allowed_workflows || [])
+      .some((workflow) => normalizeWorkflowName(workflow) === 'deep_research')
+  );
+  const searchAvailable = computed(() => agentInfo.value?.search_enabled === true);
+  // Explicit workflow mode and Skill selection are separate controls.  A
+  // selected Skill's preferred workflow is resolved from Agent Info below;
+  // no Skill key is allowed to impersonate an explicit workflow request.
+  const researchMode = ref<'normal' | 'deep_research'>('normal');
+  const artifacts = ref<any[]>([]);
+  const forceGuestMode = import.meta.env.VITE_FORCE_GUEST_MODE === 'true';
+  const isGuestMode = computed(() => !authState.value.token);
+  const isGuestRestricted = computed(() => forceGuestMode || isGuestMode.value);
+  const shouldPersistGuestLocally = computed(() => isGuestMode.value);
+  const resolveQueryEndpoint = () => {
+    return isGuestRestricted.value ? '/api/v2/guest/query' : '/api/v2/agent-runtime/query';
+  };
+  const activeThreadId = ref('');
+
+  // ── Composer 偏好持久化（按智能体隔离）──────────────────
+  // 恢复只发生在 loadAgentInfo 应用默认值之后；watcher 在恢复完成前不写入，
+  // 避免把初始化中间态覆盖进用户已保存的偏好。访客不读不写。
+  let composerPrefsRestored = false;
+
+  const applyStoredComposerToggles = () => {
+    if (isGuestRestricted.value) return;
+    const prefs = readComposerPrefs(agentCode);
+    if (!prefs) return;
+    if (typeof prefs.searchEnabled === 'boolean') {
+      searchEnabled.value = searchAvailable.value && prefs.searchEnabled;
+    }
+    if (typeof prefs.deepRetrieval === 'boolean') {
+      deepRetrievalEnabled.value = prefs.deepRetrieval;
+    }
+  };
+
+  const applyStoredComposerPrefs = () => {
+    if (isGuestRestricted.value) return;
+    const prefs = readComposerPrefs(agentCode);
+    if (!prefs) return;
+    const info = agentInfo.value;
+
+    const modelIds = new Set((info?.available_models || []).map((m) => m.name));
+    if (prefs.model && modelIds.has(prefs.model)) {
+      selectedModel.value = prefs.model;
+    }
+
+    const allowedKbIds = info?.kb_ids || [];
+    if (Array.isArray(prefs.kbIds)) {
+      const validKbs = prefs.kbIds.filter((id) => allowedKbIds.includes(id));
+      // 存量选择全部失效时回落默认；显式存过空数组则尊重“全不选”。
+      if (validKbs.length > 0 || prefs.kbIds.length === 0) {
+        selectedKbs.value = validKbs;
       }
     }
-  });
-  const artifacts = ref<any[]>([]);
-  const isGuestMode = computed(() => !authState.value.token);
-  const activeThreadId = ref('');
+
+    applyStoredComposerToggles();
+
+    if (Array.isArray(prefs.skills)) {
+      const availableSkillNames = new Set(
+        (info?.available_skills || [])
+          .map((skill: any) => String(skill?.name || skill?.id || '').trim())
+          .filter(Boolean)
+      );
+      const requiredSkills = normalizeSelectedSkills([
+        ...(info?.required_skills || []),
+        ...(info?.available_skills || [])
+          .filter((skill: any) => skill.required)
+          .map((skill: any) => skill.name),
+      ]).filter((id) => availableSkillNames.has(id));
+      const storedSkills = normalizeSelectedSkills(prefs.skills)
+        .filter((id) => availableSkillNames.has(id));
+      selectedSkills.value = Array.from(new Set([...requiredSkills, ...storedSkills]));
+    }
+  };
+
+  watch(
+    [selectedModel, selectedKbs, searchEnabled, deepRetrievalEnabled, selectedSkills],
+    () => {
+      if (!composerPrefsRestored || isGuestRestricted.value) return;
+      // 智能体当前没有联网能力时，运行值一定是 false；此时保留已存的用户
+      // 偏好，否则能力恢复后用户的「联网=开」已经被覆盖掉了。
+      const storedSearch = readComposerPrefs(agentCode)?.searchEnabled;
+      writeComposerPrefs(agentCode, {
+        model: selectedModel.value || undefined,
+        kbIds: [...selectedKbs.value],
+        searchEnabled: searchAvailable.value
+          ? searchEnabled.value
+          : (typeof storedSearch === 'boolean' ? storedSearch : searchEnabled.value),
+        deepRetrieval: deepRetrievalEnabled.value,
+        skills: [...selectedSkills.value],
+      });
+    },
+    { deep: true },
+  );
+
+  const resolveRequestSelectedSkills = (rawSkills?: string[]): string[] | undefined => {
+    if (isGuestRestricted.value) return [];
+    const normalized = normalizeSelectedSkills(rawSkills ?? selectedSkills.value);
+    return normalized.length > 0 ? normalized : undefined;
+  };
   let historyLoadSeq = 0;
 
   // ── 后台任务状态 ──────────────────────────────────────
+  let backgroundRestoreTimer: ReturnType<typeof setTimeout> | null = null;
+  let backgroundRestoreDisposed = false;
   const activeBackgroundTask = ref<BackgroundTaskInfo | null>(null);
   const backgroundTaskStreaming = ref(false);
   let taskUnsubscribe: (() => void) | null = null;
@@ -390,9 +720,14 @@ export function useAgentChat() {
       .pop();
     const recoveredContent = extractAssistantContent(lastAssistant?.content);
     if (!recoveredContent) return false;
+    const splitRecovered = splitCompleteAssistantContent(recoveredContent);
 
-    if (options?.replaceContent || recoveredContent.length > (assistantMsg.content || '').length) {
-      assistantMsg.content = recoveredContent;
+    if (splitRecovered.reasoning) {
+      assistantMsg.reasoning = appendUniqueText(assistantMsg.reasoning || '', splitRecovered.reasoning);
+    }
+
+    if (options?.replaceContent || splitRecovered.content.length > (assistantMsg.content || '').length) {
+      assistantMsg.content = splitRecovered.content;
     }
 
     if (options?.refreshArtifacts) {
@@ -405,27 +740,33 @@ export function useAgentChat() {
   const persistPendingStreamState = (question: string, options?: SendMessageOptions) => {
     const threadId = String(options?.threadId || '').trim();
     if (!threadId || isGuestMode.value) return;
+    const existing = readAgentPendingStreamState();
+    const resumeAttempts = (
+      existing?.threadId === threadId &&
+      existing?.question === question
+    ) ? existing.resumeAttempts : 0;
 
-    writePendingStreamState({
+    writePendingStreamState(pendingStreamStorageKey, {
       threadId,
       question,
       researchMode: options?.researchMode ?? researchMode.value,
       selectedSkills: normalizeSelectedSkills(options?.selectedSkills ?? selectedSkills.value),
       kbIds: [...(options?.kbIds ?? selectedKbs.value)],
       useSearch: options?.useSearch ?? searchEnabled.value,
+      deepRetrieval: options?.deepRetrieval ?? deepRetrievalEnabled.value,
       intentMode: options?.intentMode,
       draftId: options?.draftId,
       confirmationStatus: options?.confirmationStatus,
       researchPlan: options?.researchPlan,
       model: options?.model || selectedModel.value || undefined,
       savedAt: Date.now(),
-      resumeAttempts: 0,
+      resumeAttempts,
     });
   };
 
   const getPendingInterruptedThreadId = (): string | null => {
     if (isGuestMode.value) return null;
-    return readPendingStreamState()?.threadId || null;
+    return readAgentPendingStreamState()?.threadId || null;
   };
 
   /** 订阅后台任务事件流 */
@@ -437,12 +778,33 @@ export function useAgentChat() {
     }
 
     backgroundTaskStreaming.value = true;
+    const thinkingSplitState = createThinkingMarkupSplitState();
+    const flushBackgroundThinkingTail = () => {
+      const split = splitThinkingMarkupChunk(thinkingSplitState, '', true);
+      if (split.content) {
+        assistantMsg.content = (assistantMsg.content || '') + split.content;
+      }
+      if (split.reasoning) {
+        assistantMsg.reasoning = (assistantMsg.reasoning || '') + split.reasoning;
+      }
+    };
 
     taskUnsubscribe = AgentAPI.subscribeTaskStream(
       taskId,
       threadId,
-      (textChunk) => {
-        assistantMsg.content = (assistantMsg.content || '') + textChunk;
+      agentCode,
+      (textChunk, mode) => {
+        if (mode === 'replace') {
+          thinkingSplitState.buffer = '';
+          thinkingSplitState.inThinking = false;
+        }
+        const split = splitThinkingMarkupChunk(thinkingSplitState, textChunk, mode === 'replace');
+        assistantMsg.reasoning = mode === 'replace'
+          ? appendUniqueText(assistantMsg.reasoning || '', split.reasoning)
+          : (assistantMsg.reasoning || '') + split.reasoning;
+        assistantMsg.content = mode === 'replace'
+          ? split.content
+          : (assistantMsg.content || '') + split.content;
       },
       (statusMsg) => {
         status.value = statusMsg;
@@ -461,7 +823,9 @@ export function useAgentChat() {
         }
 
         const events = assistantMsg.processEvents || [];
-        if (event.id && events.some(e => e.id === event.id)) return;
+        const eventKey = processEventDedupeKey(event);
+        if (eventKey && events.some(e => processEventDedupeKey(e) === eventKey)) return;
+        applyFallbackAnswerFromEvent(event, assistantMsg);
         events.push(event);
         assistantMsg.processEvents = events;
         
@@ -473,6 +837,8 @@ export function useAgentChat() {
       },
       async () => {
         // 任务完成
+        flushBackgroundThinkingTail();
+        notifyTaskFinished('深度研究任务已完成', '后台任务已生成完整结果，点击查看。');
         backgroundTaskStreaming.value = false;
         isBusy.value = false;
         status.value = '';
@@ -492,6 +858,7 @@ export function useAgentChat() {
         }
       },
       (error) => {
+        flushBackgroundThinkingTail();
         console.error('[useAgentChat] Background task SSE error:', error);
         // Don't immediately mark as failed — the task may still be running on the server.
         // Show a transient warning and attempt auto-recovery after a short delay.
@@ -503,9 +870,15 @@ export function useAgentChat() {
 
         // Auto-recovery: wait 5s then check if the task is still active on the server
         if (currentTaskId && currentThreadId) {
-          setTimeout(async () => {
+          if (backgroundRestoreTimer) clearTimeout(backgroundRestoreTimer);
+          const timerThreadId = currentThreadId;
+          backgroundRestoreTimer = setTimeout(async () => {
+            if (backgroundRestoreDisposed) return;
+            // 会话已切换/清空时不得恢复订阅：isBusy 是组合式单例状态，
+            // 旧会话的后台任务会把新会话的 composer 锁到任务结束。
+            if (activeThreadId.value !== timerThreadId) return;
             try {
-              const result = await AgentAPI.getThreadActiveTask(currentThreadId);
+              const result = await AgentAPI.getThreadActiveTask(currentThreadId, agentCode);
               if (result.has_active_task && result.task) {
                 // Task is still running — re-subscribe
                 console.log('[useAgentChat] Auto-recovery: task still active, re-subscribing');
@@ -532,6 +905,7 @@ export function useAgentChat() {
                     refreshArtifacts: true,
                   });
                 }
+                notifyTaskFinished('深度研究任务已完成', '后台任务已生成完整结果，点击查看。');
               }
             } catch (recoveryError) {
               console.error('[useAgentChat] Auto-recovery failed:', recoveryError);
@@ -554,6 +928,7 @@ export function useAgentChat() {
           assistantMsg.content += `\n\n[后台任务错误: ${error}，请稍后重试或重新进入当前会话查看结果。]`;
           activeBackgroundTask.value = null;
           taskUnsubscribe = null;
+          notifyTaskFinished('后台任务出现异常', '任务连接中断且未能自动恢复，请回到会话查看。');
         }
       },
       (thinkingText) => {
@@ -575,7 +950,7 @@ export function useAgentChat() {
     const task = activeBackgroundTask.value;
     if (!task) return;
     try {
-      await AgentAPI.cancelTask(task.task_id, task.thread_id);
+      await AgentAPI.cancelTask(task.task_id, task.thread_id, agentCode);
       if (taskUnsubscribe) {
         taskUnsubscribe();
         taskUnsubscribe = null;
@@ -593,16 +968,31 @@ export function useAgentChat() {
   const checkAndResumeBackgroundTask = async (threadId: string): Promise<boolean> => {
     if (isGuestMode.value) return false;
     try {
-      const result = await AgentAPI.getThreadActiveTask(threadId);
+      const result = await AgentAPI.getThreadActiveTask(threadId, agentCode);
       if (result.has_active_task && result.task) {
         activeBackgroundTask.value = result.task;
-        // 找到最后一条 assistant 消息并订阅
+        // Server history may still end at the user turn while the background
+        // research task is running.  Always materialize a streaming assistant
+        // target before subscribing; otherwise refresh reports success but no
+        // subscription is actually created.
         const lastMsg = messages.value[messages.value.length - 1];
-        if (lastMsg && lastMsg.role === 'assistant') {
-          lastMsg.isStreaming = true;
-          isBusy.value = true;
-          subscribeToBackgroundTask(result.task.task_id, threadId, lastMsg);
+        let assistantMsg = lastMsg && lastMsg.role === 'assistant' ? lastMsg : null;
+        if (!assistantMsg) {
+          assistantMsg = reactive<ChatMessage>({
+            id: `background-resume-${result.task.task_id}`,
+            role: 'assistant',
+            content: '',
+            reasoning: '',
+            statusHistory: [],
+            processEvents: [],
+            isStreaming: true,
+          });
+          messages.value.push(assistantMsg);
         }
+        assistantMsg.isStreaming = true;
+        isBusy.value = true;
+        backgroundTaskStreaming.value = true;
+        subscribeToBackgroundTask(result.task.task_id, threadId, assistantMsg);
         return true;
       }
     } catch (e) {
@@ -614,55 +1004,27 @@ export function useAgentChat() {
   const checkAndResumeInterruptedStream = async (threadId: string): Promise<boolean> => {
     if (isGuestMode.value) return false;
 
-    const pending = readPendingStreamState();
+    const pending = readAgentPendingStreamState();
     if (!pending || pending.threadId !== threadId) return false;
 
     const lastMsg = messages.value[messages.value.length - 1];
     const normalizedQuestion = normalizeDisplayedUserQuestion(pending.question);
 
     if (!lastMsg || lastMsg.role !== 'user' || lastMsg.content !== normalizedQuestion) {
-      clearPendingStreamState(threadId);
+      clearAgentPendingStreamState(threadId);
       return false;
     }
 
-    if (pending.resumeAttempts >= MAX_PENDING_RESUME_ATTEMPTS) {
-      status.value = '检测到上次回答中断，请手动重新发送问题。';
-      return false;
-    }
-
-    writePendingStreamState({
-      ...pending,
-      savedAt: Date.now(),
-      resumeAttempts: pending.resumeAttempts + 1,
-    });
-
-    status.value = '检测到页面刷新导致回答中断，正在自动恢复...';
-    const userTurns = messages.value.filter((msg) => msg.role === 'user').length;
-    if (userTurns <= 0) {
-      clearPendingStreamState(threadId);
-      return false;
-    }
-
-    await rollbackConversation(threadId, userTurns - 1);
-    await sendMessage(pending.question, {
-      threadId,
-      researchMode: pending.researchMode,
-      selectedSkills: pending.selectedSkills,
-      kbIds: pending.kbIds,
-      useSearch: pending.useSearch,
-      intentMode: pending.intentMode,
-      draftId: pending.draftId,
-      confirmationStatus: pending.confirmationStatus,
-      researchPlan: pending.researchPlan,
-      model: pending.model,
-      appendUserMessage: true,
-    });
-    return true;
+    // Direct streams have no durable cursor. Re-POSTing here can execute tools
+    // and persist the same user turn twice, so require an explicit resend.
+    clearAgentPendingStreamState(threadId);
+    status.value = '检测到上次回答中断。为避免重复执行，请手动重新发送问题。';
+    return false;
   };
 
   const loadAgentInfo = async () => {
     try {
-      agentInfo.value = await AgentAPI.getInfo();
+      agentInfo.value = await AgentAPI.getInfo(agentCode);
       const availableModels = agentInfo.value?.available_models || [];
       const defaultId = (agentInfo.value?.default_model || agentInfo.value?.model || '').trim();
       const ids = new Set(availableModels.map((m) => m.name));
@@ -676,16 +1038,34 @@ export function useAgentChat() {
         selectedModel.value = '';
       }
       searchEnabled.value = false; // 默认关闭搜索
+      deepRetrievalEnabled.value = false; // 默认关闭深度检索
       researchMode.value = 'normal';
-      if (isGuestMode.value) {
+      if (isGuestRestricted.value) {
         selectedSkills.value = [];
+      } else {
+        const declaredSelectedSkills = [
+          ...(agentInfo.value?.selected_skills || []),
+          ...(agentInfo.value?.required_skills || []),
+          ...(agentInfo.value?.available_skills || [])
+            .filter((skill) => skill.required || skill.default_selected)
+            .map((skill) => skill.name),
+        ];
+        const availableSkillNames = new Set(
+          (agentInfo.value?.available_skills || [])
+            .map((skill: any) => String(skill?.name || skill?.id || '').trim())
+            .filter(Boolean)
+        );
+        selectedSkills.value = normalizeSelectedSkills(declaredSelectedSkills)
+          .filter((id) => availableSkillNames.has(id));
       }
       const allowedKbIds = agentInfo.value?.kb_ids || [];
-      if (allowedKbIds.length > 0) {
-        // 保留用户已选中的有效 ID；若当前没有选择则默认全选
-        const validSelected = selectedKbs.value.filter((id) => allowedKbIds.includes(id));
-        selectedKbs.value = validSelected.length > 0 ? validSelected : [...allowedKbIds];
-      }
+      // 保留用户已选中的有效 ID；无可访问知识库时必须清空历史默认值。
+      const validSelected = selectedKbs.value.filter((id) => allowedKbIds.includes(id));
+      selectedKbs.value = validSelected.length > 0 ? validSelected : [...allowedKbIds];
+
+      // 默认值就绪后恢复该智能体上次保存的 composer 偏好。
+      applyStoredComposerPrefs();
+      composerPrefsRestored = true;
     } catch (e) {
       console.error('Failed to load agent info', e);
     }
@@ -695,10 +1075,20 @@ export function useAgentChat() {
     const normalizedThreadId = String(threadId || '').trim();
     const seq = ++historyLoadSeq;
 
+    // 切换会话必须同时中止仍在进行的普通流：否则 fetch 继续读流并把 chunk 写进
+    // 已从 messages 摘除的 assistant 对象（孤儿对象持续增长），连接也一直占用。
+    cancelStream();
+
     // 取消之前的后台任务订阅（避免状态串扰）
     if (taskUnsubscribe) {
       taskUnsubscribe();
       taskUnsubscribe = null;
+    }
+    // 会话切换后，旧会话的自动恢复定时器不得再触发（否则旧后台任务
+    // 重新拉起订阅并锁死新会话的 composer）。
+    if (backgroundRestoreTimer) {
+      clearTimeout(backgroundRestoreTimer);
+      backgroundRestoreTimer = null;
     }
     backgroundTaskStreaming.value = false;
     activeBackgroundTask.value = null;
@@ -752,6 +1142,13 @@ export function useAgentChat() {
     options?: SendMessageOptions
   ) => {
     if (!question.trim() || isBusy.value) return;
+
+    // 深研请求会转后台跑数十分钟：只在用户自己发起时申请通知授权，恢复既有
+    // 任务的路径不申请，避免一打开会话就弹权限框。
+    if (!isGuestRestricted.value
+      && (options?.researchMode ?? researchMode.value) === 'deep_research') {
+      ensureNotificationPermission();
+    }
 
     const shouldAppendUser = options?.appendUserMessage !== false;
 
@@ -816,7 +1213,8 @@ export function useAgentChat() {
     let pendingStatus: string | null = null;
     let pendingEvents: AgentProcessEvent[] = [];
     let pendingDraftChunk = '';
-    const seenEventIds = new Set<string>();
+    const seenEventKeys = new Set<string>();
+    const thinkingSplitState = createThinkingMarkupSplitState();
 
     const flushPendingUpdates = () => {
       // 优先处理状态和事件
@@ -896,17 +1294,32 @@ export function useAgentChat() {
     if (streamThreadId) {
       activeThreadId.value = streamThreadId;
     }
-    const effectiveResearchMode = isGuestMode.value
-      ? 'normal'
-      : (options?.researchMode ?? researchMode.value);
+    if (shouldPersistGuestLocally.value && streamThreadId) {
+      await saveGuestConversation(streamThreadId, messages.value, agentCode);
+    }
+    const requestedResearchMode = options?.researchMode ?? researchMode.value;
+    const effectiveResearchMode = !isGuestRestricted.value
+      && deepResearchAvailable.value
+      && requestedResearchMode === 'deep_research'
+      ? 'deep_research'
+      : 'normal';
 
-    // 访客固定轻量模式：不携带技能，关闭思考链
-    const finalSkills = isGuestMode.value
-      ? []
-      : normalizeSelectedSkills(options?.selectedSkills ?? selectedSkills.value);
+    // 访客仍不携带可选技能并关闭思考链；工作流由 Profile 能力解析。
+    const requestSelectedSkills = resolveRequestSelectedSkills(options?.selectedSkills);
+    const effectiveUseSearch = searchAvailable.value
+      && Boolean(options?.useSearch ?? searchEnabled.value);
+    const effectiveDeepRetrieval = Boolean(
+      options?.deepRetrieval ?? deepRetrievalEnabled.value
+    );
+    const requestWorkflow = resolveAgentWorkflow(agentInfo.value, {
+      researchMode: effectiveResearchMode,
+      selectedSkills: requestSelectedSkills,
+      useSearch: effectiveUseSearch,
+      guest: isGuestRestricted.value,
+    });
     const requestedModel = options?.model || selectedModel.value || undefined;
     const modelSupportsThinking = resolveModelSupportsThinking(agentInfo.value, requestedModel);
-    const effectiveThinking = isGuestMode.value
+    const effectiveThinking = isGuestRestricted.value
       ? false
       : (modelSupportsThinking ? options?.thinking : false);
 
@@ -936,12 +1349,29 @@ export function useAgentChat() {
     };
 
     try {
-      persistPendingStreamState(question, options);
+      persistPendingStreamState(question, {
+        ...options,
+        researchMode: effectiveResearchMode,
+        selectedSkills: requestSelectedSkills,
+        useSearch: effectiveUseSearch,
+        deepRetrieval: effectiveDeepRetrieval,
+      });
       console.log('[useAgentChat] Starting query:', question);
       const result = await AgentAPI.queryStream(
         question,
-        (textChunk) => {
-          pendingChunk += textChunk;
+        (textChunk, mode) => {
+          if (mode === 'replace') {
+            thinkingSplitState.buffer = '';
+            thinkingSplitState.inThinking = false;
+            pendingChunk = '';
+            const split = splitThinkingMarkupChunk(thinkingSplitState, textChunk, true);
+            assistantMsg.content = split.content;
+            assistantMsg.reasoning = appendUniqueText(assistantMsg.reasoning || '', split.reasoning);
+          } else {
+            const split = splitThinkingMarkupChunk(thinkingSplitState, textChunk);
+            pendingChunk += split.content;
+            pendingThinking += split.reasoning;
+          }
           flushImmediately();
         },
         (statusMsg) => {
@@ -953,18 +1383,21 @@ export function useAgentChat() {
           researchMode: effectiveResearchMode,
           thinking: effectiveThinking,
           kbIds: options?.kbIds || selectedKbs.value,
-          useSearch: options?.useSearch ?? searchEnabled.value,
-          selectedSkills: finalSkills,
+          useSearch: effectiveUseSearch,
+          deepRetrieval: effectiveDeepRetrieval,
+          selectedSkills: requestSelectedSkills,
+          workflow: requestWorkflow,
           intentMode: options?.intentMode,
           draftId: options?.draftId,
           confirmationStatus: options?.confirmationStatus,
           researchPlan: options?.researchPlan,
           model: requestedModel,
           token: authState.value.token || undefined,
-          endpoint: isGuestMode.value ? '/api/v2/guest/query' : '/api/v2/agent-runtime/query',
+          endpoint: resolveQueryEndpoint(),
           deviceId: isGuestMode.value ? getOrCreateGuestDeviceId() : undefined,
           signal: controller.signal,
           fileIds: options?.fileIds,
+          agentCode,
         },
         (event) => {
           if (streamThreadId && activeThreadId.value && streamThreadId !== activeThreadId.value) {
@@ -978,14 +1411,27 @@ export function useAgentChat() {
 
           const events = assistantMsg.processEvents || [];
 
-          // 根据 id 去重防止后端重复发送导致的渲染重复
-          if (event.id && (seenEventIds.has(event.id) || events.some(e => e.id === event.id))) {
-            console.log('[useAgentChat] Ignoring duplicate event:', event.id);
+          // 按“事件 + 工具调用 + 时间”去重，避免旧后端复用 id 时吞掉后续检索结果。
+          const eventKey = processEventDedupeKey(event);
+          if (eventKey && (
+            seenEventKeys.has(eventKey)
+            || events.some(e => processEventDedupeKey(e) === eventKey)
+          )) {
+            console.log('[useAgentChat] Ignoring duplicate event:', eventKey);
             return;
           }
 
-          if (event.id) {
-            seenEventIds.add(event.id);
+          if (eventKey) {
+            seenEventKeys.add(eventKey);
+          }
+
+          if (!String(assistantMsg.content || '').trim() && !pendingChunk.trim()) {
+            const fallbackAnswer = extractFallbackAnswerFromEvent(event);
+            if (fallbackAnswer) {
+              const split = splitCompleteAssistantContent(fallbackAnswer);
+              pendingChunk = split.content;
+              pendingThinking = appendUniqueText(pendingThinking, split.reasoning);
+            }
           }
 
           pendingEvents.push(event);
@@ -1010,6 +1456,9 @@ export function useAgentChat() {
           applyFollowUpSuggestions(rawSuggestions);
         },
       );
+      const tailSplit = splitThinkingMarkupChunk(thinkingSplitState, '', true);
+      pendingChunk += tailSplit.content;
+      pendingThinking += tailSplit.reasoning;
       flushImmediately();
 
       if (
@@ -1017,7 +1466,6 @@ export function useAgentChat() {
         && assistantMsg.content?.trim()
         && !result.backgroundTaskId
         && effectiveResearchMode !== 'deep_research'
-        && !finalSkills.includes('deep-research')
         && !assistantMsg.followUpSuggestions?.length
       ) {
         assistantMsg.suggestionsLoading = true;
@@ -1027,7 +1475,7 @@ export function useAgentChat() {
       // 如果返回了 backgroundTaskId，说明深度研究已转为后台任务
       if (result.backgroundTaskId) {
         console.log('[useAgentChat] Background task started:', result.backgroundTaskId);
-        clearPendingStreamState(streamThreadId);
+        clearAgentPendingStreamState(streamThreadId);
         
         // 立即订阅后台任务事件流（在获取任务信息之前），避免错过事件
         assistantMsg.isStreaming = true;
@@ -1036,7 +1484,7 @@ export function useAgentChat() {
         
         // 异步获取任务信息（不阻塞订阅）
         try {
-          const taskStatus = await AgentAPI.getTaskStatus(result.backgroundTaskId, streamThreadId);
+          const taskStatus = await AgentAPI.getTaskStatus(result.backgroundTaskId, streamThreadId, agentCode);
           activeBackgroundTask.value = {
             task_id: taskStatus.task_id,
             thread_id: taskStatus.thread_id,
@@ -1060,14 +1508,14 @@ export function useAgentChat() {
       if (result.aborted) {
         flushImmediately();
         console.log('[useAgentChat] Stream aborted by user');
-        clearPendingStreamState(streamThreadId);
+        clearAgentPendingStreamState(streamThreadId);
         isBusy.value = false;
         status.value = '';
         assistantMsg.isStreaming = false;
         assistantMsg.suggestionsLoading = false;
         streamAbortController = null;
-        if (isGuestMode.value && threadId) {
-          await saveGuestConversation(threadId, messages.value);
+        if (shouldPersistGuestLocally.value && threadId) {
+          await saveGuestConversation(threadId, messages.value, agentCode);
         }
         return;
       }
@@ -1088,8 +1536,10 @@ export function useAgentChat() {
       }
 
       console.log('[useAgentChat] Stream completed successfully');
+      // 用户切到其他标签页时用标题角标提示回答已生成。
+      flashTitleWhileHidden();
       clearSuggestionsTimeout();
-      clearPendingStreamState(streamThreadId);
+      clearAgentPendingStreamState(streamThreadId);
       isBusy.value = false;
       status.value = '';
       assistantMsg.isStreaming = false;
@@ -1098,8 +1548,8 @@ export function useAgentChat() {
       }
       streamAbortController = null;
 
-      if (isGuestMode.value && threadId) {
-        await saveGuestConversation(threadId, messages.value);
+      if (shouldPersistGuestLocally.value && threadId) {
+        await saveGuestConversation(threadId, messages.value, agentCode);
       }
     } catch (e: any) {
       flushImmediately();
@@ -1109,12 +1559,12 @@ export function useAgentChat() {
       // 用户主动取消（fetch 被 abort 时会抛 AbortError）
       if (e?.name === 'AbortError') {
         console.log('[useAgentChat] Fetch aborted by user');
-        clearPendingStreamState(streamThreadId);
+        clearAgentPendingStreamState(streamThreadId);
         isBusy.value = false;
         status.value = '';
         assistantMsg.isStreaming = false;
-        if (isGuestMode.value && threadId) {
-          await saveGuestConversation(threadId, messages.value);
+        if (shouldPersistGuestLocally.value && threadId) {
+          await saveGuestConversation(threadId, messages.value, agentCode);
         }
         return;
       }
@@ -1142,6 +1592,9 @@ export function useAgentChat() {
       } else {
         assistantMsg.content += `\n\n---\n*注：连接中断，以上内容可能不完整。可稍后重新进入当前会话查看服务端已保存的完整结果。*`;
       }
+      if (shouldPersistGuestLocally.value && threadId) {
+        await saveGuestConversation(threadId, messages.value, agentCode);
+      }
       isBusy.value = false;
       status.value = '';
       assistantMsg.isStreaming = false;
@@ -1149,15 +1602,21 @@ export function useAgentChat() {
   };
 
   const clearMessages = () => {
+    // 新建对话同样要中止在飞的流（同 loadHistory 的理由）。
+    cancelStream();
     if (taskUnsubscribe) {
       taskUnsubscribe();
       taskUnsubscribe = null;
+    }
+    if (backgroundRestoreTimer) {
+      clearTimeout(backgroundRestoreTimer);
+      backgroundRestoreTimer = null;
     }
     messages.value = [];
     status.value = '';
     artifacts.value = [];
     activeThreadId.value = '';
-    clearPendingStreamState();
+    clearAgentPendingStreamState();
     isBusy.value = false;
     backgroundTaskStreaming.value = false;
     activeBackgroundTask.value = null;
@@ -1165,6 +1624,9 @@ export function useAgentChat() {
     // Resume to default modes for a fresh chat experience
     researchMode.value = 'normal';
     searchEnabled.value = false;
+    deepRetrievalEnabled.value = false;
+    // 新会话回到用户保存的默认开关（而不是一律关闭）。
+    applyStoredComposerToggles();
   };
 
   const setResearchMode = (mode: 'normal' | 'deep_research') => {
@@ -1181,15 +1643,45 @@ export function useAgentChat() {
       return;
     }
 
+    // 反馈键由问题摘要派生，重答会复用同一个键；被回滚掉的回答如果留着旧
+    // 评价，新回答一进来就会显示上一轮的赞/踩。
+    const keptMessages = trimMessagesByUserTurns(messages.value, keepUserTurns);
+    const keptSet = new Set(keptMessages);
+    const allKeys = feedbackKeysForMessages(messages.value);
+    const droppedFeedbackKeys = messages.value
+      .map((msg, index) => (keptSet.has(msg) ? null : allKeys[index]))
+      .filter((key): key is string => Boolean(key));
+
     if (!isGuestMode.value) {
       await ConversationAPI.rollback(threadId, keepUserTurns);
+      if (droppedFeedbackKeys.length > 0) {
+        await FeedbackAPI.removeMany(threadId, droppedFeedbackKeys);
+      }
     }
     messages.value = trimMessagesByUserTurns(messages.value, keepUserTurns);
-    if (isGuestMode.value) {
-      await saveGuestConversation(threadId, messages.value);
+    if (shouldPersistGuestLocally.value) {
+      await saveGuestConversation(threadId, messages.value, agentCode);
     }
     artifacts.value = [];
   };
+
+  // 离开页面/卸载组件时释放在飞的流与后台订阅：没有这层清理，路由离开后
+  // fetch 仍在读流、订阅仍在回调，连接与孤儿对象一直留到流自然结束。
+  // getCurrentInstance 守卫让该 composable 仍可在组件外（测试）调用。
+  if (getCurrentInstance()) {
+    onUnmounted(() => {
+      cancelStream();
+      backgroundRestoreDisposed = true;
+      if (backgroundRestoreTimer) {
+        clearTimeout(backgroundRestoreTimer);
+        backgroundRestoreTimer = null;
+      }
+      if (taskUnsubscribe) {
+        taskUnsubscribe();
+        taskUnsubscribe = null;
+      }
+    });
+  }
 
   return {
     messages,
@@ -1199,6 +1691,7 @@ export function useAgentChat() {
     selectedModel,
     selectedKbs,
     searchEnabled,
+    deepRetrievalEnabled,
     selectedSkills,
     researchMode,
     setResearchMode,

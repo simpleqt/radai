@@ -1,8 +1,8 @@
 # Model Management Module (模型管理与热更新) 详解
 
-> **最后同步**：2026-05-31（含 `usage_scope=asr`）
+> **最后同步**：2026-07-09（对齐 `models.py`、`llm_model.py`、`factory.py`、`asr_config.py`）
 
-模型管理模块是整个系统的“引擎调速器”。系统现已完全摆脱了传统的单一静态 `config.yaml` 配置，演进为 **MySQL 持久化 + 进程内缓存与 TTL + Redis 订阅/发布实时同步** 的高可用模型管理系统。这保证了在多 Worker、多进程的高并发生产环境下，管理员能够零重启热更新所有模型配置。
+模型管理模块是整个系统的“引擎调速器”。当前主路径为 **MySQL 持久化 + 进程内缓存与 TTL + Redis 订阅/发布实时同步**；`backend/config.yaml` 与 `settings` 仍作为模型工厂 fallback，用于数据库不可用或未命中时保持兼容。这保证了在多 Worker、多进程的生产环境下，管理员能够零重启热更新对话模型配置。
 
 ---
 
@@ -25,7 +25,14 @@ Admin PUT /api/v1/models/{id}
 ────────────────
 create_chat_model(name)
     → _DB_CACHE[usage_scope:name] 未过期 ? 命中 : 查 MySQL → 写缓存(30s)
-    → MODEL_CONFIG_SOURCE=db 失败时降级 config.yaml → settings
+    → MODEL_CONFIG_SOURCE=db 失败时降级 backend/config.yaml → settings
+
+ASR 读取路径
+────────────────
+POST /api/v1/asr/transcribe
+    → load_asr_config_from_db(name?)
+    → llm_models where usage_scope='asr' and is_active=true
+    → 未配置则返回 503
 ```
 
 ---
@@ -39,7 +46,7 @@ create_chat_model(name)
 | 字段名 | 类型 | 说明 | 示例值 |
 | :--- | :--- | :--- | :--- |
 | **id** | Integer | 自增主键 | `1` |
-| **usage_scope** | String(32) | 用途域（与 `name` 联合唯一） | `"chat"`（Agent 对话）；**`"asr"`**（语音转写，见 `backend/api/routers/asr.py`）；预留 `embedding`/`rerank` |
+| **usage_scope** | String(32) | 用途域（与 `name` 联合唯一） | `"chat"`（Agent 对话）；**`"asr"`**（语音转写，见 `backend/core/models/asr_config.py`）；预留 `kb_chat`/`embedding`/`rerank` |
 | **name** | String(100) | 模型唯一标识（API 与智能体调用名） | `"qwen-max"` |
 | **display_name**| String(200) | 前端展示名 | `"通义千问 Qwen-Max"` |
 | **provider** | String(50) | 模型提供商 | `"qwen"` / `"deepseek"` / `"custom"` |
@@ -47,10 +54,22 @@ create_chat_model(name)
 | **model** | String(100) | 调用接口实际的模型名称 | `"qwen-max-2025-01-25"` |
 | **api_key** | String(500) | 环境变量引用标识或加密明文 | `"$DASHSCOPE_API_KEY"` |
 | **base_url** | String(500) | API 请求基地址 | `"https://dashscope.aliyuncs.com/compatible-mode/v1"` |
+| **api_key_env_var** / **base_url_env_var** | String | 当列值为空或 `$ENV` 未取到时的环境变量名 fallback | `"DASHSCOPE_API_KEY"` |
+| **request_timeout** / **max_retries** | Float / SmallInteger | 请求超时与重试次数 | `600.0` / `2` |
+| **max_tokens** | Integer | 最大输出 token | `16384` |
+| **max_input_tokens** | Integer | 最大输入 token / 上下文窗口，运行时会注入 `profile.max_input_tokens` | `131072` |
+| **temperature** / **top_p** | Float | 采样参数 | `0.1` / `0.8` |
+| **extra_body** | JSON | OpenAI-compatible 额外请求体参数 | `{"enable_thinking": false}` |
+| **when_thinking_enabled** | JSON | 开启思考模式时追加/覆盖的请求参数 | `{"extra_body": {"enable_thinking": true}}` |
+| **thinking_config** | JSON | 结构化思考配置，转换为 factory 内部 `thinking` | `{"enabled": true}` |
 | **supports_thinking** | Boolean | 是否支持深度思考（Reasoning）模式 | `true` |
 | **supports_vision** | Boolean | 是否支持多模态图片输入 | `true` |
+| **supports_reasoning_effort** | Boolean | 是否支持 OpenAI 风格 `reasoning_effort` | `false` |
+| **supports_streaming** | Boolean | 是否支持流式输出（模型工厂会按适配器处理） | `true` |
+| **use_responses_api** / **output_version** | Boolean/String | OpenAI Responses API 与结构化输出兼容字段 | `false` / `"responses/v1"` |
 | **is_default** | Boolean | 是否为系统当前默认模型 | `true` |
 | **is_active** | Boolean | 是否启用 | `true` |
+| **sort_order** | SmallInteger | 默认模型候选排序 | `0` |
 
 ### 2. 智能环境变量解析机制
 
@@ -100,7 +119,7 @@ create_chat_model(name)
 MODEL_CONFIG_SOURCE = "db"
   ├── 1. 尝试从 MySQL (带 cache + Redis 广播) 加载
   │   └── 成功: 实例化并返回 (如 LlmModel Or ModelConfig)
-  ├── 2. 失败/未找到: 降级尝试从 config.yaml 加载
+  ├── 2. 失败/未找到: 降级尝试从 backend/config.yaml 加载
   │   └── 成功: 实例化并返回
   └── 3. 仍失败: 最终回退至 BaseLLMProvider / settings 全局配置
 ```
@@ -114,18 +133,29 @@ MODEL_CONFIG_SOURCE = "db"
     *   若关闭思考，强行将 `extra_body` 中的 `enable_thinking` 设为 `false`，并从参数中剔除 `reasoning_effort`。
 *   **VLLM / 兼容端点**:
     *   自动将 `extra_body` 中的 `chat_template_kwargs` 内的 `thinking` 键设为 `false`，避免不支持思考模式的模型引发请求崩溃。
+*   **上下文窗口**:
+    *   `max_input_tokens` 优先来自 MySQL；缺失时通过 `context_limits` 按配置/模型名推断，并写入 LangChain 模型实例的 `profile.max_input_tokens`。
 
 ---
 
 ## 🛠️ RESTful 管理接口 (`backend/api/routers/models.py`)
 
-路由前缀为 `/api/v1/models`，所有接口均挂载 **`require_admin`** 依赖注入，强制进行管理员角色校验：
+路由前缀为 `/api/v1/models`，所有接口均挂载 **`require_admin`** 依赖注入，强制进行管理员角色校验。
 
-1.  **`GET /`** — 列出指定 `usage_scope` 下的全部模型配置（展示完整参数）。
-2.  **`POST /`** — 创建新的模型配置。若请求中 `is_default=True`，会自动清空该 scope 下其他模型的默认状态。随后通过 Redis 广播变更。
-3.  **`PUT /{model_id}`** — 修改指定模型的所有参数。支持更新完成后主动清空 Redis 缓存并广播更新。
+> 当前边界：`GET /api/v1/models?usage_scope=...` 可按 scope 查询；`POST`、`PUT`、`DELETE`、`toggle` 的写入和广播逻辑固定面向 `usage_scope="chat"`。`usage_scope="asr"` 记录由 ASR 运行时读取，但不是当前管理 API 的写入主路径。
+> 管理审计：创建、更新、删除、启停都会通过 `write_admin_audit()` 写入管理员审计日志；响应中的 `api_key` 会做首尾掩码。
+
+1.  **`GET /`** — 列出指定 `usage_scope` 下的全部模型配置（响应中的 `api_key` 会做掩码）。
+2.  **`POST /`** — 创建新的 chat 模型配置。若请求中 `is_default=True`，会自动清空 chat scope 下其他模型的默认状态。随后通过 Redis 广播变更。
+3.  **`PUT /{model_id}`** — 修改指定模型的所有参数。若 `api_key` 为空或仍是掩码值，则保留原密钥；更新完成后广播指定模型和默认模型缓存失效。
 4.  **`DELETE /{model_id}`** — 删除模型配置，并向频道发布失效广播。
 5.  **`POST /{model_id}/toggle`** — 快速开启/禁用模型 (`is_active` 状态切换)，用于应急上下架。
+
+---
+
+## 🎙️ ASR 配置读取 (`backend/core/models/asr_config.py`)
+
+语音转写接口 `POST /api/v1/asr/transcribe` 要求登录用户，并从 `llm_models` 读取 `usage_scope="asr"`、`is_active=true` 的模型配置；未指定模型名时按 `is_default desc, sort_order` 取第一条。ASR 读取 `extra_body.default_language` 作为默认语言，缺省为 `zh`。未配置可用 ASR 模型时，接口返回 503。
 
 ---
 

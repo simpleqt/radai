@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1060" viewBox="0 0 900 1060">
+  <defs><marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L10,3 L0,6 Z" fill="#000"/></marker></defs>
+  <rect width="900" height="1060" fill="#fff"/>
+  <g fill="#fff" stroke="#000" stroke-width="2">
+    <rect x="250" y="30" width="400" height="65"/><rect x="250" y="135" width="400" height="65"/>
+    <rect x="250" y="240" width="400" height="65"/><rect x="250" y="345" width="400" height="65"/>
+    <rect x="250" y="450" width="400" height="65"/><rect x="250" y="555" width="400" height="65"/>
+    <rect x="250" y="660" width="400" height="65"/><rect x="250" y="765" width="400" height="65"/>
+    <rect x="250" y="930" width="400" height="65"/>
+  </g>
+  <g font-family="sans-serif" font-size="22" text-anchor="middle" fill="#000">
+    <text x="450" y="70">101  知识库管理接口接入</text><text x="450" y="175">102  接收用户查询</text>
+    <text x="450" y="280">103  结构化解析</text><text x="450" y="385">104  直接检索服务候选召回</text>
+    <text x="450" y="490">105  领域物理约束校验</text><text x="450" y="595">106  融合排序</text>
+    <text x="450" y="700">107  探索式学习智能体评估</text><text x="450" y="805">108  智能体服务接口调度</text>
+    <text x="450" y="970">109  结果输出</text>
+  </g>
+  <g stroke="#000" stroke-width="2" fill="none" marker-end="url(#a)">
+    <path d="M450 95 V135"/><path d="M450 200 V240"/><path d="M450 305 V345"/><path d="M450 410 V450"/>
+    <path d="M450 515 V555"/><path d="M450 620 V660"/><path d="M450 725 V765"/><path d="M650 692 H760 V960 H650"/>
+    <path d="M250 798 H120 V482 H250"/>
+  </g>
+  <g font-family="sans-serif" font-size="16" fill="#000">
+    <text x="468" y="545">物理一致性结果/约束反馈信息</text>
+    <text x="468" y="648">排序结果/条件化证据组</text>
+    <text x="468" y="750">未覆盖槽位/冲突字段/未知字段</text>
+    <text x="30" y="640">补检索候选</text>
+    <text x="665" y="675">满足阈值或终止条件</text>
+    <text x="470" y="862">未满足阈值</text>
+  </g>
+</svg>

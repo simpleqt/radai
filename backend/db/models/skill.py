@@ -6,22 +6,26 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     Column,
     DateTime,
     Index,
-    JSON,
+    Integer,
     String,
     Text,
     UniqueConstraint,
 )
 
-from backend.db.models import Base
+from backend.db.models.base import Base
 
 
 def _uuid() -> str:
     return str(uuid.uuid4())
+
+
+_AUTOINCREMENT_ID = BigInteger().with_variant(Integer, "sqlite")
 
 
 class ManagedSkill(Base):
@@ -79,7 +83,7 @@ class SkillVersion(Base):
 class SkillAcl(Base):
     __tablename__ = "skill_acl"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_AUTOINCREMENT_ID, primary_key=True, autoincrement=True)
     skill_id = Column(String(36), nullable=False, index=True)
     subject_type = Column(String(16), nullable=False)
     subject_id = Column(String(64), nullable=False)
@@ -105,7 +109,7 @@ class SkillAcl(Base):
 class AgentSkillBinding(Base):
     __tablename__ = "agent_skill_bindings"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    id = Column(_AUTOINCREMENT_ID, primary_key=True, autoincrement=True)
     agent_code = Column(String(64), nullable=False, index=True)
     skill_id = Column(String(36), nullable=False, index=True)
     is_enabled = Column(Boolean, nullable=False, default=True)
@@ -129,7 +133,7 @@ class AgentSkillBinding(Base):
 class SkillAuditLog(Base):
     __tablename__ = "skill_audit_logs"
 
-    audit_id = Column(BigInteger, primary_key=True, autoincrement=True)
+    audit_id = Column(_AUTOINCREMENT_ID, primary_key=True, autoincrement=True)
     skill_id = Column(String(36), nullable=True, index=True)
     version_id = Column(String(36), nullable=True, index=True)
     actor_user_id = Column(String(36), nullable=False, index=True)

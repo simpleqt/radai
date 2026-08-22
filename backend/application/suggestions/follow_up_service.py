@@ -245,13 +245,13 @@ class FollowUpSuggestionService:
     ) -> tuple[list[str], dict[str, Any]]:
         from langchain_core.messages import HumanMessage
 
-        from backend.core.models import create_chat_model
+        from backend.core.models import create_chat_model_async
 
         resolved_model = _resolve_model_name(model_name)
         logger.info("[FollowUp] 使用模型生成建议: %s", resolved_model or "(default)")
         # 勿向 create_chat_model 传入 request_timeout/temperature/max_tokens，
         # 会与 DB/YAML 配置冲突导致创建失败并回退到无 Key 的兜底模型。
-        model = create_chat_model(
+        model = await create_chat_model_async(
             name=resolved_model,
             thinking_enabled=False,
         )
@@ -565,8 +565,3 @@ def _post_filter(suggestions: list[str], answer: str, count: int) -> list[str]:
 _follow_up_service: FollowUpSuggestionService | None = None
 
 
-def get_follow_up_service() -> FollowUpSuggestionService:
-    global _follow_up_service
-    if _follow_up_service is None:
-        _follow_up_service = FollowUpSuggestionService()
-    return _follow_up_service

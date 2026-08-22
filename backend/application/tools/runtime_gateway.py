@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any
 
@@ -62,16 +63,19 @@ class RuntimeToolGateway:
             raise RuntimeError(self._missing_tool_message.format(tool_name=tool_name))
 
         metadata = tool_metadata(resolved_tool)
-        decision = await self._guardrail.aevaluate(
-            GuardrailRequest(
-                tool_name=tool_name,
-                tool_input=dict(args),
-                agent_id=self._agent_id,
-                thread_id=self._thread_id,
-                risk_level=str(metadata.get("risk_level") or "safe"),
-                side_effect=str(metadata.get("side_effect") or "none"),
-                policy_source=str(metadata.get("policy_source") or ""),
-            )
+        decision = await asyncio.wait_for(
+            self._guardrail.aevaluate(
+                GuardrailRequest(
+                    tool_name=tool_name,
+                    tool_input=dict(args),
+                    agent_id=self._agent_id,
+                    thread_id=self._thread_id,
+                    risk_level=str(metadata.get("risk_level") or "safe"),
+                    side_effect=str(metadata.get("side_effect") or "none"),
+                    policy_source=str(metadata.get("policy_source") or ""),
+                )
+            ),
+            timeout=5.0,
         )
         if decision.allow:
             return resolved_tool

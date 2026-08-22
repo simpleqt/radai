@@ -1,4 +1,0 @@
-data: {"type": "event", "event": {"kind": "background_task_started", "metadata": {"task_id": "t-123"}}}
-
-data: [DONE]
-

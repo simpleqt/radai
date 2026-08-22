@@ -154,12 +154,9 @@ def get_app_config() -> AppConfig:
     runtime_override = _current_app_config.get()
     if runtime_override is not None:
         return runtime_override
-    if _app_config is not None and _app_config_is_custom:
-        return _app_config
-    now = time.monotonic()
-    if _app_config is not None and now < _app_config_next_mtime_check:
-        return _app_config
     with _app_config_lock:
+        if _app_config is not None and _app_config_is_custom:
+            return _app_config
         now = time.monotonic()
         if _app_config is not None and now < _app_config_next_mtime_check:
             return _app_config
@@ -191,27 +188,30 @@ def get_app_config() -> AppConfig:
 
 
 def reload_app_config(config_path: str | None = None) -> AppConfig:
-    return _load_and_cache_app_config(config_path)
+    with _app_config_lock:
+        return _load_and_cache_app_config(config_path)
 
 
 def reset_app_config() -> None:
     global _app_config, _app_config_path, _app_config_mtime
     global _app_config_is_custom, _app_config_next_mtime_check
-    _app_config = None
-    _app_config_path = None
-    _app_config_mtime = None
-    _app_config_is_custom = False
-    _app_config_next_mtime_check = 0.0
+    with _app_config_lock:
+        _app_config = None
+        _app_config_path = None
+        _app_config_mtime = None
+        _app_config_is_custom = False
+        _app_config_next_mtime_check = 0.0
 
 
 def set_app_config(config: AppConfig) -> None:
     global _app_config, _app_config_path, _app_config_mtime
     global _app_config_is_custom, _app_config_next_mtime_check
-    _app_config = config
-    _app_config_path = None
-    _app_config_mtime = None
-    _app_config_is_custom = True
-    _app_config_next_mtime_check = float("inf")
+    with _app_config_lock:
+        _app_config = config
+        _app_config_path = None
+        _app_config_mtime = None
+        _app_config_is_custom = True
+        _app_config_next_mtime_check = float("inf")
 
 
 def peek_current_app_config() -> AppConfig | None:

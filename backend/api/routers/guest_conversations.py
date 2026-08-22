@@ -17,6 +17,9 @@ from backend.application.checkpointing.guest_fallback import (
     get_thread_ids_with_checkpoint_messages,
     has_checkpoint_messages,
 )
+from backend.application.conversations.local_catalog import (
+    get_local_conversation_catalog,
+)
 from backend.config.loggers import get_logger
 from backend.core.config import build_internal_thread_key
 from backend.db.connection import get_async_session
@@ -31,7 +34,7 @@ async def _has_checkpoint(request: Request, internal_thread_id: str) -> bool:
     try:
         return await has_checkpoint_messages(request, internal_thread_id)
     except Exception as exc:
-        logger.debug(
+        logger.warning(
             "检查 guest/main checkpoint 失败: thread=%s, error=%s",
             internal_thread_id,
             exc,
@@ -71,19 +74,27 @@ async def list_guest_conversations(
     visible: list[ConversationResponse] = []
     started_at = time.perf_counter()
     checkpoint_seconds = 0.0
+    local_catalog = get_local_conversation_catalog()
 
     while len(visible) < wanted_visible:
-        result = await session.execute(
-            select(*columns)
-            .where(
-                Conversation.user_id == user.user_id,
-                Conversation.is_deleted == False,
+        if local_catalog is not None:
+            conversations = await local_catalog.list_for_user(
+                user_id=user.user_id,
+                offset=scan_offset,
+                limit=scan_batch_size,
             )
-            .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
-            .offset(scan_offset)
-            .limit(scan_batch_size)
-        )
-        conversations = result.all()
+        else:
+            result = await session.execute(
+                select(*columns)
+                .where(
+                    Conversation.user_id == user.user_id,
+                    Conversation.is_deleted.is_(False),
+                )
+                .order_by(Conversation.updated_at.desc(), Conversation.id.desc())
+                .offset(scan_offset)
+                .limit(scan_batch_size)
+            )
+            conversations = result.all()
         if not conversations:
             break
         scan_offset += len(conversations)

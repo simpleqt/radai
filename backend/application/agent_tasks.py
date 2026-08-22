@@ -14,6 +14,11 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from backend.application.conversations.thread_guard import (
+    ConversationThreadLease,
+    acquire_conversation_thread,
+    conversation_lease_key,
+)
 from backend.domain.agents.events import AgentEvent, EventEnvelope
 
 _MAX_TASKS = max(8, int(os.getenv("AGENT_BACKGROUND_MAX_TASKS", "128") or "128"))
@@ -92,6 +97,10 @@ class AgentTaskRegistry:
     def __init__(self, persistence_path: str | Path | None = None) -> None:
         self._records: OrderedDict[str, AgentTaskRecord] = OrderedDict()
         self._lock = asyncio.Lock()
+        # Background tasks and normal-mode streams share one mutual-exclusion
+        # source (the conversation thread guard), so crossings between the two
+        # paths on one thread are rejected instead of interleaving state.
+        self._thread_leases: dict[str, ConversationThreadLease] = {}
         self._persistence_path = Path(persistence_path) if persistence_path else None
         self._storage_lock = asyncio.Lock()
         self._storage_ready = False
@@ -404,39 +413,58 @@ class AgentTaskRegistry:
                 raise AgentTaskCapacityError(
                     f"单个用户最多同时提交 {_MAX_TASKS_PER_USER} 个后台智能体任务"
                 )
+            # Raises ConversationThreadBusy when a normal-mode stream already
+            # owns this thread; acquire after the capacity checks so rejected
+            # requests never reserve the thread. The key is user-scoped to
+            # match the Agent API / MCP normal paths on the same graph thread.
+            thread_lease = acquire_conversation_thread(
+                conversation_lease_key(user_id, thread_id)
+            )
             task_id = str(uuid.uuid4())
-            record = AgentTaskRecord(
-                task_id=task_id,
-                user_id=user_id,
-                agent_code=agent_code,
-                thread_id=thread_id,
-                question=question,
-            )
-            record.events.append(
-                AgentEvent(
-                    type="workflow.step",
-                    request_id="",
+            if thread_lease is not None:
+                self._thread_leases[task_id] = thread_lease
+            try:
+                record = AgentTaskRecord(
+                    task_id=task_id,
+                    user_id=user_id,
+                    agent_code=agent_code,
                     thread_id=thread_id,
-                    sequence=-1,
-                    payload={
-                        "event": {
-                            "id": f"background-task:{task_id}",
-                            "kind": "background_task_started",
-                            "title": "深度研究后台任务已启动",
-                            "detail": "连接中断后可重新订阅该任务。",
-                            "metadata": {"task_id": task_id},
-                        }
-                    },
+                    question=question,
                 )
-            )
-            self._records[task_id] = record
-            await self._persist_record(record)
-            await self._persist_event(record, record.events[0], 0)
-            record.runner = asyncio.create_task(
-                self._run(record, stream_factory),
-                name=f"agent-task:{task_id}",
-            )
+                record.events.append(
+                    AgentEvent(
+                        type="workflow.step",
+                        request_id="",
+                        thread_id=thread_id,
+                        sequence=-1,
+                        payload={
+                            "event": {
+                                "id": f"background-task:{task_id}",
+                                "kind": "background_task_started",
+                                "title": "深度研究后台任务已启动",
+                                "detail": "连接中断后可重新订阅该任务。",
+                                "metadata": {"task_id": task_id},
+                            }
+                        },
+                    )
+                )
+                self._records[task_id] = record
+                await self._persist_record(record)
+                await self._persist_event(record, record.events[0], 0)
+                record.runner = asyncio.create_task(
+                    self._run(record, stream_factory),
+                    name=f"agent-task:{task_id}",
+                )
+            except BaseException:
+                self._records.pop(task_id, None)
+                self._release_thread_lease_for(task_id)
+                raise
             return record
+
+    def _release_thread_lease_for(self, task_id: str) -> None:
+        lease = self._thread_leases.pop(task_id, None)
+        if lease is not None:
+            lease.release()
 
     async def startup_ack(self, record: AgentTaskRecord) -> AsyncIterator[AgentEvent]:
         """Acknowledge task creation without holding the query request open."""
@@ -458,6 +486,7 @@ class AgentTaskRegistry:
         try:
             await self._run_semaphore.acquire()
         except asyncio.CancelledError:
+            self._release_thread_lease_for(record.task_id)
             record.status = "cancelled"
             record.finished_at = time.time()
             await self._persist_record(record)
@@ -477,7 +506,6 @@ class AgentTaskRegistry:
             raise
         record.status = "running"
         record.started_at = time.time()
-        await self._persist_record(record)
         saw_error = False
         saw_done = False
         terminal_event: AgentEvent | None = None
@@ -501,7 +529,21 @@ class AgentTaskRegistry:
                     )
                 await self._append(record, event)
 
+        from backend.application.conversations.thread_guard import (
+            start_lease_heartbeat,
+            stop_lease_heartbeat,
+        )
+
+        # Renew the conversation lease for the whole background execution so
+        # the stale-takeover bound never preempts a live long-running task.
+        lease_heartbeat_task = start_lease_heartbeat(
+            self._thread_leases.get(record.task_id)
+        )
         try:
+            # Persist inside the guarded region: a cancellation or storage
+            # failure here must still release the semaphore and thread lease
+            # through the shared finally block instead of leaking them.
+            await self._persist_record(record)
             await asyncio.wait_for(
                 consume_stream(),
                 timeout=_EXECUTION_TIMEOUT_SECONDS,
@@ -621,7 +663,9 @@ class AgentTaskRegistry:
                 ),
             )
         finally:
+            stop_lease_heartbeat(lease_heartbeat_task)
             self._run_semaphore.release()
+            self._release_thread_lease_for(record.task_id)
             if record.finished_at is None:
                 record.finished_at = time.time()
             try:
@@ -732,7 +776,12 @@ class AgentTaskRegistry:
                     "pending",
                     "running",
                 }:
-                    await record.condition.wait()
+                    # 不裸等唤醒：任何 notify 遗漏的异常出口都不该把 SSE
+                    # 订阅挂成永久的，超时后复查状态再继续等。
+                    try:
+                        await asyncio.wait_for(record.condition.wait(), timeout=30.0)
+                    except TimeoutError:
+                        continue
                 batch_start = record.dropped_event_count + index
                 batch = list(record.events[index:])
                 index = len(record.events)

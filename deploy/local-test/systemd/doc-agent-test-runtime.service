@@ -1,0 +1,26 @@
+[Unit]
+Description=RADAI isolated test application runtime
+Wants=network-online.target
+After=network-online.target
+ConditionPathIsSymbolicLink=/home/inspur/myenv/runtime/doc-agent-test/current
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/inspur/myenv/runtime/doc-agent-test
+Environment=DOC_AGENT_TEST_RUNTIME_ROOT=/home/inspur/myenv/runtime/doc-agent-test
+ExecStart=/home/inspur/myenv/runtime/doc-agent-test/bin/manage.sh start-apps
+ExecStartPost=/home/inspur/myenv/runtime/doc-agent-test/bin/manage.sh wait
+ExecReload=/home/inspur/myenv/runtime/doc-agent-test/bin/manage.sh reload-selected /home/inspur/myenv/runtime/doc-agent-test/state/restart-plan
+ExecStop=/home/inspur/myenv/runtime/doc-agent-test/bin/manage.sh stop-apps
+TimeoutStartSec=10min
+TimeoutStopSec=3min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+RestrictSUIDSGID=true
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

@@ -1,4 +1,0 @@
-data: {"type": "event", "event": {"id": "e1", "kind": "tool_start", "title": "知识库检索", "detail": "q=test", "tool": "multi_kb_search", "timestamp": 1710000000000}}
-
-data: [DONE]
-

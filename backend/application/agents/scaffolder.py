@@ -26,10 +26,12 @@ from backend.domain.agents.workflows import WorkflowSpec, _load_workflow_specs
 
 _AGENT_CODE_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 _DOMAIN_PATTERN = re.compile(r"^[a-z][a-z0-9-]{0,127}$")
+_PROMPT_MODULE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
 _COMMON_TOOL_CANDIDATES = (
     "multi_kb_search",
     "chat_file_search",
     "read_context_artifact",
+    "context_read",
     "web_search",
 )
 # These capabilities are granted by ToolPolicy, but are only materialized when
@@ -359,19 +361,34 @@ class AgentScaffolder:
                 if not isinstance(value, dict):
                     continue
                 provider = str(value.get("provider") or "").strip()
-                module_name, separator, _attribute = provider.partition(":")
+                module_name, separator, attribute = provider.partition(":")
                 prefix = "backend.application.agents.prompt_templates."
                 if not separator or not module_name.startswith(prefix):
                     continue
                 relative_module = module_name[len(prefix) :]
-                module_path = (
+                if (
+                    attribute != "build_system_prompt"
+                    or not _PROMPT_MODULE_PATTERN.fullmatch(relative_module)
+                ):
+                    raise ValueError(
+                        f"Unsafe prompt provider declaration: {provider!r}"
+                    )
+                prompt_root = (
                     self.project_root
                     / "backend"
                     / "application"
                     / "agents"
                     / "prompt_templates"
-                    / Path(*relative_module.split("."))
-                ).with_suffix(".py")
+                ).resolve()
+                module_path = (
+                    prompt_root / Path(*relative_module.split("."))
+                ).with_suffix(".py").resolve()
+                try:
+                    module_path.relative_to(prompt_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Prompt provider escapes the template directory: {provider!r}"
+                    ) from exc
                 if not module_path.is_file():
                     continue
                 previous_modules.setdefault(module_name, sys.modules.get(module_name))

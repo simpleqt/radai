@@ -29,10 +29,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.api.routers.auth import get_current_user
 from backend.api.upload_utils import UploadTooLargeError, read_upload_with_limit
 from backend.config.loggers import get_logger
+from backend.config.runtime_security import public_base_url
 from backend.config.settings import settings
 from backend.core.config import get_paths
 from backend.db.connection import get_async_session
-from backend.db.models import SessionFile, User, UserFile
+from backend.db.models import Conversation, SessionFile, User, UserFile
 from backend.services.chat_file_index import get_index_manager
 from backend.services.user_file_service import (
     ALLOWED_UPLOAD_EXTENSIONS,
@@ -90,7 +91,7 @@ class PersonalFileItem(BaseModel):
 def _build_personal_file_image_url(
     request: Request, file_id: str, image_name: str
 ) -> str:
-    base_url = str(request.base_url).rstrip("/")
+    base_url = public_base_url(request)
     expires_at = int(time.time()) + 7 * 24 * 60 * 60
     signature = _build_personal_image_signature(file_id, image_name, expires_at)
     return (
@@ -102,9 +103,24 @@ def _build_personal_file_image_url(
 def _build_personal_image_signature(
     file_id: str, image_name: str, expires_at: int
 ) -> str:
-    secret = (settings.minio_secret_key or "").encode("utf-8")
+    from backend.services.url_signing import url_signing_secret
+
+    secret = url_signing_secret().encode("utf-8")
     payload = f"{file_id}\n{image_name}\n{expires_at}".encode("utf-8")
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()
+
+
+def _image_object_owned_by(object_name: str | None, owner_user_id: str) -> bool:
+    """Only trust a DB storage_object that stays under this owner's prefixes."""
+
+    normalized = str(object_name or "").strip().lstrip("/")
+    if not normalized or any(
+        part in {"", ".", ".."} for part in normalized.split("/")
+    ):
+        return False
+    return normalized.startswith(
+        (f"users/{owner_user_id}/", f"chat_files/{owner_user_id}/")
+    )
 
 
 def _valid_personal_image_signature(
@@ -114,6 +130,15 @@ def _valid_personal_image_signature(
     sig: str | None,
 ) -> bool:
     if not exp or not sig or exp < int(time.time()):
+        return False
+    # Fail closed on an empty signing key: an empty secret makes the HMAC
+    # locally forgeable (matching verify_chart_signature).
+    from backend.services.url_signing import url_signing_secret
+
+    # 实际 HMAC 密钥来自 url_signing_secret()（URL_SIGNING_SECRET →
+    # internal_api_secret → minio_secret_key）；守卫必须判同一来源，
+    # 否则"配了独立签名密钥、minio 密钥为空"时签名成功验证全拒。
+    if not (url_signing_secret() or "").strip():
         return False
     expected = _build_personal_image_signature(file_id, image_name, exp)
     return hmac.compare_digest(expected, sig)
@@ -145,6 +170,11 @@ def _validated_generated_local_path(raw_path: str, user_id: str) -> Path:
     if candidate.is_symlink() or Path(cleaned).is_symlink():
         raise HTTPException(status_code=403, detail="生成文件不在当前用户工件目录内")
     return candidate
+
+
+def _validated_generated_local_file(raw_path: str, user_id: str) -> tuple[Path, int]:
+    path = _validated_generated_local_path(raw_path, user_id)
+    return path, path.stat().st_size
 
 
 def _validated_generated_minio_object(
@@ -265,8 +295,13 @@ async def get_personal_file_image(
     if not target:
         raise HTTPException(status_code=404, detail="图片不存在")
 
+    # The DB-provided storage_object is the only untrusted candidate; drop it
+    # unless it stays under this owner's prefixes (the two derived candidates
+    # are owner-scoped by construction). Prevents reading another user's
+    # object if metadata.image_urls[].storage_object is ever poisoned.
+    db_object = target.get("storage_object")
     candidate_objects = [
-        target.get("storage_object"),
+        db_object if _image_object_owned_by(db_object, row.owner_user_id) else None,
         f"users/{row.owner_user_id}/personal-files/{file_id}/images/{image_name}",
         f"chat_files/{row.owner_user_id}/{file_id}/images/{image_name}",
     ]
@@ -274,15 +309,28 @@ async def get_personal_file_image(
     client = _get_minio_client()
     bucket = row.storage_bucket or get_user_minio_bucket_name()
     response = None
+    last_error: Exception | None = None
     for object_name in candidate_objects:
         if not object_name:
             continue
         try:
             response = await asyncio.to_thread(client.get_object, bucket, object_name)
             break
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             response = None
     if response is None:
+        logger.warning(
+            "个人文件图片对象读取失败: bucket=%s candidates=%s file_id=%s",
+            bucket,
+            candidate_objects,
+            file_id,
+            exc_info=(
+                (type(last_error), last_error, last_error.__traceback__)
+                if last_error is not None
+                else None
+            ),
+        )
         raise HTTPException(status_code=404, detail="图片对象不存在")
 
     media_type = target.get("content_type") or "image/png"
@@ -292,7 +340,7 @@ async def get_personal_file_image(
         media_type=media_type,
         headers={
             "Cache-Control": "public, max-age=86400",
-            "Content-Disposition": f'inline; filename="{image_name}"',
+            "Content-Disposition": f'inline; filename="{(image_name or "").replace(chr(34), chr(39)).replace(chr(92), "_")}"',
         },
     )
 
@@ -455,6 +503,19 @@ async def attach_file_to_session(
     session: AsyncSession = Depends(get_async_session),
 ):
     """将个人文件夹中的已有文件，绑定到指定会话"""
+    # 0. 校验会话归属:该 thread_id 若已被其他用户占用则拒绝(防止把文件绑到
+    #    他人会话命名空间)。会话行可能在首条消息前尚未创建,不存在时放行——
+    #    SessionFile 仍以本人 user_id 隔离。用 404 避免泄露会话存在性。
+    owner_rows = (
+        await session.execute(
+            select(Conversation.user_id).where(
+                Conversation.thread_id == session_id
+            )
+        )
+    ).scalars().all()
+    if owner_rows and all(owner != user.user_id for owner in owner_rows):
+        raise HTTPException(status_code=404, detail="会话不存在")
+
     # 1. 验证文件是否存在且属于该用户
     stmt = select(UserFile).where(
         UserFile.file_id == payload.file_id,
@@ -489,30 +550,41 @@ async def attach_file_to_session(
     session.add(db_session_file)
 
     # 4. 如果是长文档，需要在会话中构建检索索引
+    indexed = False
     m_json = db_file.metadata_ or {}
     if m_json.get("file_category") == "long_doc" and m_json.get("content"):
         try:
             index_manager = get_index_manager()
-            index = index_manager.get_or_create(session_id, user_id=user.user_id)
+            index = await index_manager.get_or_create_async(
+                session_id, user_id=user.user_id
+            )
             chunk_count = await asyncio.to_thread(
                 index.add_document,
                 file_id=payload.file_id,
                 content=m_json.get("content"),
                 file_name=db_file.display_name,
             )
+            indexed = True
             logger.info(
                 "[PersonalFiles] 绑定长文档并成功建立索引: file_id=%s, chunks=%d",
                 payload.file_id,
                 chunk_count,
             )
         except Exception as e:
+            # 索引失败不撤销绑定，但必须让调用方知道检索会缺失，
+            # 不能静默把失败当成功。
             logger.error("[PersonalFiles] 绑定建立索引失败: %s", e)
 
     await session.commit()
 
     return {
         "success": True,
-        "message": "文件绑定会话成功",
+        "message": (
+            "文件绑定会话成功"
+            if indexed or m_json.get("file_category") != "long_doc"
+            else "文件绑定会话成功，但检索索引构建失败，对话可能检索不到该文件内容"
+        ),
+        "indexed": indexed,
         "file_id": payload.file_id,
         "session_id": session_id,
     }
@@ -539,11 +611,12 @@ async def save_generated_file(
     local_abs_path: str | None = None
     size_bytes = 0
     if has_local:
-        local_path = _validated_generated_local_path(
-            payload.local_abs_path or "", user.user_id
+        local_path, size_bytes = await asyncio.to_thread(
+            _validated_generated_local_file,
+            payload.local_abs_path or "",
+            user.user_id,
         )
         local_abs_path = str(local_path)
-        size_bytes = local_path.stat().st_size
     else:
         storage_bucket, storage_object = _validated_generated_minio_object(
             payload.storage_bucket,

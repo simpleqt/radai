@@ -1,7 +1,8 @@
 # 知识库召回效果评估与消融实验方案
 
-> **文档状态**：📋 方案文档（部分已落地）。§二 流程图为早期 LightRAG 单路径描述；**现行实现**见 [知识库算法和架构.md](./知识库算法和架构.md)（DirectRetriever 四路 + Retrieval Profile）。  
+> **文档状态**：📋 方案文档（部分已落地）。§二 流程图为早期 LightRAG 单路径描述；**现行实现**见 [知识库算法和架构.md](./知识库算法和架构.md)（DirectRetriever 四路 + Retrieval Profile）。
 > **可运行评测**：[eval_framework.md](./eval_framework.md) · `eval/datasets/paper_kb/` · `eval/datasets/hotpotqa/` · `eval/graphrag_bench/`
+> **self_ingestion smoke**：`scripts/eval_self_extraction.py`、`scripts/check_self_ingestion_consistency.py`、`scripts/repair_self_ingestion.py`、`backend/tests/test_redis_bm25_index.py` 等用于验证自研入库与召回底座。
 
 ## 一、概述
 
@@ -89,6 +90,7 @@
 | 期刊论文库 17 题 | `eval/datasets/paper_kb/` | F1、Ragas CP/CR | `domain` + **MMR_ONLY**，F1≈0.63 |
 | HotpotQA | `eval/datasets/hotpotqa/` | F1、Recall@K | `general_qa` + **RAW**，Direct 优于 LightRAG mix |
 | GraphRAG-Bench | `eval/graphrag_bench/` | 官方 CR/ER（LLM） | medical→domain；novel→general_qa；hybrid 提词 |
+| 自研入库/召回 smoke | `scripts/` + `backend/tests/` | schema、BM25、repair、一致性 | 不替代召回 benchmark，用于上线前验证 self_ingestion 底座 |
 
 运行方式见 [eval_framework.md](./eval_framework.md)。消融方案名与 `paper_kb/common.py`、`graphrag_bench/bench_common.py` 对齐，勿与本文 §六 早期命名混用。
 

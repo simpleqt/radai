@@ -25,6 +25,7 @@ class AgentRuntimeContext:
     use_search: bool = True
     subagent_enabled: bool = False
     thinking_enabled: bool = True
+    deep_retrieval: bool = False
     permissions: dict = field(default_factory=dict)
     guardrail_instructions: str = ""
     time_context: str = ""

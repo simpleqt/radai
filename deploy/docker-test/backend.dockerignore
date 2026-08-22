@@ -1,0 +1,11 @@
+backend/tests/
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/**/*.pyo
+backend/**/*.log
+backend/**/*.db
+backend/**/*.sqlite
+backend/**/*.sqlite3
+backend/data/
+backend/logs/
+backend/.runtime/

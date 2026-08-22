@@ -47,6 +47,10 @@ _ManagedCoordinationUnitFailure = _legacy._ManagedCoordinationUnitFailure
 _ManagedCoordinationUnitTimeout = _legacy._ManagedCoordinationUnitTimeout
 _cancel_task_bounded = _legacy._cancel_task_bounded
 
+from backend.application.agent_workflows.coordination_runtime_support import (  # noqa: E402
+    _consume_background_task_result,
+)
+
 
 class CoordinationUnitRunner(CoordinationComponent):
     async def _run_unit(
@@ -611,26 +615,44 @@ class CoordinationUnitRunner(CoordinationComponent):
         except Exception as exc:  # noqa: BLE001
             errors.append(str(exc))
         finally:
-            pending_event_stopped = await _cancel_task_bounded(pending_event)
-            with suppress(Exception, asyncio.CancelledError):
-                await close_async_iterator_safely(
-                    stream,
-                    active_read_task=(None if pending_event_stopped else pending_event),
-                    timeout=1.0,
-                )
-            for renewal_task in lease_renewal_tasks:
-                await _cancel_task_bounded(renewal_task)
-            for lease in reversed(acquired_leases):
-                try:
-                    await lease.release()
-                except ResourceLeaseError:
-                    logger.warning(
-                        "resource lease release failed: resource=%s owner=%s token=%s",
-                        lease.resource,
-                        lease.owner_id,
-                        lease.fencing_token,
-                        exc_info=True,
+            # 清理链跑在分离任务里并用 shield 等待:链上前两步各有约 1 秒的
+            # await,若二次取消(deadline 先取消一次、断连触发的父任务退出回调
+            # 再补一刀)落在该窗口,普通 finally 会从中段抛出,续租取消与租约
+            # 释放永不执行——孤儿续租每 TTL/3 续一次,容量槽位泄漏到进程重启。
+            # 分离任务不受本任务取消影响,保证释放必然执行;期间收到的取消在
+            # 清理结束后重新抛出,不吞取消契约。
+            async def _release_unit_resources() -> None:
+                pending_event_stopped = await _cancel_task_bounded(pending_event)
+                with suppress(Exception, asyncio.CancelledError):
+                    await close_async_iterator_safely(
+                        stream,
+                        active_read_task=(
+                            None if pending_event_stopped else pending_event
+                        ),
+                        timeout=1.0,
                     )
+                for renewal_task in lease_renewal_tasks:
+                    await _cancel_task_bounded(renewal_task)
+                for lease in reversed(acquired_leases):
+                    try:
+                        await lease.release()
+                    except ResourceLeaseError:
+                        logger.warning(
+                            "resource lease release failed: resource=%s owner=%s token=%s",
+                            lease.resource,
+                            lease.owner_id,
+                            lease.fencing_token,
+                            exc_info=True,
+                        )
+
+            cleanup_task = asyncio.create_task(
+                _release_unit_resources(),
+                name=f"coordination-unit-cleanup:{unit_id}",
+            )
+            cleanup_task.add_done_callback(_consume_background_task_result)
+            # shield 上的取消照常向外传播(取消契约不变)——分离任务继续在
+            # 后台完成续租取消与租约释放,结果由 done callback 消费。
+            await asyncio.shield(cleanup_task)
         answer = "".join(answer_parts).strip()
         effective_evidence_refs, effective_evidence_records = (
             self._collect_dynamic_web_evidence(

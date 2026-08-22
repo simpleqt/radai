@@ -1,5 +1,8 @@
 import { request } from '@/utils/request';
 
+export type IngestionBackend = 'legacy_lightrag' | 'self_ingestion';
+export type RetrievalBackend = 'legacy_lightrag' | 'self_ingestion';
+
 export interface KnowledgeBase {
   kb_id: string;
   kb_code: string;
@@ -10,8 +13,108 @@ export interface KnowledgeBase {
   doc_count: number;
   entity_count: number;
   relation_count: number;
+  ingestion_backend?: IngestionBackend;
+  retrieval_backend?: RetrievalBackend;
+  self_ingestion_enabled?: boolean;
+  self_retriever_enabled?: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface KnowledgeBaseCreateInput {
+  kb_name: string;
+  kb_code: string;
+  subject?: string | null;
+  description?: string | null;
+  ingestion_backend: IngestionBackend;
+  retrieval_backend: RetrievalBackend;
+  self_ingestion_enabled: boolean;
+  self_retriever_enabled: boolean;
+}
+
+export interface ExtractionSchemaOption {
+  schema_id: string;
+  subject: string;
+  version: string;
+  schema_version: string;
+  label: string;
+  entity_type_count: number;
+  relation_type_count: number;
+}
+
+export interface KnowledgeGraphNode {
+  id: string;
+  label: string;
+  entity_type: string;
+  description: string;
+  source_id: string;
+  file_path: string;
+  degree: number;
+}
+
+export interface KnowledgeGraphEdge {
+  source: string;
+  target: string;
+  relation_type: string;
+  description: string;
+  source_id: string;
+  weight: number;
+}
+
+export interface KnowledgeGraphResponse {
+  kb_id: string;
+  kb_name: string;
+  total_nodes: number;
+  total_edges: number;
+  sampled_nodes: number;
+  sampled_edges: number;
+  truncated: boolean;
+  cache_hit: boolean;
+  cache_ttl_seconds: number;
+  nodes: KnowledgeGraphNode[];
+  edges: KnowledgeGraphEdge[];
+}
+
+export interface KbDocument {
+  id: number;
+  kb_id: string;
+  doc_id: string;
+  file_name: string;
+  file_path?: string | null;
+  document_date?: string | null;
+  category_path?: string | null;
+  parse_status: number;
+  storage_status?: number;
+  error_message?: string | null;
+  chunk_count?: number;
+  entity_count?: number;
+  relation_count?: number;
+  ingestion_backend?: IngestionBackend;
+  doc_status?: string | null;
+  commit_version?: number;
+  sort_order?: number;
+  created_at: string;
+  updated_at?: string | null;
+}
+
+export interface DocumentChunkItem {
+  chunk_id: string;
+  chunk_index: number;
+  block_type: string;
+  content: string;
+  token_count: number;
+  char_start?: number | null;
+  char_end?: number | null;
+  block_id?: string | null;
+  commit_version: number;
+}
+
+export interface DocumentChunkListResponse {
+  kb_id: string;
+  doc_id: string;
+  file_name: string;
+  total: number;
+  items: DocumentChunkItem[];
 }
 
 export const KBDetailAPI = {
@@ -19,10 +122,12 @@ export const KBDetailAPI = {
     const qs = new URLSearchParams(params).toString();
     return request(`/knowledge_bases${qs ? '?' + qs : ''}`);
   },
-  create: (data: Partial<KnowledgeBase>) => request('/knowledge_bases', {
+  create: (data: Partial<KnowledgeBaseCreateInput>) => request('/knowledge_bases', {
     method: 'POST',
     body: JSON.stringify(data)
   }),
+  listExtractionSchemas: () =>
+    request('/knowledge_bases/extraction_schemas') as Promise<ExtractionSchemaOption[]>,
   get: (id: string) => request(`/knowledge_bases/${id}`),
   update: (id: string, data: Partial<KnowledgeBase>) => request(`/knowledge_bases/${id}`, {
     method: 'PUT',
@@ -34,6 +139,10 @@ export const KBDetailAPI = {
   documents: (id: string, params: Record<string, any> = {}) => {
     const qs = new URLSearchParams(params).toString();
     return request(`/knowledge_bases/${id}/documents${qs ? '?' + qs : ''}`);
+  },
+  graph: (id: string, params: Record<string, any> = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/knowledge_bases/${id}/graph${qs ? '?' + qs : ''}`) as Promise<KnowledgeGraphResponse>;
   },
   deleteDocument: (kbId: string, docId: string) => request(`/knowledge_bases/${kbId}/documents/${docId}`, {
     method: 'DELETE'
@@ -70,6 +179,10 @@ export const KBDetailAPI = {
   deleteDirectory: (kbId: string, path: string, deleteDocs: boolean = false) => request(`/knowledge_bases/${kbId}/directories/${encodeURIComponent(path)}?delete_documents=${deleteDocs}`, {
     method: 'DELETE'
   }),
+  documentChunks: (kbId: string, docId: string, params: Record<string, any> = {}) => {
+    const qs = new URLSearchParams(params).toString();
+    return request(`/knowledge_bases/${kbId}/documents/${encodeURIComponent(docId)}/chunks${qs ? '?' + qs : ''}`) as Promise<DocumentChunkListResponse>;
+  },
   updateDocument: (kbId: string, docId: string, data: any) => request(`/knowledge_bases/${kbId}/documents/${docId}`, {
     method: 'PATCH',
     body: JSON.stringify(data)

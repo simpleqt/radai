@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from backend.application.auth_security import token_session_is_current
@@ -57,14 +57,16 @@ class AuthService:
     """Resolve session tokens and API keys without tying callers to FastAPI."""
 
     def __init__(self) -> None:
-        self._api_key_cache: OrderedDict[
-            str, tuple[float, ResolvedAuth | None]
-        ] = OrderedDict()
-        self._api_key_cache_lock = asyncio.Lock()
+        self._api_key_cache: OrderedDict[str, tuple[float, ResolvedAuth | None]] = (
+            OrderedDict()
+        )
+        self._api_key_cache_lock = threading.RLock()
 
-    async def _get_cached_api_key(self, digest: str) -> tuple[bool, ResolvedAuth | None]:
+    async def _get_cached_api_key(
+        self, digest: str
+    ) -> tuple[bool, ResolvedAuth | None]:
         now = time.monotonic()
-        async with self._api_key_cache_lock:
+        with self._api_key_cache_lock:
             cached = self._api_key_cache.get(digest)
             if cached is None:
                 return False, None
@@ -79,7 +81,7 @@ class AuthService:
         self, digest: str, auth: ResolvedAuth | None, *, ttl: float
     ) -> None:
         max_entries = max(16, int(os.getenv("AUTH_API_KEY_CACHE_MAX_ENTRIES", "2048")))
-        async with self._api_key_cache_lock:
+        with self._api_key_cache_lock:
             self._api_key_cache[digest] = (time.monotonic() + max(0.1, ttl), auth)
             self._api_key_cache.move_to_end(digest)
             while len(self._api_key_cache) > max_entries:
@@ -94,24 +96,35 @@ class AuthService:
         if cache_hit:
             return cached_auth
 
+        from backend.application.api_key_credentials import hashed_storage_available
         from backend.db.connection import read_only_session_context
         from backend.db.models import ApiKey, User
 
         try:
             async with read_only_session_context() as session:
-                result = await session.execute(
-                    select(
-                        ApiKey.is_active,
-                        ApiKey.expires_at,
-                        ApiKey.user_id,
-                        ApiKey.access_scope,
-                        ApiKey.mcp_allowed_tools,
-                        ApiKey.rate_limit,
-                        User.role,
-                        User.is_active,
+                columns = (
+                    ApiKey.is_active,
+                    ApiKey.expires_at,
+                    ApiKey.user_id,
+                    ApiKey.access_scope,
+                    ApiKey.mcp_allowed_tools,
+                    ApiKey.rate_limit,
+                    User.role,
+                    User.is_active,
+                )
+                if await hashed_storage_available(session):
+                    # Dual read: rows created before the backfill still carry
+                    # only the verbatim key.
+                    lookup = or_(
+                        ApiKey.api_key_hash == digest,
+                        ApiKey.api_key == value,
                     )
+                else:
+                    lookup = ApiKey.api_key == value
+                result = await session.execute(
+                    select(*columns)
                     .outerjoin(User, User.user_id == ApiKey.user_id)
-                    .where(ApiKey.api_key == value)
+                    .where(lookup)
                 )
                 row = result.first()
         except SQLAlchemyError as exc:
@@ -184,9 +197,9 @@ class AuthService:
         if not value:
             return None
 
-        from backend.db.redis import get_redis
+        from backend.db.redis import get_auth_redis
 
-        redis_client = get_redis()
+        redis_client = get_auth_redis()
         try:
             try:
                 raw = await redis_client.get(f"auth:token:{value}")

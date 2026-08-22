@@ -365,19 +365,33 @@ const htmlPreviewSrcdoc = computed(() => {
 </script>
 
 <template>
-  <div 
+  <Transition name="fade">
+    <div
+      v-if="show"
+      class="fixed inset-0 z-40 bg-black/40 2xl:hidden"
+      aria-hidden="true"
+      @click="close"
+    />
+  </Transition>
+
+  <aside
     v-if="show"
-    class="w-[min(48rem,56vw)] min-w-[36rem] max-w-[60vw] border-l border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex flex-col h-full shadow-2xl relative z-40 transition-all duration-300 transform"
+    class="@container/panel fixed inset-y-0 right-0 z-[45] col-start-3 row-start-1 flex h-full w-full flex-col border-l border-border-subtle bg-surface shadow-panel sm:w-[min(26rem,100vw)] 2xl:static 2xl:z-auto 2xl:w-full 2xl:shadow-none"
   >
     <!-- Header -->
-    <div class="h-14 px-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between bg-slate-50/50 dark:bg-slate-900/50">
-      <div class="flex items-center space-x-2">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="text-indigo-500">
+    <div class="flex h-(--topbar-h) shrink-0 items-center justify-between gap-2 border-b border-border-subtle px-3">
+      <div class="flex min-w-0 items-center gap-2">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 text-accent">
           <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/>
         </svg>
-        <span class="text-xs font-bold uppercase tracking-widest text-slate-700 dark:text-slate-200">工件预览 ({{ artifacts.length }})</span>
+        <span class="truncate text-sm font-semibold text-text-primary">工件预览 ({{ artifacts.length }})</span>
       </div>
-      <button @click="close" class="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-800 rounded-lg transition-colors text-slate-400">
+      <button
+        type="button"
+        class="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-text-tertiary transition-colors hover:bg-surface-hover hover:text-text-primary"
+        title="关闭"
+        @click="close"
+      >
         <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
       </button>
     </div>
@@ -386,17 +400,16 @@ const htmlPreviewSrcdoc = computed(() => {
       <!-- Artifact List (Vertical) -->
       <div
         v-if="artifacts.length > 1"
-        class="border-b border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-900 max-h-52 overflow-y-auto p-2 space-y-2"
+        class="border-b border-border-subtle bg-surface max-h-52 overflow-y-auto p-2 space-y-2"
       >
         <button
           v-for="(art, idx) in artifacts"
           :key="art.id || art.file_id"
           @click="selectArtifact(art)"
           class="w-full text-left px-3 py-2 rounded-lg text-xs font-medium transition-all"
-          :class="[
-            (art.id || art.file_id) === selectedId
-              ? 'bg-indigo-600 text-white shadow-md'
-              : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
+          :class="[ (art.id || art.file_id) === selectedId
+              ? 'bg-accent text-white shadow-sm'
+              : 'bg-surface-sunken text-text-secondary hover:bg-surface-hover'
           ]"
         >
           <div class="flex items-start justify-between gap-2">
@@ -406,16 +419,17 @@ const htmlPreviewSrcdoc = computed(() => {
         </button>
       </div>
 
-      <!-- Preview Content -->
-      <div v-if="currentArtifact" class="flex-1 overflow-y-auto p-4 custom-scrollbar bg-slate-50/30 dark:bg-slate-950/20">
+      <!-- Preview Content：切换工件时交叉淡入 -->
+      <Transition name="fade" mode="out-in">
+      <div v-if="currentArtifact" :key="selectedId ?? 'none'" class="flex-1 overflow-y-auto p-4 custom-scrollbar bg-surface-sunken">
         <div class="mb-4">
           <div class="flex items-start justify-between gap-3">
             <div>
-              <h2 class="text-lg font-bold text-slate-800 dark:text-slate-100 mb-1">{{ currentArtifact.title }}</h2>
+              <h2 class="text-lg font-bold text-text-primary mb-1">{{ currentArtifact.title }}</h2>
               <div class="flex items-center space-x-2 flex-wrap">
-                <span class="text-[10px] px-2 py-0.5 rounded bg-slate-200 dark:bg-slate-800 text-slate-500 font-mono">{{ currentArtifactKind.toUpperCase() }}</span>
+                <span class="text-[10px] px-2 py-0.5 rounded bg-surface-sunken text-text-secondary font-mono">{{ currentArtifactKind.toUpperCase() }}</span>
                 <span v-if="currentArtifactLanguage" class="text-[10px] px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-300 font-mono">{{ currentArtifactLanguage }}</span>
-                <span v-if="currentArtifactMime" class="text-[10px] px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-800/80 text-slate-500 font-mono">{{ currentArtifactMime }}</span>
+                <span v-if="currentArtifactMime" class="text-[10px] px-2 py-0.5 rounded bg-surface-sunken text-text-secondary font-mono">{{ currentArtifactMime }}</span>
               </div>
             </div>
             <button
@@ -423,28 +437,28 @@ const htmlPreviewSrcdoc = computed(() => {
               type="button"
               :disabled="downloading"
               @click="downloadArtifact(currentArtifact)"
-              class="shrink-0 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-medium text-slate-600 dark:text-slate-300 hover:border-indigo-300 hover:text-indigo-600 dark:hover:border-indigo-700 dark:hover:text-indigo-300 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+              class="shrink-0 px-3 py-1.5 rounded-lg border border-border-subtle text-xs font-medium text-text-secondary hover:border-accent/30 hover:text-accent transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
             >
               {{ downloading ? '下载中...' : '下载文件' }}
             </button>
           </div>
         </div>
 
-        <div class="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm overflow-hidden">
-          <div v-if="previewLoading" class="p-12 flex flex-col items-center justify-center text-center text-slate-500 dark:text-slate-400">
-            <div class="h-8 w-8 rounded-full border-2 border-indigo-200 border-t-indigo-600 animate-spin mb-4"></div>
+        <div class="rounded-xl border border-border-subtle bg-surface shadow-sm overflow-hidden">
+          <div v-if="previewLoading" class="p-12 flex flex-col items-center justify-center text-center text-text-secondary">
+            <div class="h-8 w-8 rounded-full border-2 border-accent/30 border-t-indigo-600 animate-spin mb-4"></div>
             <p class="text-sm font-medium">正在加载文档预览...</p>
           </div>
 
           <div v-else-if="previewError" class="p-12 flex flex-col items-center justify-center text-center">
-            <p class="text-sm font-medium text-slate-700 dark:text-slate-200 mb-2">暂时无法渲染该工件</p>
-            <p class="text-xs text-slate-500 dark:text-slate-400 mb-6">{{ previewError }}</p>
+            <p class="text-sm font-medium text-text-secondary mb-2">暂时无法渲染该工件</p>
+            <p class="text-xs text-text-secondary mb-6">{{ previewError }}</p>
             <button
               v-if="getArtifactHref(currentArtifact)"
               type="button"
               :disabled="downloading"
               @click="downloadArtifact(currentArtifact)"
-              class="px-6 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl shadow-lg shadow-indigo-200 hover:bg-indigo-700 transition-all dark:shadow-none disabled:opacity-60 disabled:cursor-not-allowed"
+              class="px-6 py-2.5 bg-accent text-white text-sm font-bold rounded-xl shadow-sm hover:bg-accent-hover transition-all dark:shadow-none disabled:opacity-60 disabled:cursor-not-allowed"
             >
               {{ downloading ? '下载中...' : '下载查看' }}
             </button>
@@ -453,11 +467,11 @@ const htmlPreviewSrcdoc = computed(() => {
           <!-- Code View -->
           <div v-else-if="currentArtifactKind === 'code'" class="relative group">
             <div class="absolute right-3 top-3 opacity-0 group-hover:opacity-100 transition-opacity">
-              <button class="p-2 bg-white/80 dark:bg-slate-800/80 rounded-md shadow-sm text-slate-500 hover:text-indigo-500 transition-colors">
+              <button class="p-2 bg-surface/80 rounded-md shadow-sm text-text-secondary hover:text-accent transition-colors">
                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
               </button>
             </div>
-            <pre class="p-4 text-xs font-mono text-slate-700 dark:text-slate-300 overflow-x-auto bg-[#fafafa] dark:bg-[#0d1117]"><code>{{ currentArtifact.content }}</code></pre>
+            <pre class="p-4 text-xs font-mono text-text-secondary overflow-x-auto bg-[#fafafa] dark:bg-[#0d1117]"><code>{{ currentArtifact.content }}</code></pre>
           </div>
 
           <!-- Markdown View -->
@@ -466,11 +480,16 @@ const htmlPreviewSrcdoc = computed(() => {
           </div>
 
           <!-- HTML View -->
-          <div v-else-if="currentArtifactKind === 'html'" class="bg-white">
+          <div v-else-if="currentArtifactKind === 'html'" class="bg-surface">
+            <!--
+              Artifact HTML is model-authored: allow-scripts + allow-same-origin
+              together would let a preview script read this app's localStorage
+              (auth_token). Keep scripts in an opaque origin instead.
+            -->
             <iframe
               title="HTML 文档预览"
-              class="w-full h-[70vh] border-0 bg-white"
-              sandbox="allow-scripts allow-same-origin allow-popups allow-modals"
+              class="w-full h-[70vh] border-0 bg-surface"
+              sandbox="allow-scripts allow-popups allow-modals"
               :srcdoc="htmlPreviewSrcdoc"
             />
           </div>
@@ -480,13 +499,13 @@ const htmlPreviewSrcdoc = computed(() => {
             <div class="w-16 h-16 bg-blue-50 dark:bg-blue-900/20 rounded-2xl flex items-center justify-center mb-4">
                <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="text-blue-500"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>
             </div>
-            <p class="text-sm font-medium text-slate-700 dark:text-slate-200 mb-6">该工件为二进制文件或外部资源</p>
+            <p class="text-sm font-medium text-text-secondary mb-6">该工件为二进制文件或外部资源</p>
             <button
               v-if="getArtifactHref(currentArtifact)"
               type="button"
               :disabled="downloading"
               @click="downloadArtifact(currentArtifact)"
-              class="px-6 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl shadow-lg shadow-indigo-200 hover:bg-indigo-700 transition-all dark:shadow-none disabled:opacity-60 disabled:cursor-not-allowed"
+              class="px-6 py-2.5 bg-accent text-white text-sm font-bold rounded-xl shadow-sm hover:bg-accent-hover transition-all dark:shadow-none disabled:opacity-60 disabled:cursor-not-allowed"
             >
               {{ downloading ? '下载中...' : '点击下载 / 预览' }}
             </button>
@@ -494,16 +513,17 @@ const htmlPreviewSrcdoc = computed(() => {
 
           <!-- Text/Default View -->
           <div v-else class="p-6">
-            <p class="text-sm text-slate-600 dark:text-slate-400 whitespace-pre-wrap font-sans leading-relaxed">{{ currentArtifact.content }}</p>
+            <p class="text-sm text-text-secondary whitespace-pre-wrap font-sans leading-relaxed">{{ currentArtifact.content }}</p>
           </div>
         </div>
       </div>
 
       <!-- Empty Preview -->
-      <div v-else class="flex-1 flex flex-col items-center justify-center text-slate-400 p-8 text-center">
+      <div v-else class="flex-1 flex flex-col items-center justify-center text-text-tertiary p-8 text-center">
         <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" class="opacity-20 mb-4"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
         <p class="text-sm">选择一个工件以预览内容</p>
       </div>
+      </Transition>
     </div>
-  </div>
+  </aside>
 </template>

@@ -44,5 +44,12 @@ export const AuthAPI = {
       return '/api/v1/auth/cas/login';
     }
     return `/api/v1/auth/cas/login?targetUrl=${encodeURIComponent(targetUrl)}`;
+  },
+
+  async exchangeCasCode(code: string): Promise<LoginResponse> {
+    return request('/auth/cas/exchange', {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+    });
   }
 };

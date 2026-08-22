@@ -1,7 +1,8 @@
 import { authState } from '@/utils/request';
+import { workflowStartedStatus } from '@/api/agent-v2';
 
 export interface SSEHandlers {
-  onChunk?: (text: string) => void;
+  onChunk?: (text: string, mode?: 'append' | 'replace') => void;
   onStatus?: (status: string) => void;
   onEvent?: (event: any) => void;
   onThinking?: (text: string) => void;
@@ -91,7 +92,7 @@ export async function streamSSE(
           } else if (type === 'reasoning.delta' || type === 'thinking') {
             handlers.onThinking?.(payload.content || '');
           } else if (type === 'workflow.started') {
-            handlers.onStatus?.(`workflow.started:${payload.workflow || ''}`);
+            handlers.onStatus?.(workflowStartedStatus(payload.workflow));
           } else if (type === 'workflow.step' && payload.event !== undefined) {
             handlers.onEvent?.(payload.event);
           } else if (type === 'workflow.step' || type === 'status' || payload.status !== undefined) {
@@ -99,7 +100,9 @@ export async function streamSSE(
           } else if (type === 'event' || payload.event !== undefined) {
             if (payload.event !== undefined) handlers.onEvent?.(payload.event);
           } else if (type === 'message.delta' || type === 'chunk') {
-            handlers.onChunk?.(payload.content || '');
+            handlers.onChunk?.(payload.content || '', 'append');
+          } else if (type === 'message.replace') {
+            handlers.onChunk?.(payload.content || '', 'replace');
           } else if (type === 'error' || payload.error !== undefined) {
             handlers.onError?.(String(payload.message || payload.error));
           } else if (typeof payload.content === 'string') {
@@ -117,5 +120,12 @@ export async function streamSSE(
     return;
   }
 
+  if (!doneReceived) {
+    // 流在未收到 [DONE]/done 事件时关闭（代理掐断/后端崩溃）：按中断
+    // 处理而不是当作正常完成，避免消费者把截断内容缓存成完整结果
+    // （与 agent 聊天路径的 interrupted 纪律一致）。
+    handlers.onError?.('连接中断，内容可能不完整');
+    return;
+  }
   handlers.onDone?.();
 }

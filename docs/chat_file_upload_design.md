@@ -2,12 +2,12 @@
 
 > **版本**: v1.0
 > **日期**: 2026-05-11
-> **状态**: ⚠️ 部分实现（2026-06-08）
+> **状态**: ✅ 核心链路已实现（2026-07-09）
 > **架构基线**：本文中的设计示例已按当前平台执行链路校正。工具实现位于 `backend/application/tools/providers/`，统一由 `ToolAssemblyPipeline` 按 profile、workflow 和请求上下文装配；不得再向 `backend/custom/agents` 增加依赖。
-> 已实现：`/api/v2/chat-files` 上传、`useFileUpload`、`FilePreviewChip`、Agent 侧文件元数据、`ChatFileIndex` + `chat_file_search`（`chat_files.py` 上传后建索引）。
+> 已实现：`/api/v2/chat-files` 上传、`/api/v1/my-files` 文件库、`useFileUpload`、`FilePreviewChip`、Agent 侧文件元数据、`ChatFileIndex` + `chat_file_search`。
 > 已实现补充：PDF/DOCX/PPTX 图片提取、文档图片上传到 MinIO、短文档图片 `image_url` 多模态注入、长文档检索图片 token 注册、MinerU `upload_images=true` 远程图片 URL 保留。
-> 待完成：索引跨进程持久化、完整 `/chat-upload` 单路由封装。MinerU OCR 仍依赖网关 URL 配置。
-> **实现说明**：实际上传走 `/api/v2/chat-files/upload`，非设计稿中的 `/api/v2/agent/chat-upload`。
+> 当前边界：长文档热索引仍是进程内 LRU，但 `ChatFileIndexManager` 可在 miss 时从 `UserFile + SessionFile` 持久化元数据重建索引；MinerU OCR 仍依赖 `settings.mineru_api_url`。
+> **实现说明**：实际上传走 `/api/v2/chat-files/upload`，不是历史设计稿中的 `/api/v2/agent/chat-upload` 或单路由 `/chat-upload`。
 
 ### 设计 vs 实现对照
 
@@ -22,9 +22,10 @@
 | 文档图片 URL 替换 | ✅ | 本地图片引用在入库前替换为 MinIO / MinerU URL |
 | 短文档图片多模态注入 | ✅ | 标准 Agent Runtime 请求上下文注入 `multimodal_images` |
 | 长文档检索图片引用 | ✅ | `backend/application/tools/providers/chat_file_search_tool.py` + `image_url_registry.py` |
-| 长文档 BM25 会话索引 | ✅ | `ChatFileIndex` + `strategy=indexed` + `chat_file_search`（见 `ToolAssemblyPipeline`） |
+| 长文档 BM25 会话索引 | ✅ | `ChatFileIndex` + `strategy=indexed` + `chat_file_search`；索引 key 为 `(user_id, thread_id)` |
 | MinerU 复杂 PDF 回退 | ⚠️ | `chat_file_parser.py` 支持 MinerU OCR 回退（依赖网关 URL 配置） |
-| 单路由 `/agent/chat-upload` | ❌ | 拆分为 `chat-files` 独立路由 |
+| 索引跨进程恢复 | ✅ | 热索引进程内；miss 时从 `UserFile + SessionFile` 重建 long_doc 索引 |
+| 单路由 `/agent/chat-upload` | 不采用 | 当前拆分为 `chat-files`、`my-files`、`files` 三类路由 |
 
 ---
 
@@ -57,15 +58,15 @@
 │  │  sendMessage(text, { attachments })     │             │
 │  └─────────────────────┬───────────────────┘             │
 └────────────────────────┼─────────────────────────────────┘
-                         │ POST /api/v2/agent/chat-upload
+                         │ POST /api/v2/chat-files/upload
                          │ (multipart/form-data)
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │                     Backend (FastAPI)                     │
 │                                                          │
 │  ┌──────────────────────────────────────────────┐       │
-│  │         ChatFileRouter (新路由)                │       │
-│  │   POST /chat-upload  →  上传+分类+解析        │       │
+│  │         ChatFileRouter                         │       │
+│  │   POST /api/v2/chat-files/upload              │       │
 │  └───────────────────────┬──────────────────────┘       │
 │                          │                               │
 │         ┌────────────────┼───────────────────┐          │
@@ -100,15 +101,10 @@
 # 多模态文件：直接传给支持 vision 的模型
 MULTIMODAL_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"}
 
-# 可直接用 Python 解析的文档
-PYTHON_PARSEABLE = {
-    ".txt": "text/plain",
-    ".md": "text/markdown",
-    ".csv": "text/csv",
-    ".json": "application/json",
-    ".py": "text/x-python",
-    ".html": "text/html",
-    ".xml": "text/xml",
+# 可直接用 Python/文本路径解析的文档
+PYTHON_PARSEABLE_EXTENSIONS = {
+    ".txt", ".md", ".csv", ".json", ".py", ".html", ".xml", ".log",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".rst", ".kml",
 }
 
 # 需要专用解析器的文档
@@ -122,8 +118,8 @@ RICH_DOCUMENT_EXTENSIONS = {
     ".xls": "application/vnd.ms-excel",
 }
 
-# 当 Python 解析器无法处理时，回退到 MinerU 的文件类型
-MINERU_FALLBACK_EXTENSIONS = {".pdf", ".doc", ".ppt", ".xls"}
+# Python 解析失败时优先回退 MinerU 的文件类型
+MINERU_FALLBACK_EXTENSIONS = {".pdf", ".doc", ".ppt"}
 ```
 
 ### 3.2 处理流程决策树
@@ -159,12 +155,12 @@ MINERU_FALLBACK_EXTENSIONS = {".pdf", ".doc", ".ppt", ".xls"}
   │
   └── 上传后处理
         │
-        ├── 原始文件上传 MinIO
-        ├── 提取到的图片上传 MinIO
+        ├── 原始文件上传用户 MinIO bucket
+        ├── 提取到的图片上传用户 MinIO bucket
         ├── MinerU 远程图片 URL 合并入 metadata.image_urls
         ├── 文档中的本地图片引用替换为可访问 URL
         └── 进入【长度路由】
-  
+
   └──【长度路由】
         │
         ├── 内容长度 ≤ 5000 字
@@ -190,8 +186,8 @@ MINERU_FALLBACK_EXTENSIONS = {".pdf", ".doc", ".ppt", ".xls"}
      - `images` 字段中的 base64 图片，转为二进制后继续上传。
      - `images` 字段中的远程 URL，直接保留到 `ParseResult.image_urls`。
 2. `backend/api/routers/chat_files.py`
-   - 原始文件始终上传到 MinIO。
-   - 解析器提取出的图片会单独上传到 `chat_files/{user_id}/{file_id}/images/{img.name}`。
+   - 原始文件始终上传到用户 MinIO bucket。
+   - 解析器提取出的图片会单独上传到 `users/{user_id}/threads/{thread_id}/chat-files/{file_id}/images/{img.name}`。
    - 文档 markdown / HTML 中的本地图片引用会在入库前替换为可访问 URL。
    - 最终写入 `metadata.image_urls`，供 Agent 和检索工具复用。
 3. 标准 Agent Runtime 附件预处理链路
@@ -203,65 +199,69 @@ MINERU_FALLBACK_EXTENSIONS = {".pdf", ".doc", ".ppt", ".xls"}
 
 ---
 
-## 四、数据库设计
+## 四、数据库与持久化设计
 
-### 4.1 新增表：`chat_uploaded_files`
+当前实现没有新增 `chat_uploaded_files` 或 `chat_file_chunks` 表，也没有 Redis BM25 索引 key。对话附件复用用户文件中心模型：
 
-会话级上传文件记录表，追踪用户在对话中上传的每个文件及其处理状态。
+### 4.1 `user_files`
 
-```sql
-CREATE TABLE chat_uploaded_files (
-    id            VARCHAR(36)  PRIMARY KEY,           -- UUID
-    thread_id     VARCHAR(100) NOT NULL,              -- 所属会话线程
-    user_id       VARCHAR(36)  NOT NULL,              -- 上传用户
-    file_name     VARCHAR(255) NOT NULL,              -- 原始文件名
-    file_size     BIGINT       NOT NULL,              -- 文件字节数
-    mime_type     VARCHAR(100),                        -- MIME 类型
-    file_category VARCHAR(20)  NOT NULL,              -- multimodal / short_doc / long_doc
-    storage_path  VARCHAR(500),                        -- MinIO 对象路径
-    
-    -- 解析信息
-    parse_method  VARCHAR(20)  DEFAULT 'direct',      -- direct / python / mineru
-    parse_status  VARCHAR(20)  DEFAULT 'pending',     -- pending / parsing / completed / failed
-    content_text  MEDIUMTEXT,                          -- 解析后的纯文本（短文档直接存储）
-    content_length INT         DEFAULT 0,              -- 文本字符数
-    chunk_count   INT          DEFAULT 0,              -- 长文档分块数
-    error_message TEXT,                                -- 解析错误信息
-    
-    -- 索引信息（长文档）
-    index_status  VARCHAR(20)  DEFAULT 'none',        -- none / building / ready / failed
-    bm25_index_key VARCHAR(255),                       -- Redis 中 BM25 索引的 key
-    
-    created_at    DATETIME     DEFAULT CURRENT_TIMESTAMP,
-    updated_at    DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    INDEX idx_thread_id (thread_id),
-    INDEX idx_user_id (user_id),
-    INDEX idx_parse_status (parse_status)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+一条上传文件对应一行 `UserFile`，核心字段：
+
+| 字段 | 用途 |
+|---|---|
+| `file_id` | `uf_...` 文件 ID |
+| `owner_user_id` | 文件所有者，用于隔离 |
+| `thread_id` | 对话附件所属外部 thread；个人文件可为空 |
+| `source_type` | `minio` 或 `local` |
+| `storage_bucket` / `storage_object` | 用户 MinIO bucket 与对象路径 |
+| `local_abs_path` | 生成工件登记到本地时使用 |
+| `display_name`、`mime_type`、`size_bytes` | 展示与下载元数据 |
+| `status` | `active` / `deleted` |
+| `metadata_` | 解析结果、策略、文档内容、图片 URL、表格分析元数据 |
+
+对话附件的 `metadata_` 主要包含：
+
+```json
+{
+  "file_category": "multimodal | short_doc | long_doc",
+  "strategy": "vision | context | indexed",
+  "content": "解析后文本，long_doc 也会保留用于索引重建",
+  "content_length": 12345,
+  "parse_mode": "auto | mineru",
+  "parse_method": "none | direct | python | mineru",
+  "image_urls": [
+    {
+      "url": "/api/v2/chat-files/{file_id}/images/{name}?exp=...&sig=...",
+      "name": "image_0.png",
+      "caption": "文档图片 1",
+      "content_type": "image/png",
+      "storage_object": "users/{uid}/threads/{tid}/chat-files/{file_id}/images/image_0.png"
+    }
+  ]
+}
 ```
 
-### 4.2 新增表：`chat_file_chunks`
+### 4.2 `session_files`
 
-长文档的分块内容存储表，支持混合检索。
+`SessionFile` 表保存会话与文件的绑定关系：
 
-```sql
-CREATE TABLE chat_file_chunks (
-    id            VARCHAR(36)  PRIMARY KEY,
-    file_id       VARCHAR(36)  NOT NULL,              -- 关联 chat_uploaded_files.id
-    thread_id     VARCHAR(100) NOT NULL,
-    chunk_index   INT          NOT NULL,              -- 块序号
-    content       MEDIUMTEXT   NOT NULL,              -- 块内容
-    token_count   INT          DEFAULT 0,             -- token 数
-    embedding     BLOB,                                -- 向量嵌入（可选，使用 numpy 序列化）
-    
-    created_at    DATETIME     DEFAULT CURRENT_TIMESTAMP,
-    
-    INDEX idx_file_id (file_id),
-    INDEX idx_thread_id (thread_id),
-    INDEX idx_chunk_order (file_id, chunk_index)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
+| 字段 | 用途 |
+|---|---|
+| `session_id` | 外部 thread_id |
+| `user_id` | 当前用户 ID |
+| `file_id` | 绑定的 `UserFile.file_id` |
+| `attached_from` | `upload` 或 `my_files` |
+
+列表、删除和索引重建均通过 `SessionFile.user_id + session_id` 限定当前用户当前会话。
+
+### 4.3 索引持久化语义
+
+`ChatFileIndex` 本身仍是进程内 LRU 热索引；不写 chunk 表，不依赖 Redis/Milvus/embedding。为了支持进程重启或 LRU 驱逐后的恢复，`ChatFileIndexManager.get(thread_id, user_id=...)` 会在 miss 时：
+
+1. 查询 `UserFile` join `SessionFile`。
+2. 限定 `SessionFile.user_id == user_id`、`UserFile.owner_user_id == user_id`、`UserFile.status == "active"`。
+3. 只加载 `metadata_.file_category == "long_doc"` 且 `metadata_.content` 非空的文件。
+4. 重新分块并构建 BM25/TF-IDF 索引。
 
 ---
 
@@ -269,7 +269,7 @@ CREATE TABLE chat_file_chunks (
 
 ### 5.1 新增 API 端点
 
-#### `POST /api/v2/agent/chat-upload`
+#### `POST /api/v2/chat-files/upload`
 
 对话文件上传接口，支持同时上传多个文件。
 
@@ -279,6 +279,7 @@ CREATE TABLE chat_file_chunks (
 |------|------|------|------|
 | `files` | File[] | 是 | 上传的文件列表 |
 | `thread_id` | string | 是 | 会话线程 ID |
+| `parse_mode` | string | 否 | `auto` 或 `mineru`，默认 `auto` |
 
 **响应**:
 
@@ -299,21 +300,35 @@ CREATE TABLE chat_file_chunks (
       "file_id": "uuid",
       "file_name": "diagram.png",
       "file_category": "multimodal",
-      "parse_status": "ready",
+      "parse_status": "completed",
       "strategy": "vision",
       "message": "图片将直接发送给模型分析"
     }
-  ]
+  ],
+  "thread_id": "thread-id"
 }
 ```
 
-#### `GET /api/v2/agent/chat-files/{thread_id}`
+#### `GET /api/v2/chat-files/{thread_id}`
 
 获取会话中已上传的文件列表。
 
-#### `DELETE /api/v2/agent/chat-files/{file_id}`
+#### `DELETE /api/v2/chat-files/{file_id}`
 
-删除会话中的某个上传文件及其索引。
+删除会话中的某个上传文件绑定。当前实现删除 `session_files` 绑定关系，不物理删除 `user_files` 或 MinIO 原始对象；如果文件是 long_doc，会从当前用户当前会话的内存索引中移除。
+
+#### `GET /api/v2/chat-files/{file_id}/images/{image_name}`
+
+返回对话文档图片。URL 必须携带 `exp` 与 `sig`，签名覆盖 `file_id`、`image_name`、`owner_user_id`、`thread_id` 和过期时间。
+
+### 5.1b 相关文件中心端点
+
+| 路径 | 用途 |
+|---|---|
+| `POST /api/v1/files/upload` | 上传到个人文件夹，走 `storage_scope="personal"` |
+| `GET /api/v1/my-files` | 列当前用户个人文件 |
+| `POST /api/v1/sessions/{session_id}/files/attach` | 将个人文件绑定到会话；long_doc 会建立会话索引 |
+| `GET /api/v2/files/{file_id}/download` | 下载文件，校验 owner 或显式授权 |
 
 ### 5.2 文档解析服务：`ChatFileParser`
 
@@ -321,115 +336,65 @@ CREATE TABLE chat_file_chunks (
 # backend/services/chat_file_parser.py
 
 class ChatFileParser:
-    """对话文件解析服务 - 三级解析策略"""
+    """对话文件解析服务 - 当前入口接收 bytes，不要求调用方先落本地文件。"""
 
-    # 短文档阈值（字符数）
-    SHORT_DOC_THRESHOLD = 5000
-    # 分块大小（字符数）
-    CHUNK_SIZE = 800
-    CHUNK_OVERLAP = 100
+    async def parse(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        mime_type: str | None = None,
+        parse_mode: str = "auto",
+    ) -> ParseResult:
+        ext = Path(filename).suffix.lower()
+        effective_parse_mode = str(parse_mode or "auto").strip().lower()
 
-    async def parse_file(self, file_path: str, mime_type: str) -> ParseResult:
-        """解析文件，返回解析结果"""
-        ext = Path(file_path).suffix.lower()
-
-        # 策略1：多模态文件不解析文本
+        # 图片不解析文本，直接标记为 multimodal。
         if ext in MULTIMODAL_EXTENSIONS:
             return ParseResult(
                 category="multimodal",
                 method="none",
                 content=None,
+                mime_type=mime_type or _guess_mime(ext),
             )
 
-        # 策略2：纯文本直接读取
-        if ext in PYTHON_PARSEABLE:
-            content = await self._read_text_file(file_path)
-            return self._categorize_by_length(content, method="direct")
+        # 纯文本 / KML / JSON / CSV 等直接解析。
+        if ext in PYTHON_PARSEABLE_EXTENSIONS:
+            content = await self._parse_text_file(file_bytes, ext, filename=filename)
+            if content is not None:
+                return self._route_by_length(content, method="direct")
+            return ParseResult(category="failed", method="direct", error="文本文件读取失败")
 
-        # 策略3：富文档先尝试 Python 解析
+        # 富文档可按 parse_mode 强制 MinerU；否则先 Python 快速解析，再回退 MinerU。
         if ext in RICH_DOCUMENT_EXTENSIONS:
-            content = await self._try_python_parse(file_path, ext)
-            if content and len(content.strip()) > 50:
-                return self._categorize_by_length(content, method="python")
+            if effective_parse_mode == "mineru":
+                return await self._try_mineru(file_bytes, filename)
+            return await self._parse_rich_document(file_bytes, filename, ext)
 
-            # 策略4：回退到 MinerU
-            content = await self._parse_with_mineru(file_path)
-            if content:
-                return self._categorize_by_length(content, method="mineru")
+        # 未知格式最后尝试 MinerU。
+        return await self._try_mineru(file_bytes, filename)
 
-            return ParseResult(
-                category="failed",
-                method="mineru",
-                content=None,
-                error="文档解析失败，无法提取有效内容",
-            )
-
-        # 未知类型：尝试 MinerU
-        content = await self._parse_with_mineru(file_path)
-        if content:
-            return self._categorize_by_length(content, method="mineru")
-
-        return ParseResult(category="failed", method="unknown", content=None)
-
-    async def _try_python_parse(self, file_path: str, ext: str) -> str | None:
-        """Python 库解析富文档"""
-        try:
-            if ext == ".pdf":
-                return await self._parse_pdf(file_path)
-            elif ext in (".docx",):
-                return await self._parse_docx(file_path)
-            elif ext in (".xlsx", ".xls"):
-                return await self._parse_excel(file_path)
-            elif ext in (".pptx", ".ppt"):
-                return await self._parse_pptx(file_path)
-        except Exception as e:
-            logger.warning(f"Python 解析失败 [{ext}]: {e}")
-            return None
-        return None
-
-    async def _parse_with_mineru(self, file_path: str) -> str | None:
-        """调用 MinerU OCR 解析文档"""
-        from backend.core.tools.ocr.mineru_ocr import MinerUOCR
-        from backend.config.settings import settings
-
-        ocr = MinerUOCR(api_url=settings.mineru_api_url)
-        try:
-            result = await ocr.process_file_async(file_path)
-            if result.is_success() and result.markdown:
-                return result.markdown
-        except Exception as e:
-            logger.error(f"MinerU 解析失败: {e}")
-        finally:
-            await ocr.close()
-        return None
-
-    def _categorize_by_length(self, content: str, method: str) -> ParseResult:
-        """根据内容长度分类为短文档或长文档"""
-        length = len(content)
-        if length <= self.SHORT_DOC_THRESHOLD:
-            return ParseResult(
-                category="short_doc",
-                method=method,
-                content=content,
-                content_length=length,
-            )
+    def _route_by_length(self, content: str, method: str, images=None) -> ParseResult:
+        cleaned = clean_surrogates(clean_document_images(content))
+        truncated = cleaned[:MAX_CONTENT_CHARS]
+        category = "short_doc" if len(truncated) <= SHORT_DOC_THRESHOLD else "long_doc"
         return ParseResult(
-            category="long_doc",
+            category=category,
             method=method,
-            content=content,
-            content_length=length,
+            content=truncated,
+            content_length=len(truncated),
+            images=images or [],
         )
 ```
 
 ### 5.3 会话级文档索引：`ChatFileIndex`（轻量方案）
 
-> **设计原则**：对话级文件检索不需要知识库级别的重型基础设施。
-> 采用 **BM25 关键词召回 + TF-IDF 余弦轻量重排** 的纯 Python 方案，
-> **零外部依赖**（不调 embedding API、不需要 Milvus/Redis），索引构建瞬间完成。
+当前实现位于 `backend/services/chat_file_index.py`。索引 key 是 `(user_id, thread_id)`，避免不同用户使用相同外部 thread_id 时共享检索上下文。
+
+> **实现原则**：对话级文件检索不需要知识库级别的向量基础设施。当前采用模式匹配、关键词精确匹配、BM25 召回、TF-IDF 余弦轻量重排和文档开头回退的纯 Python 方案；不调用 embedding API，不需要 Milvus/Redis 存储索引。
 
 #### 为什么不用 Embedding 向量检索？
 
-| 维度 | Embedding 方案 | 轻量方案（本设计） |
+| 维度 | Embedding 方案 | 当前轻量方案 |
 |------|---------------|-------------------|
 | 索引构建 | 每块调 API 算向量，数百块≈10-30s | 纯内存分词统计，<100ms |
 | 查询延迟 | 调 API 算 query 向量 + numpy 距离计算 | 纯 Python 字符串运算，<10ms |
@@ -437,352 +402,48 @@ class ChatFileParser:
 | 内存占用 | 每块 1536*4B ≈ 6KB 向量，额外 numpy | 仅存文本和词频字典 |
 | 适用场景 | 知识库级万级文档 | 对话级几十到几百块 |
 
-#### 检索策略：BM25 + TF-IDF 余弦重排 + 上下文窗口扩展
+#### 当前检索策略
 
 ```
 查询 query
   │
-  ├── 第1路：BM25 关键词召回（top_k × 3 过采样）
-  │     复用项目已有的 BM25Index，中文滑动窗口分词
+  ├── prepare_search_inputs()
+  │     提取关键词、短语、图/表相关词，并为总结类问题补充摘要检索词
   │
-  ├── 第2路：TF-IDF 余弦相似度轻量重排
-  │     对 BM25 召回的候选块，用 TF-IDF 向量做余弦相似度精排
-  │     纯 Python 实现，无需外部 API
+  ├── 模式匹配
+  │     图片、图表、Figure、Table 等问题优先走正则匹配
   │
-  ├── 融合：加权合并
-  │     final_score = 0.6 × norm(bm25) + 0.4 × tfidf_cosine
+  ├── keywords 精确匹配
+  │     大小写不敏感子串匹配，支持模型传入中英文术语
   │
-  └── 上下文窗口扩展
-        命中的块自动携带前后各1个相邻块，提供连贯上下文
-```
-
-```python
-# backend/services/chat_file_index.py
-
-import math
-import re
-from collections import Counter
-from dataclasses import dataclass, field
-
-from backend.rag.keywords.bm25_index import BM25Index
-
-@dataclass
-class ChunkMeta:
-    file_id: str
-    file_name: str
-    chunk_index: int
-    content: str
-
-@dataclass
-class SearchResult:
-    content: str
-    file_name: str
-    file_id: str
-    chunk_index: int
-    score: float
-
-class ChatFileIndex:
-    """会话级文档轻量检索索引
-
-    BM25 召回 + TF-IDF 余弦重排，纯 Python 实现。
-    不依赖任何外部服务（无 embedding API / Milvus / Redis）。
-    """
-
-    def __init__(self, thread_id: str):
-        self.thread_id = thread_id
-        self.bm25 = BM25Index()
-        self._chunks: list[ChunkMeta] = []
-        self._idf: dict[str, float] = {}       # 全局 IDF
-        self._chunk_tfidf: list[dict[str, float]] = []  # 每块的 TF-IDF 向量
-
-    # ── 索引构建 ─────────────────────────────────────────
-
-    def add_document(
-        self,
-        file_id: str,
-        content: str,
-        file_name: str,
-        chunk_size: int = 800,
-        chunk_overlap: int = 100,
-    ) -> int:
-        """分块并建立索引，同步完成，通常 <100ms"""
-        chunks = _split_text(content, chunk_size, chunk_overlap)
-
-        for i, text in enumerate(chunks):
-            self._chunks.append(ChunkMeta(
-                file_id=file_id,
-                file_name=file_name,
-                chunk_index=i,
-                content=text,
-            ))
-            self.bm25.add_document(text)
-
-        self._rebuild_tfidf()
-        return len(chunks)
-
-    def _rebuild_tfidf(self):
-        """重建全局 IDF 和每块 TF-IDF 向量"""
-        n = len(self._chunks)
-        if n == 0:
-            return
-
-        doc_freq: dict[str, int] = {}
-        tokenized: list[list[str]] = []
-
-        for chunk in self._chunks:
-            tokens = _tokenize_simple(chunk.content)
-            tokenized.append(tokens)
-            for term in set(tokens):
-                doc_freq[term] = doc_freq.get(term, 0) + 1
-
-        self._idf = {
-            term: math.log((n + 1) / (df + 1)) + 1
-            for term, df in doc_freq.items()
-        }
-
-        self._chunk_tfidf = []
-        for tokens in tokenized:
-            tf = Counter(tokens)
-            total = max(len(tokens), 1)
-            tfidf = {
-                term: (count / total) * self._idf.get(term, 1.0)
-                for term, count in tf.items()
-            }
-            self._chunk_tfidf.append(tfidf)
-
-    # ── 检索 ─────────────────────────────────────────────
-
-    def search(
-        self,
-        query: str,
-        top_k: int = 5,
-        bm25_weight: float = 0.6,
-        tfidf_weight: float = 0.4,
-        expand_window: int = 1,
-    ) -> list[SearchResult]:
-        """混合检索：BM25 召回 + TF-IDF 余弦重排 + 上下文窗口"""
-        if not self._chunks:
-            return []
-
-        # 第1步：BM25 过采样召回
-        bm25_results = self.bm25.search(query, top_k=top_k * 3)
-        if not bm25_results:
-            return []
-
-        candidate_indices = [idx for idx, _ in bm25_results]
-        bm25_scores = {idx: score for idx, score in bm25_results}
-
-        # 第2步：TF-IDF 余弦相似度对候选精排
-        query_tfidf = self._compute_query_tfidf(query)
-        tfidf_scores: dict[int, float] = {}
-        for idx in candidate_indices:
-            tfidf_scores[idx] = _cosine_sim(query_tfidf, self._chunk_tfidf[idx])
-
-        # 第3步：分数归一化 + 加权融合
-        bm25_max = max(bm25_scores.values()) if bm25_scores else 1.0
-        tfidf_max = max(tfidf_scores.values()) if tfidf_scores else 1.0
-
-        fused: dict[int, float] = {}
-        for idx in candidate_indices:
-            bm25_norm = bm25_scores.get(idx, 0) / max(bm25_max, 1e-9)
-            tfidf_norm = tfidf_scores.get(idx, 0) / max(tfidf_max, 1e-9)
-            fused[idx] = bm25_weight * bm25_norm + tfidf_weight * tfidf_norm
-
-        ranked = sorted(fused.items(), key=lambda x: -x[1])[:top_k]
-
-        # 第4步：上下文窗口扩展（携带前后相邻块）
-        results = []
-        seen_files: dict[str, set[int]] = {}
-        for idx, score in ranked:
-            chunk = self._chunks[idx]
-            fid = chunk.file_id
-            if fid not in seen_files:
-                seen_files[fid] = set()
-
-            expanded = self._expand_context(idx, expand_window, seen_files[fid])
-            seen_files[fid].update(
-                range(max(0, idx - expand_window), min(len(self._chunks), idx + expand_window + 1))
-            )
-            results.append(SearchResult(
-                content=expanded,
-                file_name=chunk.file_name,
-                file_id=fid,
-                chunk_index=chunk.chunk_index,
-                score=score,
-            ))
-        return results
-
-    def _compute_query_tfidf(self, query: str) -> dict[str, float]:
-        tokens = _tokenize_simple(query)
-        tf = Counter(tokens)
-        total = max(len(tokens), 1)
-        return {
-            term: (count / total) * self._idf.get(term, 1.0)
-            for term, count in tf.items()
-        }
-
-    def _expand_context(
-        self, center_idx: int, window: int, already_seen: set[int]
-    ) -> str:
-        """扩展上下文窗口，将前后块拼入"""
-        parts = []
-        file_id = self._chunks[center_idx].file_id
-        for offset in range(-window, window + 1):
-            i = center_idx + offset
-            if i < 0 or i >= len(self._chunks):
-                continue
-            if self._chunks[i].file_id != file_id:
-                continue
-            if i in already_seen and i != center_idx:
-                continue
-            parts.append(self._chunks[i].content)
-        return "\n\n".join(parts)
-
-    @property
-    def chunk_count(self) -> int:
-        return len(self._chunks)
-
-    @property
-    def file_count(self) -> int:
-        return len({c.file_id for c in self._chunks})
-
-# ── 工具函数 ─────────────────────────────────────────────
-
-def _tokenize_simple(text: str) -> list[str]:
-    """轻量分词：中文按字/bigram，英文按单词"""
-    words = []
-    for m in re.finditer(r'[\u4e00-\u9fff]+', text):
-        s = m.group()
-        words.extend(s)                       # 单字
-        for i in range(len(s) - 1):           # bigram
-            words.append(s[i:i+2])
-    for m in re.finditer(r'[a-zA-Z]{2,}', text):
-        words.append(m.group().lower())
-    for m in re.finditer(r'\d+(?:\.\d+)?', text):
-        words.append(m.group())
-    return words
-
-def _cosine_sim(a: dict[str, float], b: dict[str, float]) -> float:
-    """两个稀疏 TF-IDF 向量的余弦相似度"""
-    if not a or not b:
-        return 0.0
-    common = set(a) & set(b)
-    if not common:
-        return 0.0
-    dot = sum(a[k] * b[k] for k in common)
-    norm_a = math.sqrt(sum(v * v for v in a.values()))
-    norm_b = math.sqrt(sum(v * v for v in b.values()))
-    if norm_a < 1e-9 or norm_b < 1e-9:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-def _split_text(
-    text: str, chunk_size: int = 800, chunk_overlap: int = 100,
-) -> list[str]:
-    """智能分块 - 尊重段落和句子边界"""
-    paragraphs = re.split(r'\n{2,}', text)
-    chunks: list[str] = []
-    current = ""
-
-    for para in paragraphs:
-        if len(current) + len(para) <= chunk_size:
-            current += ("\n\n" + para) if current else para
-        else:
-            if current:
-                chunks.append(current.strip())
-            if len(para) > chunk_size:
-                sentences = re.split(r'(?<=[。！？.!?])\s*', para)
-                current = ""
-                for sent in sentences:
-                    if len(current) + len(sent) <= chunk_size:
-                        current += sent
-                    else:
-                        if current:
-                            chunks.append(current.strip())
-                        current = sent
-            else:
-                current = para
-
-    if current.strip():
-        chunks.append(current.strip())
-    return chunks
+  ├── BM25 + TF-IDF
+  │     使用已有 BM25Index 过采样候选，再用稀疏 TF-IDF 余弦重排
+  │
+  ├── 上下文窗口
+  │     命中块自动携带相邻块，提供连贯上下文
+  │
+  └── 回退
+        无命中或通用总结类查询返回各文档开头片段
 ```
 
 ### 5.4 Agent 工具注册：`chat_file_search`
 
-在工具装配流水线 `ToolAssemblyPipeline` 中，根据当前会话是否有长文档索引，动态注册检索工具。
+工具提供方位于 `backend/application/tools/providers/chat_file_search_tool.py`：
 
-```python
-# 在 backend/application/tools/providers/chat_file_search_tool.py 中定义
-
-from backend.services.chat_file_index import ChatFileIndexManager
-
-_index_manager = ChatFileIndexManager(max_threads=100)
-
-def create_scoped_chat_file_search_tool(thread_id: str):
-    """为指定会话创建带作用域的文档检索工具"""
-
-    @tool("chat_file_search")
-    def chat_file_search(
-        query: str,
-        top_k: int = 5,
-    ) -> str:
-        """搜索用户在当前对话中上传的文档内容。
-
-        当用户上传了较长的文档时，使用此工具在文档中搜索相关信息。
-        使用关键词匹配 + 轻量重排，自动找到最相关的文档片段。
-        每个片段会自动携带前后文上下文，确保信息连贯。
-
-        Args:
-            query: 搜索查询内容，描述你想在文档中查找的信息
-            top_k: 返回的最相关片段数量，默认5
-        """
-        index = _index_manager.get(thread_id)
-        if not index or index.chunk_count == 0:
-            return "当前对话中没有已上传的文档。"
-
-        results = index.search(query, top_k=top_k)
-        if not results:
-            return "在上传的文档中未找到与查询相关的内容。"
-
-        parts = []
-        for i, r in enumerate(results, 1):
-            parts.append(
-                f"### 片段 {i} (来自: {r.file_name}, 相关度: {r.score:.2f})\n\n{r.content}"
-            )
-
-        header = f"从 {index.file_count} 个上传文档中检索到 {len(results)} 个相关片段：\n\n"
-        return header + "\n\n---\n\n".join(parts)
-
-    return chat_file_search
-
-def has_thread_file_index(thread_id: str) -> bool:
-    """检查指定会话是否有文件索引"""
-    index = _index_manager.get(thread_id)
-    return index is not None and index.chunk_count > 0
-```
+- `create_scoped_chat_file_search_tool(thread_id, *, user_id)`：创建绑定到当前用户和当前会话的 LangChain tool。
+- `has_thread_file_index(thread_id, *, user_id)`：通过 `get_index_manager().has_files()` 判断该用户该会话是否存在 long_doc 索引。
+- tool 入参为 `query`、可选 `keywords` 和 `top_k`；`top_k` 被限制在 1 到 10。
+- 检索结果会清理本地图片引用，并通过 `image_url_registry` 将文档图片注册为 `[IMAGE:...]` token，流式输出阶段再还原为真实 URL。
 
 ### 5.5 工具装配集成
 
-在 `ToolAssemblyPipeline.assemble()` 中增加会话文件检索工具的注入逻辑：
+`backend/application/tools/tool_assembly_pipeline.py` 会在装配工具时检查：
 
-```python
-# backend/application/tools/tool_assembly_pipeline.py
+- `chat_file_search` 是否在当前 agent/profile/workflow 允许工具集里。
+- 请求上下文是否包含 `thread_id` 与 `user_id`。
+- `has_thread_file_index(thread_id, user_id=user_id)` 是否为真。
 
-def assemble(self) -> list[BaseTool]:
-    # ... 现有逻辑 ...
-
-    # 注入会话文件检索工具（如果当前线程有上传文档索引）
-    if self._thread_id and has_thread_file_index(self._thread_id):
-        from backend.application.tools.providers.chat_file_search_tool import (
-            create_scoped_chat_file_search_tool,
-        )
-        file_search = create_scoped_chat_file_search_tool(self._thread_id)
-        tools_by_name[file_search.name] = file_search
-        logger.info("[ToolAssembly] 已注入 chat_file_search 工具（会话文件检索）")
-
-    return list(tools_by_name.values())
-```
+三者都满足时，才注入当前用户当前会话专属的 `chat_file_search` 工具。
 
 ### 5.6 查询增强 - 短文档上下文注入
 
@@ -809,21 +470,19 @@ for img_info in meta.get("image_urls", [])[:10]:
 
 ## 六、前端设计
 
-### 6.1 新增组件
+### 6.1 当前组件
 
-#### `FileUploadButton.vue` - 上传按钮与拖拽区
+当前前端落点在 `frontend/src/views/ne-full/`：
 
-集成在 `ChatBox.vue` 的输入框左侧，支持：
+| 文件 | 作用 |
+|---|---|
+| `components/ChatBox.vue` | 输入框、附件菜单、粘贴图片、视觉能力提示和发送事件 |
+| `components/FilePreviewChip.vue` | 已选择/已上传附件预览、错误状态与删除入口 |
+| `components/MyFilesPickerDialog.vue` | 从个人文件夹选择已有文件并绑定到当前会话 |
+| `composables/useFileUpload.ts` | 本地附件状态、`parse_mode`、上传、删除、清空、ready 文件 ID |
+| `api/agent-v2.ts` | `ChatFileAPI.upload/listFiles/deleteFile` |
 
-- 点击选择文件
-- 拖拽文件到输入区域
-- 粘贴图片（Ctrl+V）
-- 多文件同时上传
-- 上传进度条
-
-#### `FilePreviewChip.vue` - 附件预览气泡
-
-显示在输入框上方，展示已选择/上传的文件：
+`ChatBox.vue` 的附件入口支持本地选择、粘贴图片、从“我的文件”选择和多文件上传；`FilePreviewChip.vue` 显示在输入框上方。
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -840,87 +499,97 @@ for img_info in meta.get("image_urls", [])[:10]:
 └─────────────────────────────────────────────────────┘
 ```
 
-### 6.2 ChatBox.vue 增强
+### 6.2 附件状态模型
 
 ```typescript
-// 新增的 props 和 events
+// frontend/src/views/ne-full/composables/useFileUpload.ts
 interface FileAttachment {
   id: string;
   file: File;
   name: string;
   size: number;
-  type: string;               // MIME type
-  category?: 'multimodal' | 'short_doc' | 'long_doc' | 'parsing';
-  status: 'pending' | 'uploading' | 'parsing' | 'ready' | 'error';
-  progress: number;            // 0-100
-  previewUrl?: string;         // 图片预览
+  mimeType: string;
+  category: 'multimodal' | 'short_doc' | 'long_doc' | 'failed' | 'pending';
+  status: 'pending' | 'uploading' | 'ready' | 'error';
+  strategy: 'vision' | 'context' | 'indexed' | 'none';
+  progress: number;
+  previewUrl?: string;
   errorMessage?: string;
+  contentLength?: number;
 }
-
-// ChatBox 新增 emit
-emit('send', text: string, attachments: FileAttachment[])
 ```
 
-### 6.3 API 层扩展
+### 6.3 API 层
 
 ```typescript
-// frontend/src/api/agent-v2.ts 新增
+// frontend/src/api/agent-v2.ts
 
 export interface ChatFileUploadResult {
   file_id: string;
   file_name: string;
   file_category: 'multimodal' | 'short_doc' | 'long_doc';
   parse_status: 'completed' | 'failed';
-  content_length?: number;
-  strategy: 'vision' | 'context' | 'indexed';
+  content_length: number;
+  strategy: 'vision' | 'context' | 'indexed' | 'none';
   message: string;
+  error?: string;
+  mime_type?: string;
 }
+
+export type ChatFileParseMode = 'auto' | 'mineru';
 
 export const ChatFileAPI = {
   async upload(
     threadId: string,
     files: File[],
-    onProgress?: (percent: number) => void,
-  ): Promise<{ success: boolean; files: ChatFileUploadResult[] }> {
+    parseMode: ChatFileParseMode = 'auto',
+    token?: string,
+  ): Promise<{ success: boolean; files: ChatFileUploadResult[]; thread_id: string }> {
     const formData = new FormData();
     formData.append('thread_id', threadId);
+    formData.append('parse_mode', parseMode);
     files.forEach(f => formData.append('files', f));
 
-    const res = await fetch('/api/v2/agent/chat-upload', {
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+
+    const res = await fetch('/api/v2/chat-files/upload', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
+      headers,
       body: formData,
     });
     return res.json();
   },
 
-  async listFiles(threadId: string): Promise<ChatFileUploadResult[]> {
-    const res = await fetch(`/api/v2/agent/chat-files/${threadId}`);
-    return res.json();
+  async listFiles(threadId: string, token?: string): Promise<ChatFileUploadResult[]> {
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(`/api/v2/chat-files/${encodeURIComponent(threadId)}`, { headers });
+    const data = await res.json();
+    return data.items || [];
   },
 
-  async deleteFile(fileId: string): Promise<void> {
-    await fetch(`/api/v2/agent/chat-files/${fileId}`, { method: 'DELETE' });
+  async deleteFile(fileId: string, token?: string): Promise<void> {
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    await fetch(`/api/v2/chat-files/${encodeURIComponent(fileId)}`, { method: 'DELETE', headers });
   },
 };
 ```
 
-### 6.4 useAgentChat 增强
+### 6.4 Agent 请求
 
-`sendMessage` 方法扩展，支持附件：
+发送消息前，`useFileUpload.uploadPendingFiles(threadId)` 会把 pending 附件上传解析完毕；发送给 Agent Runtime 的 payload 携带 ready 附件 ID：
 
 ```typescript
-// 在 queryStream payload 中新增字段
 const payload = {
   question,
   thread_id: threadId,
-  // 新增
-  file_ids: attachments
-    .filter(a => a.status === 'ready')
-    .map(a => a.id),
-  multimodal_file_ids: attachments
-    .filter(a => a.category === 'multimodal')
-    .map(a => a.id),
+  metadata: {
+    file_ids: attachments
+      .filter(a => a.status === 'ready')
+      .map(a => a.id),
+  },
 };
 ```
 
@@ -930,33 +599,12 @@ const payload = {
 
 ### 7.1 图片消息格式
 
-当用户上传图片，或短文档中携带可访问图片 URL 且模型支持 vision 时，构建多模态消息：
+当用户上传图片，或短文档中携带可访问图片 URL 且模型支持 vision 时，标准 Agent Runtime 会从附件元数据读取图片 URL，并注入 `multimodal_images`。当前系统不引入独立的对话上传文件模型；图片来源仍是 `UserFile.metadata_.image_urls` 和对话附件绑定。
 
-```python
-# 后端构建消息
-def build_multimodal_message(
-    question: str,
-    image_files: list[ChatUploadedFile],
-) -> list[dict]:
-    """构建多模态消息内容块"""
-    content_blocks = []
+短文档链路会同时处理两类内容：
 
-    # 文本部分
-    content_blocks.append({
-        "type": "text",
-        "text": question,
-    })
-
-    # 图片部分：支持直接上传图片、以及文档中提取出的 URL 图片
-    for img_file in image_files:
-        image_url = img_file["image_url"]
-        content_blocks.append({
-            "type": "image_url",
-            "image_url": {"url": image_url},
-        })
-
-    return content_blocks
-```
+- 文本：以 `<uploaded_document>` 形式拼入本轮问题上下文。
+- 图片：从 `metadata.image_urls` 取可访问 URL，按上限传给支持 vision 的模型。
 
 ### 7.2 模型能力检测
 
@@ -982,45 +630,36 @@ const currentModelSupportsVision = computed(() => {
 - 若 MinerU 返回的 markdown 中仍包含本地图片路径，上传阶段会用 `replace_local_images_with_urls()` 做替换。
 - 这意味着短文档上下文、长文档检索、流式图片引用三条链路都基于同一份 `metadata.image_urls`。
 
-### 8.1 解析流程
+### 8.2 解析流程
 
 复用现有的 `MinerUOCR` 类 (`backend/core/tools/ocr/mineru_ocr.py`)：
 
 ```
-文件上传 → 存储到 MinIO → 下载到本地临时目录
-    → MinerUOCR.process_file_async()
-        → 提交任务 (POST /api/v1/tasks/submit)
-        → 轮询状态 (GET /api/v1/tasks/{id})
-        → 获取结果 (GET /api/v1/tasks/{id}/data)
-            → 返回 Markdown 内容
-    → 清理临时文件
+上传 bytes
+  → ChatFileParser._try_mineru()
+  → 写入 NamedTemporaryFile
+  → MinerUOCR.submit_task_async(tmp_path)
+  → wait_for_completion_async(task_id, timeout=300)
+  → get_task_data_async(task_id, include_fields=["md", "content_list", "images"], upload_images=True)
+  → 提取 markdown、base64 图片、远程图片 URL
+  → 清理临时文件
 ```
 
-### 8.2 解析降级策略
+### 8.3 解析降级策略
 
 ```python
-async def parse_rich_document(file_path: str, ext: str) -> str | None:
-    """富文档解析 - 三级降级策略"""
+async def _parse_rich_document(data: bytes, filename: str, ext: str) -> ParseResult:
+    content = await asyncio.to_thread(self._python_parse_sync, data, ext)
+    if content and _is_valid_content(content):
+        images = await asyncio.to_thread(self._extract_document_images, data, ext)
+        return self._route_by_length(content, method="python", images=images)
 
-    # 第1级：Python 库快速解析
-    content = await try_python_parse(file_path, ext)
-    if content and is_valid_content(content):
-        logger.info(f"Python 解析成功: {len(content)} 字")
-        return content
+    if ext in MINERU_FALLBACK_EXTENSIONS or ext in {".docx", ".pptx", ".xlsx"}:
+        result = await self._try_mineru(data, filename)
+        if result.category != "failed":
+            return result
 
-    # 第2级：MinerU pipeline 模式
-    content = await try_mineru_parse(file_path, backend="pipeline")
-    if content and is_valid_content(content):
-        logger.info(f"MinerU pipeline 解析成功: {len(content)} 字")
-        return content
-
-    # 第3级：MinerU VLM 模式（GPU 加速，精度更高）
-    content = await try_mineru_parse(file_path, backend="vlm-vllm-engine")
-    if content and is_valid_content(content):
-        logger.info(f"MinerU VLM 解析成功: {len(content)} 字")
-        return content
-
-    return None
+    return ParseResult(category="failed", method="python", error="无法解析文档内容")
 
 def is_valid_content(content: str) -> bool:
     """判断解析内容是否有效"""
@@ -1045,32 +684,41 @@ def is_valid_content(content: str) -> bool:
 | 文档规模 | 数千~数万文档 | 1~20 个文件 |
 | 块数量 | 数十万块 | 数十~数百块 |
 | 查询频率 | 高频并发 | 单会话串行 |
-| 生命周期 | 持久化 | 会话级临时 |
+| 生命周期 | 持久化 | 元数据持久化；热索引进程内 LRU，可按 `(user_id, thread_id)` 重建 |
 | 精度要求 | 高（语义理解） | 中（关键词+浅层语义即可） |
 
-**结论**：不需要 Embedding API / Milvus / Redis，纯 Python 内存方案足矣。
+**结论**：不需要 Embedding API / Milvus / Redis。当前实现用纯 Python 热索引提供低延迟检索，并把 long_doc 文本保存在 `UserFile.metadata_.content` 中用于重建。
 
-### 9.2 两路检索 + 融合策略
+### 9.2 当前检索策略
 
 ```
-查询 → ┬── BM25 关键词召回（过采样 3x）
-       │     复用项目已有的 BM25Index
-       │     中文滑动窗口分词，精确术语匹配
-       │
-       └── TF-IDF 余弦相似度精排
-             对 BM25 候选做余弦重排
-             纯 Python dict 运算，无 numpy 向量
-
-       → 加权融合：0.6 × BM25_norm + 0.4 × TF-IDF_cosine
-       → 上下文窗口扩展（前后各1块）
-       → 返回 top_k 结果
+用户问题 + 可选 keywords
+  │
+  ├── prepare_search_inputs()
+  │     提取中英文术语、图/表编号、引号精确短语；
+  │     通用总结问题改写为 abstract/introduction/... 等摘要检索词
+  │
+  ├── 模式匹配
+  │     图片/图表/Figure/Table 等问题优先正则匹配结构化线索
+  │
+  ├── 关键词精确匹配
+  │     keywords 大小写不敏感子串匹配
+  │
+  ├── BM25 + TF-IDF 融合
+  │     BM25 过采样候选，TF-IDF 余弦重排
+  │
+  └── 顺序回退
+        无有效命中或通用总结类问题返回文档开头片段
 ```
 
 | 组件 | 作用 | 复杂度 | 依赖 |
 |------|------|--------|------|
+| **模式匹配** | 针对图片、图表、表格、Figure/Table 编号 | O(chunks × patterns) | 正则 |
+| **关键词匹配** | 精确术语命中，支持中英文混合 keywords | O(chunks × keywords) | 纯 Python |
 | **BM25**（第1路） | 精确关键词召回，找到包含查询词的块 | O(query_tokens × doc_freq) | 已有 `BM25Index` |
 | **TF-IDF 余弦**（第2路） | 轻量语义重排，基于词频分布相似度精选 | O(候选数 × 公共词数) | 纯 Python |
 | **上下文窗口** | 命中块前后扩展1块，保证上下文连贯 | O(1) | 无 |
+| **图片 token** | 检索结果注册文档图片为 `[IMAGE:...]` | O(每文件图片数) | `image_url_registry` |
 
 ### 9.3 为什么选 BM25 + TF-IDF 而不是其他组合？
 
@@ -1094,7 +742,7 @@ def is_valid_content(content: str) -> bool:
 - **块大小**：800 字（在精度和上下文窗口大小之间取平衡）
 - **重叠**：100 字（确保跨块边界的术语不丢失）
 - **切分规则**：优先按段落边界切，段落超长则按句子边界切
-- 具体实现见 5.3 节的 `_split_text` 函数
+- 具体实现见 `backend/services/chat_file_index.py:split_text()`
 
 ### 9.5 索引生命周期
 
@@ -1115,44 +763,12 @@ def is_valid_content(content: str) -> bool:
 
 ### 9.6 内存管理 - LRU 索引池
 
-```python
-# backend/services/chat_file_index.py 中
+`ChatFileIndexManager` 控制同时驻留内存的索引数量，默认 `max_threads=100`。当前 key 不是单独的 `thread_id`，而是 `(user_id, thread_id)`：
 
-from collections import OrderedDict
-
-class ChatFileIndexManager:
-    """全局索引管理器 - LRU 缓存
-
-    控制同时在内存中的索引数量，避免 OOM。
-    典型场景：100 个活跃会话 × 每会话平均 50 块 × 800字/块 ≈ 4MB，极轻量。
-    """
-
-    def __init__(self, max_threads: int = 100):
-        self._indices: OrderedDict[str, ChatFileIndex] = OrderedDict()
-        self._max_threads = max_threads
-
-    def get_or_create(self, thread_id: str) -> ChatFileIndex:
-        if thread_id in self._indices:
-            self._indices.move_to_end(thread_id)
-            return self._indices[thread_id]
-
-        if len(self._indices) >= self._max_threads:
-            evicted_id, _ = self._indices.popitem(last=False)
-            logger.info(f"[ChatFileIndex] LRU 驱逐: {evicted_id}")
-
-        index = ChatFileIndex(thread_id)
-        self._indices[thread_id] = index
-        return index
-
-    def get(self, thread_id: str) -> ChatFileIndex | None:
-        if thread_id in self._indices:
-            self._indices.move_to_end(thread_id)
-            return self._indices[thread_id]
-        return None
-
-    def remove(self, thread_id: str):
-        self._indices.pop(thread_id, None)
-```
+- `get_or_create(thread_id, user_id=...)`：创建或取回当前用户当前会话索引。
+- `get(thread_id, user_id=...)`：未命中时会从 `UserFile + SessionFile` 重建 long_doc 索引。
+- `remove_document(file_id)`：删除对话附件绑定时，从当前索引移除该文件块。
+- LRU 驱逐只释放热索引；持久化元数据仍在 DB，可按需重建。
 
 ### 9.7 性能预估
 
@@ -1181,59 +797,35 @@ class ChatFileIndexManager:
 
 ---
 
-## 十一、实施计划
+## 十一、当前实现清单
 
-### 第一阶段：基础上传与短文档（3天）
-
-1. 数据库表创建
-2. `ChatFileParser` 文本解析服务
-3. `POST /api/v2/agent/chat-upload` 接口
-4. 前端 `FileUploadButton` + `FilePreviewChip` 组件
-5. 短文档上下文注入
-6. ChatBox 集成
-
-### 第二阶段：多模态支持（2天）
-
-1. 图片上传与预览
-2. 多模态消息构建
-3. 模型 vision 能力检测与提示
-4. 粘贴图片支持
-
-### 第三阶段：长文档索引与检索（2天）
-
-1. `ChatFileIndex` 轻量检索模块（BM25 + TF-IDF，纯 Python）
-2. `ChatFileIndexManager` LRU 索引池
-3. `chat_file_search` Agent 工具
-4. `ToolAssemblyPipeline` 动态注入
-
-### 第四阶段：MinerU 集成与降级（2天）
-
-1. MinerU 解析降级链路
-2. 解析状态实时反馈（SSE）
-3. 异常处理与用户提示
-
-### 第五阶段：优化与测试（2天）
-
-1. 性能优化（并发上传、异步解析）
-2. 边界情况处理
-3. 端到端测试
-4. 文档更新
+| 能力 | 当前状态 |
+|------|----------|
+| 基础上传 | 已实现，`POST /api/v2/chat-files/upload`，单文件 50MB、每次最多 10 个 |
+| 文件持久化 | 已实现，复用 `user_files` 与 `session_files`，不新增 `chat_uploaded_files` / `chat_file_chunks` |
+| 短文档上下文 | 已实现，文本注入 `<uploaded_document>`，文档图片进入多模态图片列表 |
+| 长文档检索 | 已实现，`ChatFileIndex` 热索引 + DB 元数据重建 |
+| 文档图片 | 已实现，PDF/DOCX/PPTX 提取图片并上传用户 MinIO bucket |
+| MinerU 回退 | 已实现，依赖 `settings.mineru_api_url` 与 MinerU 网关 |
+| 前端附件 | 已实现，`ChatBox.vue` + `FilePreviewChip.vue` + `useFileUpload.ts` |
+| 个人文件绑定 | 已实现，`/api/v1/my-files` 与 `/api/v1/sessions/{session_id}/files/attach` |
 
 ---
 
 ## 十二、关键文件变更清单
 
-| 文件 | 操作 | 说明 |
-|------|------|------|
-| `backend/db/models/__init__.py` | 修改 | 新增 `ChatUploadedFile`、`ChatFileChunk` 模型 |
-| `backend/services/chat_file_parser.py` | 新建 | 文档解析服务 |
-| `backend/services/chat_file_index.py` | 新建 | 会话级轻量检索索引（BM25 + TF-IDF） |
-| `backend/api/routers/chat_files.py` | 新建 | 对话文件上传 API 路由 |
-| `backend/application/tools/providers/chat_file_search_tool.py` | 新建 | Agent 文档检索工具 |
-| `backend/application/tools/tool_assembly_pipeline.py` | 修改 | 按请求上下文注入 `chat_file_search` 工具 |
-| `frontend_csh_ai/src/api/agent-v2.ts` | 修改 | 新增 `ChatFileAPI` |
-| `frontend_csh_ai/src/views/ne-full/components/ChatBox.vue` | 修改 | 集成文件上传按钮 |
-| `frontend_csh_ai/src/views/ne-full/components/FileUploadButton.vue` | 新建 | 文件上传组件 |
-| `frontend_csh_ai/src/views/ne-full/components/FilePreviewChip.vue` | 新建 | 文件预览气泡 |
-| `frontend_csh_ai/src/views/ne-full/composables/useAgentChat.ts` | 修改 | 支持附件发送 |
-| `frontend_csh_ai/src/views/ne-full/composables/useFileUpload.ts` | 新建 | 文件上传逻辑 |
+| 文件 | 当前职责 |
+|------|----------|
+| `backend/api/routers/chat_files.py` | 对话附件上传、列表、解绑、图片签名读取 |
+| `backend/api/routers/my_files.py` | 个人文件上传、列表、绑定到会话、生成文件保存 |
+| `backend/api/routers/files.py` | 文件元数据、下载、MinIO 工件下载与 KB 图片代理 |
+| `backend/services/user_file_service.py` | 统一解析、存储、UserFile 落库和图片 URL 处理 |
+| `backend/services/chat_file_parser.py` | 文本、富文档、图片和 MinerU 解析 |
+| `backend/services/chat_file_index.py` | `(user_id, thread_id)` 热索引与 DB 重建 |
+| `backend/application/tools/providers/chat_file_search_tool.py` | `chat_file_search` 工具和图片 token 注册 |
+| `backend/application/tools/tool_assembly_pipeline.py` | 按 policy、user_id、thread_id 和索引状态注入工具 |
+| `frontend/src/api/agent-v2.ts` | `ChatFileAPI` 与 Agent Runtime 请求 |
+| `frontend/src/views/ne-full/components/ChatBox.vue` | 附件入口、粘贴图片、发送 |
+| `frontend/src/views/ne-full/components/FilePreviewChip.vue` | 附件预览 |
+| `frontend/src/views/ne-full/components/MyFilesPickerDialog.vue` | 个人文件选择并绑定 |
+| `frontend/src/views/ne-full/composables/useFileUpload.ts` | 附件状态与上传流程 |

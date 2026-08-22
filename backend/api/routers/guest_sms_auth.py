@@ -13,13 +13,13 @@ import re
 import secrets
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import lru_cache
 
 import httpx
 from dotenv import dotenv_values
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from redis.asyncio import Redis
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,8 +47,27 @@ from backend.db.redis import get_redis_client
 router = APIRouter(prefix="/guest-sms", tags=["guest-短信登录"])
 logger = get_logger(__name__)
 
+# 比较并删除必须在 Redis 端原子执行：网关调用可能挂满锁 TTL，超时后
+# 锁被后继请求抢得，前任的迟到 DELETE 会误删后继的锁，绕过重发间隔。
+_RELEASE_SMS_LOCK_IF_OWNER_LUA = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+end
+return 0
+"""
+
+
+async def _release_sms_lock(redis_client, lock_key: str, owner: str) -> None:
+    try:
+        await redis_client.eval(
+            _RELEASE_SMS_LOCK_IF_OWNER_LUA, 1, lock_key, owner
+        )
+    except Exception:
+        pass
+
+
 CAPTCHA_TTL_SECONDS = 300
-CAPTCHA_MAX_ATTEMPTS = 5
+CAPTCHA_MAX_ATTEMPTS = 3
 SMS_CODE_TTL_SECONDS = 300
 SMS_CODE_MAX_ATTEMPTS = 5
 SMS_RESEND_SECONDS = 60
@@ -70,23 +89,23 @@ class GuestSmsCaptchaResponse(BaseModel):
 
 
 class GuestSmsSendCodeRequest(BaseModel):
-    telephone: str
-    captcha_id: str
-    captcha_answer: str
+    telephone: str = Field(min_length=1, max_length=32)
+    captcha_id: str = Field(min_length=1, max_length=64)
+    captcha_answer: str = Field(min_length=1, max_length=32)
 
 
 class GuestSmsLoginRequest(BaseModel):
-    telephone: str
-    code: str
+    telephone: str = Field(min_length=1, max_length=32)
+    code: str = Field(min_length=1, max_length=16)
 
 
 class GuestSmsRegisterRequest(BaseModel):
-    telephone: str
-    username: str | None = None
-    code: str
-    password: str
-    confirm_password: str
-    display_name: str | None = None
+    telephone: str = Field(min_length=1, max_length=32)
+    username: str | None = Field(default=None, max_length=50)
+    code: str = Field(min_length=1, max_length=16)
+    password: str = Field(min_length=6, max_length=256)
+    confirm_password: str = Field(min_length=6, max_length=256)
+    display_name: str | None = Field(default=None, max_length=100)
 
 
 def _mask_phone(phone: str) -> str:
@@ -97,13 +116,40 @@ def _guest_username(phone: str) -> str:
     return f"guest_{phone}"
 
 
-def _is_trusted_guest_sms_user(user: User, phone: str) -> bool:
-    """Return whether an existing row was provisioned by this SMS flow."""
+def _is_trusted_guest_sms_user(user: User) -> bool:
+    """Return whether a row was provisioned by this guest SMS flow.
+
+    Identity is bound to the phone number, so both the passwordless quick-login
+    row (username == ``guest_{phone}``) and a self-registered row with a custom
+    username qualify — every guest-SMS row is minted here with a ``guest_sms_``
+    API key. That prefix is the isolation boundary: an SMS code must never
+    unlock a CAS/admin/web-password account that merely shares the phone.
+    """
     return (
-        str(getattr(user, "username", "") or "") == _guest_username(phone)
-        and str(getattr(user, "role", "user") or "user").lower() == "user"
+        str(getattr(user, "role", "user") or "user").lower() == "user"
         and str(getattr(user, "api_key", "") or "").startswith("guest_sms_")
     )
+
+
+async def _find_guest_sms_user_by_phone(
+    session: AsyncSession,
+    phone: str,
+) -> User | None:
+    """Locate the single identity for a phone across both guest SMS flows.
+
+    Telephone is the primary key; ``guest_{phone}`` username is the legacy
+    fallback for quick-login rows created before telephone was persisted.
+    Resolving both keeps login and register on one row per phone instead of
+    silently forking a second passwordless account.
+    """
+    result = await session.execute(select(User).where(User.telephone == phone))
+    user = result.scalar_one_or_none()
+    if user is not None:
+        return user
+    result = await session.execute(
+        select(User).where(User.username == _guest_username(phone))
+    )
+    return result.scalar_one_or_none()
 
 
 def _hash_password(password: str) -> str:
@@ -290,7 +336,7 @@ def _tencent_auth_header(
     payload_json: str,
 ) -> str:
     algorithm = "TC3-HMAC-SHA256"
-    date = datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%d")
+    date = datetime.fromtimestamp(timestamp, tz=UTC).strftime("%Y-%m-%d")
     canonical_headers = (
         f"content-type:application/json; charset=utf-8\nhost:{TENCENT_SMS_HOST}\n"
     )
@@ -366,10 +412,12 @@ async def _send_tencent_sms(phone: str, code: str) -> tuple[bool, str]:
         return False, "短信网关异常，请稍后再试"
 
     if response.status_code >= 400:
+        # 整包响应体超出排障所需最小集（RequestId/号码尾号等），只记状态码
+        # 与截断片段。
         logger.warning(
             "[Guest SMS] 腾讯云短信 HTTP 失败: status=%s body=%s",
             response.status_code,
-            body,
+            str(body)[:300],
         )
         return False, "验证码发送失败，请稍后再试"
 
@@ -378,7 +426,14 @@ async def _send_tencent_sms(phone: str, code: str) -> tuple[bool, str]:
     if first_status.get("Code") == "Ok":
         return True, "验证码已发送"
 
-    logger.warning("[Guest SMS] 腾讯云短信返回失败: %s", body)
+    logger.warning(
+        "[Guest SMS] 腾讯云短信返回失败: code=%s message=%s",
+        first_status.get("Code") or (body.get("Response") or {}).get("Error", {}).get("Code"),
+        str(
+            first_status.get("Message")
+            or (body.get("Response") or {}).get("Error", {}).get("Message")
+        )[:200],
+    )
     response_error = (body.get("Response") or {}).get("Error") or {}
     code = str(first_status.get("Code") or response_error.get("Code") or "")
     message = first_status.get("Message") or response_error.get("Message")
@@ -419,9 +474,10 @@ async def send_guest_sms_code(
         return {"success": False, "error": captcha_error, "refresh_captcha": True}
 
     lock_key = f"guest_sms:send_lock:{telephone}"
+    lock_owner = secrets.token_urlsafe(16)
     acquired = await redis_client.set(
         lock_key,
-        "1",
+        lock_owner,
         ex=SMS_RESEND_SECONDS,
         nx=True,
     )
@@ -435,13 +491,13 @@ async def send_guest_sms_code(
         max_requests=SMS_IP_RATE_MAX_REQUESTS,
     )
     if not allowed:
-        await redis_client.delete(lock_key)
+        await _release_sms_lock(redis_client, lock_key, lock_owner)
         return _sms_rate_limited_response(retry_after)
 
     code = "".join(str(secrets.randbelow(10)) for _ in range(6))
     sent, message = await _send_tencent_sms(telephone, code)
     if not sent:
-        await redis_client.delete(lock_key)
+        await _release_sms_lock(redis_client, lock_key, lock_owner)
         return {"success": False, "error": message}
 
     await redis_client.setex(
@@ -488,8 +544,12 @@ async def guest_sms_register(
         return {"success": False, "error": code_error}
 
     username = requested_username or _guest_username(telephone)
-    result = await session.execute(select(User).where(User.telephone == telephone))
-    user = result.scalar_one_or_none()
+    # Resolve the phone's canonical row (telephone, else a legacy quick-login
+    # ``guest_{phone}`` row). Without this, a phone that used quick-login first
+    # (telephone left NULL) fails the telephone lookup, matches its own
+    # ``guest_{phone}`` row as a foreign username owner, and is wrongly told the
+    # username is taken.
+    user = await _find_guest_sms_user_by_phone(session, telephone)
     # Keep the lookup on ``execute`` so lightweight/test sessions and the
     # production AsyncSession share the same SQLAlchemy contract.
     username_result = await session.execute(select(User).where(User.username == username))
@@ -586,15 +646,16 @@ async def guest_sms_login(
     if not code_ok:
         return {"success": False, "error": code_error}
 
-    username = _guest_username(telephone)
-    result = await session.execute(select(User).where(User.username == username))
-    user = result.scalar_one_or_none()
+    user = await _find_guest_sms_user_by_phone(session, telephone)
     now = datetime.now()
 
     if user is None:
         user = User(
             user_id=str(uuid.uuid4()),
-            username=username,
+            username=_guest_username(telephone),
+            # Persist the phone so register and later logins converge on one
+            # identity instead of forking a second passwordless account.
+            telephone=telephone,
             password=None,
             email=None,
             api_key=f"guest_sms_{secrets.token_urlsafe(24)}",
@@ -609,28 +670,35 @@ async def guest_sms_login(
     else:
         if not user.is_active:
             return {"success": False, "error": "账户已被禁用"}
-        if not _is_trusted_guest_sms_user(user, telephone):
+        if not _is_trusted_guest_sms_user(user):
             logger.warning(
                 "[Guest SMS] 拒绝登录流程合并其他认证来源账户: user_id=%s",
                 user.user_id,
             )
             return {"success": False, "error": "该手机号账户无法使用短信登录"}
+        values: dict = {"last_login": now, "updated_at": now}
+        # Backfill a legacy quick-login row matched only by username. The
+        # telephone lookup returned nothing, so no other row owns this number.
+        if not getattr(user, "telephone", None):
+            values["telephone"] = telephone
         await session.execute(
-            update(User)
-            .where(User.user_id == user.user_id)
-            .values(last_login=now, updated_at=now)
+            update(User).where(User.user_id == user.user_id).values(**values)
         )
+        if "telephone" in values:
+            user.telephone = telephone
         await session.flush()
 
     await session.commit()
-    display_name = _mask_phone(telephone)
+    display_name = (
+        str(getattr(user, "display_name", "") or "").strip() or _mask_phone(telephone)
+    )
     token = await _issue_auth_token(redis_client, user, display_name)
     return {
         "success": True,
         "token": token,
         "user": {
             "user_id": user.user_id,
-            "username": username,
+            "username": user.username,
             "display_name": display_name,
             "role": user.role or "user",
             "is_active": user.is_active,

@@ -1,0 +1,23 @@
+[Unit]
+Description=RADAI production incremental deployment from origin/production
+Wants=network-online.target
+After=network-online.target
+ConditionPathIsDirectory=/home/inspur/myenv/runtime/doc-agent-production/source.git
+ConditionPathIsSymbolicLink=/home/inspur/myenv/runtime/doc-agent-production/current
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/inspur/myenv/runtime/doc-agent-production
+Environment=DOC_AGENT_PRODUCTION_RUNTIME_ROOT=/home/inspur/myenv/runtime/doc-agent-production
+Environment=DOC_AGENT_PRODUCTION_BRANCH=production
+Environment=DOC_AGENT_PRODUCTION_GIT_CREDENTIAL_FILE=/home/inspur/myenv/runtime/doc-agent-production/config/git-auth/credentials
+ExecStart=/home/inspur/myenv/runtime/doc-agent-production/bin/deploy-release.sh automatic
+TimeoutStartSec=3h
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+RestrictSUIDSGID=true

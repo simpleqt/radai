@@ -1,0 +1,13 @@
+[Unit]
+Description=Check RADAI production health every five minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=1min
+RandomizedDelaySec=30s
+Persistent=false
+Unit=doc-agent-production-healthcheck.service
+
+[Install]
+WantedBy=timers.target

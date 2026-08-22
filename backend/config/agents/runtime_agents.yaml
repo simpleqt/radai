@@ -43,6 +43,7 @@ agents:
       - web_search
       - chat_file_search
       - read_context_artifact
+      - context_read
       - read_local_skill_file
     required_tools: []
     disallowed_tools:
@@ -70,6 +71,7 @@ agents:
     allowed_tools:
       - multi_kb_search
       - chat_file_search
+      - execute_python
       - list_experiment_datasets
       - inspect_excel_data
       - query_excel_data
@@ -85,6 +87,7 @@ agents:
       - groundwater_prediction
       - web_search
       - read_context_artifact
+      - context_read
       - read_local_skill_file
     required_tools: []
     disallowed_tools:
@@ -117,6 +120,7 @@ agents:
       - chat_file_search
       - academic_search
       - read_context_artifact
+      - context_read
       - read_local_skill_file
     required_tools: []
     disallowed_tools:
@@ -148,6 +152,7 @@ agents:
       - web_search
       - chat_file_search
       - read_context_artifact
+      - context_read
       - read_local_skill_file
     required_tools: []
     disallowed_tools:
@@ -179,6 +184,7 @@ agents:
       - web_search
       - chat_file_search
       - read_context_artifact
+      - context_read
       - read_local_skill_file
     required_tools: []
     disallowed_tools:
@@ -249,7 +255,9 @@ agents:
       - chat_file_search
       - academic_search
       - read_context_artifact
+      - context_read
       - read_local_skill_file
+      - execute_python
       - list_experiment_datasets
       - inspect_excel_data
       - query_excel_data
@@ -348,6 +356,7 @@ agents:
       - read_local_skill_file
       - chat_file_search
       - read_context_artifact
+      - context_read
     required_tools: []
     disallowed_tools:
       - task
@@ -384,7 +393,9 @@ agents:
       - chat_file_search
       - academic_search
       - read_context_artifact
+      - context_read
       - read_local_skill_file
+      - execute_python
       - list_experiment_datasets
       - inspect_excel_data
       - query_excel_data

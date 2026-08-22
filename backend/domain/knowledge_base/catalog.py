@@ -13,3 +13,7 @@ class KnowledgeBaseCatalogEntry:
     owner_id: str | None
     is_default: bool
     status: str
+    ingestion_backend: str | None = None
+    retrieval_backend: str | None = None
+    self_ingestion_enabled: bool | None = None
+    self_retriever_enabled: bool | None = None

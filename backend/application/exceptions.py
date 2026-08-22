@@ -23,17 +23,3 @@ class AuthenticationUnavailable(ApplicationError):
     error_code = "authentication_unavailable"
 
 
-class UpstreamServiceError(ApplicationError):
-    """An external model or service failed while handling the request."""
-
-    status_code = 502
-    public_detail = "上游服务调用失败"
-    error_code = "upstream_service_error"
-
-
-class StorageUnavailable(ApplicationError):
-    """A required database or storage backend is unavailable."""
-
-    status_code = 503
-    public_detail = "存储服务暂时不可用"
-    error_code = "storage_unavailable"

@@ -1,10 +1,23 @@
 policies:
+  audit_default:
+    include:
+      - multi_kb_search
+      - chat_file_search
+      - read_context_artifact
+      - context_read
+      - web_search
+    include_when_skill_selected: {}
+    exclude: []
+
   ne_default:
     include:
       - multi_kb_search
       - chat_file_search
       - read_context_artifact
+      - context_read
       - web_search
+      - execute_python
+      - export_document
     include_when_skill_selected:
       academic-search:
         - academic_search
@@ -32,7 +45,10 @@ policies:
       - multi_kb_search
       - chat_file_search
       - read_context_artifact
+      - context_read
       - web_search
+      - execute_python
+      - export_document
     include_when_skill_selected:
       academic-search:
         - academic_search
@@ -58,6 +74,7 @@ policies:
       - multi_kb_search
       - chat_file_search
       - read_context_artifact
+      - context_read
       - web_search
       - groundwater_project_skill_read
       - groundwater_project_bootstrap
@@ -72,9 +89,19 @@ policies:
 
   fmca_default:
     include:
+      - multi_kb_search
       - chat_file_search
       - read_context_artifact
+      - context_read
       - web_search
+      - execute_python
+      - export_document
+      - generate_mechanics_diagram
+      - search_kb_images
+      - search_question_bank
+      - get_course_stats
+      - get_achievement
+      - load_previous_reports
     include_when_skill_selected:
       academic-search:
         - academic_search
@@ -95,5 +122,69 @@ policies:
         - visualize_excel_data
       deep-research:
         - save_deep_research_report
-    exclude:
+    exclude: []
+
+  landslide_default:
+    include:
       - multi_kb_search
+      - chat_file_search
+      - read_context_artifact
+      - context_read
+      - web_search
+    include_when_skill_selected: {}
+    exclude: []
+
+  course_eval_default:
+    include:
+      - multi_kb_search
+      - chat_file_search
+      - read_context_artifact
+      - context_read
+      - web_search
+      - execute_python
+      - export_document
+      - list_course_eval_tasks
+      - get_course_stats
+      - get_achievement
+      - suggest_goal_mapping
+      - draft_report_narrative
+      - check_report_quality
+      - load_previous_reports
+      - transition_task
+      - extract_grade_sheet
+      - extract_paper
+      - extract_syllabus
+      - run_validation
+      - compute_statistics
+      - generate_report
+      - export_report_pdf
+      - create_semester_task
+      - attach_material
+      - get_score_grid
+      - update_scores
+      - confirm_scores
+      - apply_mappings
+    include_when_skill_selected:
+      course-outcome-eval:
+        - list_course_eval_tasks
+        - get_course_stats
+        - get_achievement
+        - suggest_goal_mapping
+        - draft_report_narrative
+        - check_report_quality
+        - load_previous_reports
+        - transition_task
+        - extract_grade_sheet
+        - extract_paper
+        - extract_syllabus
+        - run_validation
+        - compute_statistics
+        - generate_report
+        - export_report_pdf
+        - create_semester_task
+        - attach_material
+        - get_score_grid
+        - update_scores
+        - confirm_scores
+        - apply_mappings
+    exclude: []

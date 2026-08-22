@@ -4,32 +4,7 @@
 """
 
 import logging
-
-
-class LoggerContext:
-    """日志上下文管理器"""
-
-    def __init__(self, logger: logging.Logger, **context):
-        self.logger = logger
-        self.context = context
-        self.old_adapter = None
-
-    def __enter__(self):
-        self.old_adapter = logging.LoggerAdapter
-        logging.LoggerAdapter = type(
-            "ContextAdapter",
-            (logging.LoggerAdapter,),
-            {
-                "process": lambda self, msg, kwargs: super(type(self), self).process(
-                    f"[{self.extra}] {msg}" if self.extra else msg, kwargs
-                )
-            },
-        )
-        return logging.LoggerAdapter(self.logger, self.context)
-
-    def __exit__(self, _exc_type, _exc_val, _exc_tb):
-        if self.old_adapter:
-            logging.LoggerAdapter = self.old_adapter
+import threading
 
 
 class LoggerFactory:
@@ -41,17 +16,22 @@ class LoggerFactory:
 
     _loggers: dict = {}
     _initialized: bool = False
+    _init_lock = threading.Lock()
 
     @classmethod
     def initialize(cls):
-        """初始化日志系统"""
+        """初始化日志系统(加锁:并发首次 get_logger 会双跑 setup_logging,
+        handler 清理与添加交错会产生重复 handler 导致日志双写)。"""
         if cls._initialized:
             return
+        with cls._init_lock:
+            if cls._initialized:
+                return
 
-        from backend.config.logging import setup_logging
+            from backend.config.logging import setup_logging
 
-        setup_logging()
-        cls._initialized = True
+            setup_logging()
+            cls._initialized = True
 
     @classmethod
     def get_logger(cls, name: str) -> logging.Logger:

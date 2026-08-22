@@ -27,7 +27,6 @@ def main(argv: list[str] | None = None) -> int:
         epilog="""
 示例:
   doc-agent run-api           # 启动 API 服务
-  doc-agent run-worker        # 启动 Worker
   doc-agent test              # 运行测试
   doc-agent format            # 格式化代码
   doc-agent lint              # 检查代码
@@ -57,18 +56,6 @@ def main(argv: list[str] | None = None) -> int:
         help="API Worker 数量（后台任务当前要求为 1）",
     )
 
-    # run-worker 命令
-    worker_parser = subparsers.add_parser("run-worker", help="启动 Worker")
-    worker_parser.add_argument("--workers", type=int, default=1, help="Worker 数量")
-
-    # run-ingest-worker 命令
-    ingest_worker_parser = subparsers.add_parser(
-        "run-ingest-worker", help="启动知识库入库 Worker"
-    )
-    ingest_worker_parser.add_argument(
-        "--workers", type=int, default=1, help="Worker 数量"
-    )
-
     # test 命令
     test_parser = subparsers.add_parser("test", help="运行测试")
     test_parser.add_argument("--cov", action="store_true", help="生成覆盖率报告")
@@ -89,15 +76,38 @@ def main(argv: list[str] | None = None) -> int:
     # init-db 命令
     subparsers.add_parser("init-db", help="初始化数据库")
 
-    # migrate 命令
+    # migrate 命令（参数契约必须与 backend.db.migrate 一致：--mark-existing 需要版本
+    # 参数且必须配合 --acknowledge-existing-schema，否则转发过去只会 argparse 报错）
     migrate_parser = subparsers.add_parser("migrate", help="运行数据库迁移")
-    migrate_parser.add_argument(
+    migrate_action = migrate_parser.add_mutually_exclusive_group()
+    migrate_action.add_argument(
         "--dry-run", action="store_true", help="只列出待执行迁移"
     )
-    migrate_parser.add_argument(
-        "--mark-existing",
+    migrate_action.add_argument(
+        "--check",
         action="store_true",
-        help="仅写入迁移基线，不执行迁移",
+        help="只读检查待执行迁移；存在待执行版本时返回状态码 3",
+    )
+    migrate_action.add_argument(
+        "--verify-package",
+        action="store_true",
+        help="离线校验迁移文件完整性，不连接数据库",
+    )
+    migrate_action.add_argument(
+        "--mark-existing",
+        action="append",
+        metavar="VERSION",
+        help="补记一个已人工核对结构的版本；可重复传入",
+    )
+    migrate_action.add_argument(
+        "--mark-all-existing",
+        action="store_true",
+        help="补记全部版本（仅适合已逐项核对的历史库）",
+    )
+    migrate_parser.add_argument(
+        "--acknowledge-existing-schema",
+        action="store_true",
+        help="确认已核对目标库实际结构，仅与补记命令一起使用",
     )
 
     # seed 命令
@@ -105,6 +115,67 @@ def main(argv: list[str] | None = None) -> int:
 
     # clean 命令
     subparsers.add_parser("clean", help="清理临时文件")
+
+    # context-objects-gc 命令
+    gc_parser = subparsers.add_parser(
+        "context-objects-gc",
+        help="清理过期上下文对象（COS）",
+    )
+    gc_parser.add_argument(
+        "--ttl-seconds",
+        type=int,
+        default=None,
+        help="覆盖 CONTEXT_OBJECT_TTL_SECONDS；0 表示禁用过期清理",
+    )
+    gc_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只列出将清理的对象，不删除",
+    )
+
+    # checkpoints-gc 命令
+    ckpt_gc_parser = subparsers.add_parser(
+        "checkpoints-gc",
+        help="按线程保留最近 N 个 LangGraph 检查点，清理更早的历史版本",
+    )
+    ckpt_gc_parser.add_argument(
+        "--db-path",
+        default=None,
+        help="checkpoints.db 路径（默认 AGENT_CHECKPOINT_DATA_DIR 或 backend/data）",
+    )
+    ckpt_gc_parser.add_argument(
+        "--keep-per-thread",
+        type=int,
+        default=None,
+        help="每个 (thread_id, checkpoint_ns) 保留的最近检查点数量（默认 50，最小 1）",
+    )
+    ckpt_gc_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只统计将删除的行数，不执行删除",
+    )
+    ckpt_gc_parser.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="删除后执行 VACUUM 回收磁盘空间（会短暂阻塞并发写入）",
+    )
+
+    # context-accounting-report 命令
+    accounting_parser = subparsers.add_parser(
+        "context-accounting-report",
+        help="只读聚合各会话最新检查点的上下文预算/记账数据（COS 评估用）",
+    )
+    accounting_parser.add_argument(
+        "--db-path",
+        default=None,
+        help="checkpoints.db 路径（默认 AGENT_CHECKPOINT_DATA_DIR 或 backend/data）",
+    )
+    accounting_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="最多聚合的会话线程数（默认全部）",
+    )
 
     # version 命令
     subparsers.add_parser("version", help="显示版本信息")
@@ -274,17 +345,33 @@ def main(argv: list[str] | None = None) -> int:
 
         import uvicorn
 
-        if not args.reload and args.workers != 1:
+        if (
+            not args.reload
+            and args.workers != 1
+            and args.service_role != "knowledge"
+        ):
             parser.error(
-                "run-api --workers 当前必须为 1：可重连智能体任务使用进程内注册表"
+                "run-api --workers 对 all/agent 角色必须为 1："
+                "可重连智能体任务使用进程内注册表"
             )
 
         os.environ["API_SERVICE_ROLE"] = args.service_role
+        if args.service_role == "knowledge" and args.workers > 1:
+            # Retrieval replicas must not each start the same mutating
+            # background schedulers. Ingestion remains in the dedicated worker.
+            os.environ["KNOWLEDGE_API_STATELESS_REPLICA"] = "true"
+        from backend.core.utils.client_ip import forwarded_allow_ips
+
         kwargs = {
             # Keep the knowledge service private when it is started on 127.0.0.1.
             "host": args.host,
             "port": args.port,
             "reload": args.reload,
+            # Pin who may rewrite the client address instead of depending on the
+            # server default or an ambient FORWARDED_ALLOW_IPS value: the
+            # resolved address drives rate limiting, login blocking and audit.
+            "proxy_headers": True,
+            "forwarded_allow_ips": forwarded_allow_ips(),
         }
 
         if args.reload:
@@ -302,20 +389,6 @@ def main(argv: list[str] | None = None) -> int:
             kwargs["workers"] = args.workers
 
         uvicorn.run("backend.api.http_server:app", **kwargs)
-
-    elif args.command == "run-worker":
-        import asyncio
-
-        from backend.worker.task_worker import run_worker
-
-        asyncio.run(run_worker())
-
-    elif args.command == "run-ingest-worker":
-        import asyncio
-
-        from backend.worker.ingest_worker import run_worker
-
-        asyncio.run(run_worker())
 
     elif args.command == "test":
         cmd = [sys.executable, "-m", "pytest", args.path, "-v"]
@@ -350,8 +423,16 @@ def main(argv: list[str] | None = None) -> int:
         cmd = [sys.executable, "-m", "backend.db.migrate"]
         if args.dry_run:
             cmd.append("--dry-run")
-        if args.mark_existing:
-            cmd.append("--mark-existing")
+        if args.check:
+            cmd.append("--check")
+        if args.verify_package:
+            cmd.append("--verify-package")
+        for version in args.mark_existing or []:
+            cmd.extend(["--mark-existing", version])
+        if args.mark_all_existing:
+            cmd.append("--mark-all-existing")
+        if args.acknowledge_existing_schema:
+            cmd.append("--acknowledge-existing-schema")
         return _run_commands(cmd)
 
     elif args.command == "seed":
@@ -359,6 +440,66 @@ def main(argv: list[str] | None = None) -> int:
 
     elif args.command == "clean":
         return _run_commands(["make", "clean"])
+
+    elif args.command == "context-objects-gc":
+        from backend.core.agents.context.object_store import ContextObjectStore
+
+        store = ContextObjectStore(object_ttl_seconds=args.ttl_seconds)
+        if args.dry_run:
+            entries = store.scan()
+            print(
+                json.dumps(
+                    {"dry_run": True, "objects": entries},
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+            return 0
+        report = store.gc(ttl_seconds=args.ttl_seconds)
+        print(json.dumps(report, ensure_ascii=False, default=str))
+        return 0
+
+    elif args.command == "checkpoints-gc":
+        from backend.application.checkpointing.gc import (
+            DEFAULT_KEEP_PER_THREAD,
+            gc_sqlite_checkpoints,
+            resolve_default_checkpoint_db,
+        )
+
+        db_path = args.db_path or str(resolve_default_checkpoint_db())
+        try:
+            report = gc_sqlite_checkpoints(
+                db_path,
+                keep_per_thread=(
+                    args.keep_per_thread
+                    if args.keep_per_thread is not None
+                    else DEFAULT_KEEP_PER_THREAD
+                ),
+                dry_run=args.dry_run,
+                vacuum=args.vacuum,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 1
+        print(json.dumps(report.as_dict(), ensure_ascii=False))
+        return 0
+
+    elif args.command == "context-accounting-report":
+        from backend.application.checkpointing.accounting_report import (
+            collect_context_accounting,
+        )
+        from backend.application.checkpointing.gc import (
+            resolve_default_checkpoint_db,
+        )
+
+        db_path = args.db_path or str(resolve_default_checkpoint_db())
+        try:
+            report = collect_context_accounting(db_path, limit=args.limit)
+        except (FileNotFoundError, ValueError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 1
+        print(json.dumps(report.as_dict(), ensure_ascii=False))
+        return 0
 
     elif args.command == "version":
         return _run_commands(["make", "version"])

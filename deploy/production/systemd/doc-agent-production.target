@@ -1,0 +1,15 @@
+[Unit]
+Description=Document Agent Production Stack
+Wants=doc-agent-prod-agent-api.service
+Wants=doc-agent-prod-guest-api.service
+Wants=doc-agent-prod-knowledge-api.service
+Wants=doc-agent-prod-task-worker.service
+Wants=doc-agent-prod-ingest-worker.service
+Wants=doc-agent-prod-frontend-5173.service
+Wants=doc-agent-prod-frontend-5177.service
+Wants=doc-agent-prod-frontend-5174.service
+Wants=doc-agent-prod-frontend-5176.service
+After=network-online.target
+
+[Install]
+WantedBy=default.target

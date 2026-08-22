@@ -24,9 +24,9 @@
 
 ## 一、现状分析
 
-> **与仓库对齐说明**（`backend/core/models/factory.py`、`backend/api/routers/rag.py`、`backend/db/connection.py`）：对话实例创建与「模型列表」接口**当前不是同一条数据源**，实施方案必须把两条链路统一到 DB（或明确仍以 YAML 为工厂兜底、以 DB 仅为列表源时的边界）。
+> 本节保留改造前的数据源问题作为历史背景。当前实现见 §4、§6 和 [模型管理模块文档](./docs_backend/model_management_module.md)：模型工厂与 `/api/v1/rag/models` 都优先读取 MySQL，`config.yaml` / settings 仅作降级兜底。
 
-### 1.1 当前模型配置方式
+### 1.1 改造前基线（历史）
 
 | 链路 | 代码入口 | 实际数据源 | 用途 |
 |------|-----------|------------|------|
@@ -56,7 +56,7 @@ config.yaml ──► get_app_config() / ModelConfig ──► factory.create_ch
 settings.get_available_models() ──► GET /api/v1/rag/models ──► 前端 <select> 模型下拉
 ```
 
-**目标（本方案）**：`llm_models`（`usage_scope='chat'`）作为**唯一事实源**；`GET /api/v1/rag/models` 与 `create_chat_model`（在 DB 模式下）均优先读 DB；`config.yaml` / `settings` 仅作降级兜底。
+**当前结果**：`llm_models`（`usage_scope='chat'`）是默认主数据源；`GET /api/v1/rag/models` 与 `create_chat_model`（`MODEL_CONFIG_SOURCE=db`，默认）均优先读 DB，`config.yaml` / `settings` 作为明确的降级兜底，因此并非严格意义上的“唯一事实源”。
 
 ### 1.3 与仓库基础设施对齐（实施时注意）
 
@@ -66,7 +66,7 @@ settings.get_available_models() ──► GET /api/v1/rag/models ──► 前�
 | 表结构迁移 | 仓库内**未检出 Alembic**；`init_db()` 使用 `Base.metadata.create_all` | DDL 可随代码发布执行，或与 `create_all` 同步；若团队规范强制 Alembic，需**单独引入**后再改文档流程 |
 | Redis | `backend/db/redis.py`：`get_redis()` 用 `redis_host` / `redis_port` / `redis_password` / `redis_db` **拼接 URL**，无 `settings.redis_url` | Pub/Sub 示例应复用该拼接逻辑或 `get_redis()`，勿假设 `redis_url` 字段 |
 | RAG 路由前缀 | `http_server.py`：`rag_router` 挂载在 **`/api/v1/rag`** | 文档中路径保持 `/api/v1/rag/models` |
-| 管理端前端 | 已有 `frontend/src/views/admin/`（dashboard、知识库等），**尚无**模型管理页 | 新增路由与菜单项，与现有 `AdminLayout` 集成 |
+| 管理端前端 | `frontend/src/views/admin/platform.vue` 已提供模型列表、新增、编辑、启停和删除 | 继续沿用 `AdminLayout` 下的 `/admin/platform` 页面 |
 
 ### 1.4 现有 config.yaml 模型字段
 
@@ -117,7 +117,7 @@ CREATE TABLE `llm_models` (
   `model`           VARCHAR(100)    NOT NULL                 COMMENT '实际模型名称（传给 API 的 model 参数）',
 
   -- API 连接配置
-  `api_key`         VARCHAR(500)    NOT NULL                 COMMENT 'API Key（加密存储，见 2.3 节）',
+  `api_key`         VARCHAR(500)    NOT NULL                 COMMENT 'API Key（环境变量引用或列内值，见 2.3 节）',
   `base_url`        VARCHAR(500)    NOT NULL                 COMMENT 'API Base URL',
   `api_key_env_var` VARCHAR(100)    DEFAULT NULL             COMMENT 'API Key 环境变量名（如 DASHSCOPE_API_KEY，优先从环境变量读取）',
   `base_url_env_var`VARCHAR(100)    DEFAULT NULL             COMMENT 'Base URL 环境变量名（如 DASHSCOPE_API_BASE，优先从环境变量读取）',
@@ -188,18 +188,20 @@ CREATE TABLE `llm_model_access` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='模型访问权限表';
 ```
 
-### 2.3 API Key 加密策略
+### 2.3 API Key 存储策略
 
 | 方案 | 说明 | 推荐 |
 |------|------|------|
-| **A. 环境变量引用** | `api_key` 字段存 `$DASHSCOPE_API_KEY`，运行时从 env 解析 | ✅ 推荐，与现有 config.yaml 兼容 |
-| **B. AES 加密存储** | `api_key` 字段存加密密文，解密密钥从 env 读取 | 适合多租户场景 |
-| **C. 明文存储** | 仅限内网/开发环境 | ❌ 不推荐 |
+| **A. 环境变量引用** | `api_key` 字段存 `$DASHSCOPE_API_KEY`，或填写 `api_key_env_var`，运行时从 env 解析 | ✅ 当前推荐，与现有 config.yaml 兼容 |
+| **B. 原样存储** | 非 `$` 值当前按列内值直接使用，管理 API 返回时掩码 | 已实现，适合内网/开发环境 |
+| **C. AES 加密存储** | `api_key` 字段存加密密文，解密密钥从 env 读取 | 尚未实现，适合后续多租户增强 |
 
-**推荐方案 A + B 混合**：
+**当前实现**（`backend/db/models/llm_model.py`）：
 - 如果 `api_key` 以 `$` 开头 → 视为环境变量引用，运行时解析
-- 否则 → 视为 AES 加密密文，用 `MODEL_ENCRYPT_KEY` 环境变量解密
-- 管理接口写入时自动加密，读取时自动解密
+- 否则 → 直接使用列内值
+- 如果 `api_key` 为空，再回退 `api_key_env_var` 指向的环境变量
+- `base_url` 同样支持 `$ENV` 与 `base_url_env_var` 兜底
+- 管理接口返回 `api_key` 时只返回掩码；更新时传空值或包含 `***` 会保留原密钥
 
 ---
 
@@ -260,7 +262,7 @@ class LlmModel(Base):
     model = Column(String(100), nullable=False, comment="实际模型名称")
 
     # API 连接配置
-    api_key = Column(String(500), nullable=False, comment="API Key（加密或环境变量引用）")
+    api_key = Column(String(500), nullable=False, comment="API Key（环境变量引用或列内值）")
     base_url = Column(String(500), nullable=False, comment="API Base URL")
     api_key_env_var = Column(String(100), nullable=True, comment="API Key 环境变量名")
     base_url_env_var = Column(String(100), nullable=True, comment="Base URL 环境变量名")
@@ -312,7 +314,7 @@ class LlmModel(Base):
         if raw.startswith("$"):
             env_var = raw[1:]
             return os.environ.get(env_var, raw)
-        # TODO: 如果配置了 MODEL_ENCRYPT_KEY，尝试 AES 解密
+        # 当前实现：非 $ENV 的值按列内值直接使用；AES 可作为后续增强
         return raw
 
     def resolve_base_url(self) -> str:
@@ -385,32 +387,30 @@ class LlmModelAccess(Base):
 
 ## 四、后端改造方案
 
-### 4.1 新增 API 端点
+### 4.1 当前 API 端点
 
 在 `backend/api/routers/` 下新增 `models.py`：
 
 ```
-GET    /api/v1/models              # 获取前端可用对话模型列表（usage_scope=chat，供下拉框）
-GET    /api/v1/models/{id}         # 获取单个模型详情
+GET    /api/v1/models              # 管理端按 usage_scope 获取模型配置列表
 POST   /api/v1/models              # 新增模型（管理员）
 PUT    /api/v1/models/{id}         # 更新模型（管理员）
 DELETE /api/v1/models/{id}         # 删除模型（管理员）
 POST   /api/v1/models/{id}/toggle  # 启用/禁用模型（管理员）
-POST   /api/v1/models/{id}/default # 设为默认模型（管理员）
-POST   /api/v1/models/sort         # 批量调整排序（管理员）
 ```
+
+以上接口均要求管理员权限；`GET /api/v1/models` 是管理端完整列表，不是普通用户的前端下拉接口。对话页的可用模型列表由 `GET /api/v1/rag/models` 提供。默认模型和排序通过 `PUT /api/v1/models/{id}` 更新 `is_default`、`sort_order`，当前没有独立的 `/{id}/default` 或 `/sort` 路由。
 
 **关键接口设计**：
 
 ```python
-# GET /api/v1/models — 前端调用，只返回 is_active 且 usage_scope='chat' 的模型
-@router.get("/models")
-async def list_models(user_id: str | None = None):
-    """获取可用模型列表（前端下拉框用）"""
-    # 1. 查询 is_active=True 的模型，按 sort_order 排序
-    # 2. 如果有 llm_model_access 表，按 user_id/role 过滤
-    # 3. 返回 { models: [...], default_model: "xxx" }
-    # 4. api_key 不返回给前端，只返回 id/name/display_name/provider/description/supports_*
+# GET /api/v1/models — 管理端调用，可按 usage_scope 查询，密钥字段返回掩码
+@router.get("")
+async def list_admin_models(
+    usage_scope: str = "chat",
+    admin: ApiKeyAuth = Depends(require_admin),
+):
+    """获取指定 scope 的管理端模型列表。"""
 ```
 
 ```python
@@ -419,7 +419,7 @@ async def list_models(user_id: str | None = None):
 async def create_model(request: ModelCreateRequest, admin: AdminAuth):
     """新增模型配置"""
     # 1. 校验 (name, usage_scope) 唯一性（本期 usage_scope 固定 chat）
-    # 2. 如果 api_key 不是 $ 开头，自动 AES 加密后存储
+    # 2. api_key 可填写 $ENV；非 $ 值当前按列内值保存，响应时掩码
     # 3. 如果 is_default=True，先清除其他模型的 is_default
     # 4. 插入记录
     # 5. 刷新内存缓存
@@ -751,7 +751,7 @@ async def _subscribe_model_changes():
 1. ✅ 执行 DDL 创建 `llm_models` 表（含 `usage_scope`，默认 `chat`）；或合并进现有 `init_db()` / `create_all` 流程（仓库当前无 Alembic 目录）
 2. ✅ 新增 `backend/db/models/llm_model.py` ORM 定义
 3. ✅ 在 `backend/db/models/__init__.py` 中 import 新模型并导出
-4. ✅ 编写并执行数据迁移脚本 `migrate_models_to_db.py`（从 `config.yaml` 的 `models` 导入，`usage_scope='chat'`）；与现网 `AVAILABLE_MODELS` 列表差异需在上线核对
+4. ✅ 已提供 `backend/scripts/migrate_models_to_db.py`（从 `config.yaml` 的 `models` 导入，`usage_scope='chat'`）；是否已在目标数据库执行需由部署环境单独确认
 5. ✅ 验证数据完整性
 
 ### Phase 2：后端 API + 工厂改造（2-3 天）
@@ -760,22 +760,22 @@ async def _subscribe_model_changes():
 2. ✅ 改造 `factory.py`：优先从 DB 读取（**仅对话**；不按本期方案改知识库流水线）
 3. ✅ 改造 `GET /api/v1/rag/models`：优先从 DB 读取**对话模型**（`usage_scope='chat'`）
 4. ✅ 实现缓存层（进程内 + Redis Pub/Sub）
-5. ✅ API Key 加密/解密工具
+5. ⚠️ API Key 当前支持环境变量引用、列内值与返回掩码；AES 加密/解密工具尚未落地
 6. ✅ 单元测试
 
 ### Phase 3：前端管理页面（2-3 天）
 
 1. ✅ 模型管理页面（列表/新增/编辑/删除）
-2. ✅ 模型选择组件增强（图标/标签/描述）
-3. ✅ API Key 测试连接功能
-4. ✅ 排序拖拽
+2. ✅ 对话模型选择读取 Agent Info 的 `available_models`
+3. 📋 API Key 测试连接功能尚无专用后端端点和前端操作
+4. 📋 模型排序拖拽尚未实现；`sort_order` 字段可由 API 更新，但当前模型编辑表单未暴露该输入
 
 ### Phase 4：灰度切换 + 清理（1 天）
 
 1. ✅ 环境变量 `MODEL_CONFIG_SOURCE=db|yaml` 控制切换
-2. ✅ 灰度验证：先切一台 Worker 到 DB 模式
-3. ✅ 全量切换
-4. ✅ 清理 config.yaml 中的 models 段（保留为兜底注释）
+2. 📋 灰度验证属于部署动作，代码仓库无法证明已在目标环境完成
+3. 📋 全量切换属于部署动作，需按实际环境确认
+4. ⏸ `backend/config.yaml` 中仍保留 `models` 段，作为数据库未命中或不可用时的 fallback
 
 ---
 
@@ -809,8 +809,8 @@ async def _subscribe_model_changes():
 
 ## 十、安全注意事项
 
-1. **API Key 不返回前端**：`GET /api/v1/models` 只返回 `id/name/display_name/provider/description/supports_*`，绝不返回 `api_key`
+1. **API Key 掩码返回**：`GET /api/v1/models` 仅供管理员使用；响应保留 `api_key` 字段，但只返回首尾字符掩码，不返回完整密钥
 2. **管理接口鉴权**：CRUD 接口需管理员权限（`role=admin`）
-3. **API Key 加密存储**：非环境变量引用的 Key 使用 AES-256-GCM 加密
-4. **操作审计**：所有增删改操作记录 `created_by/updated_by`
+3. **API Key 存储边界**：优先使用 `$ENV` 或 `api_key_env_var`；非环境变量引用的 Key 当前仍为列内值，AES-256-GCM 加密需后续实现
+4. **操作审计**：创建、更新、删除和启停通过 `write_admin_audit()` 写入管理员审计日志；ORM 的 `created_by/updated_by` 字段当前未由该路由主动赋值
 5. **SQL 注入防护**：使用 SQLAlchemy ORM，参数化查询

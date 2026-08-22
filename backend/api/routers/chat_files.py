@@ -10,16 +10,22 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import ipaddress
-import socket
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlunparse
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
@@ -28,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.api.routers.auth import get_current_user
 from backend.api.upload_utils import UploadTooLargeError, read_upload_with_limit
 from backend.config.loggers import get_logger
+from backend.config.runtime_security import public_base_url
 from backend.db.connection import get_async_session
 from backend.db.models import SessionFile, User, UserFile
 from backend.services.chat_file_metadata import (
@@ -35,6 +42,9 @@ from backend.services.chat_file_metadata import (
 )
 from backend.services.chat_file_metadata import (
     build_chat_image_signature as _build_chat_image_signature,
+)
+from backend.services.remote_fetch import (
+    resolve_public_remote_target as _resolve_public_remote_target,
 )
 from backend.services.user_file_service import (
     ALLOWED_UPLOAD_EXTENSIONS,
@@ -77,11 +87,11 @@ class ChatFileUploadResult(BaseModel):
     # vision / context / indexed / none
     strategy: str
     message: str
-    error: Optional[str] = None
+    error: str | None = None
     # 多模态文件的 MIME 类型
-    mime_type: Optional[str] = None
+    mime_type: str | None = None
     # 短文档内容（用于前端立即预览）
-    content_preview: Optional[str] = None
+    content_preview: str | None = None
     table_analysis_enabled: bool = False
 
 
@@ -104,7 +114,7 @@ def _build_chat_file_image_url(
     thread_id: str,
     expires_in: int = CHAT_FILE_IMAGE_URL_TTL_SECONDS,
 ) -> str:
-    base_url = str(request.base_url).rstrip("/")
+    base_url = public_base_url(request)
     expires_at = int(time.time()) + max(60, expires_in)
     sig = _build_chat_image_signature(
         file_id=file_id,
@@ -116,6 +126,19 @@ def _build_chat_file_image_url(
     return (
         f"{base_url}/api/v2/chat-files/{quote(file_id)}/images/{quote(image_name, safe='')}"
         f"?exp={expires_at}&sig={sig}"
+    )
+
+
+def _image_object_owned_by(object_name: str | None, owner_user_id: str) -> bool:
+    """Only trust a DB storage_object that stays under this owner's prefixes."""
+
+    normalized = str(object_name or "").strip().lstrip("/")
+    if not normalized or any(
+        part in {"", ".", ".."} for part in normalized.split("/")
+    ):
+        return False
+    return normalized.startswith(
+        (f"users/{owner_user_id}/", f"chat_files/{owner_user_id}/")
     )
 
 
@@ -131,6 +154,17 @@ def _verify_chat_file_image_url(
     if not exp or not sig:
         return False
     if exp < int(time.time()):
+        return False
+    # Fail closed on an empty signing key: an empty secret makes the HMAC
+    # locally forgeable (matching verify_chart_signature).
+    from backend.config.settings import settings
+
+    from backend.services.url_signing import url_signing_secret
+
+    # 实际 HMAC 密钥来自 url_signing_secret()（URL_SIGNING_SECRET →
+    # internal_api_secret → minio_secret_key）；守卫必须判同一来源，
+    # 否则"配了独立签名密钥、minio 密钥为空"时签名成功验证全拒。
+    if not (url_signing_secret() or "").strip():
         return False
     expected = _build_chat_image_signature(
         file_id=file_id,
@@ -159,13 +193,38 @@ async def _materialize_remote_image_urls(
     async with httpx.AsyncClient(trust_env=False, timeout=60.0, follow_redirects=False) as client:
         for idx, item in enumerate(image_urls[:MAX_REMOTE_IMAGES_PER_FILE], start=1):
             raw_url = str(item.get("url") or "").strip()
-            if not await _is_public_remote_url(raw_url):
+            pinned = await _resolve_public_remote_target(raw_url)
+            if pinned is None:
                 continue
+            pinned_ip, pinned_host, pinned_port = pinned
             try:
-                async with client.stream("GET", raw_url) as response:
+                parsed = urlparse(raw_url)
+                # 连接到校验通过的 IP(不让 httpx 二次解析主机名),消除
+                # DNS-rebinding TOCTOU;Host 头 + TLS SNI 仍用原主机名以保证
+                # 虚拟主机路由与证书校验正确。
+                host_netloc = (
+                    f"[{pinned_ip}]" if ":" in pinned_ip else pinned_ip
+                )
+                pinned_url = urlunparse(
+                    parsed._replace(netloc=f"{host_netloc}:{pinned_port}")
+                )
+                default_port = 443 if parsed.scheme == "https" else 80
+                host_header = (
+                    pinned_host
+                    if pinned_port == default_port
+                    else f"{pinned_host}:{pinned_port}"
+                )
+                async with client.stream(
+                    "GET",
+                    pinned_url,
+                    headers={"Host": host_header},
+                    extensions={"sni_hostname": pinned_host},
+                ) as response:
                     response.raise_for_status()
                     content_type_header = str(response.headers.get("content-type") or "")
-                    if content_type_header and not content_type_header.lower().startswith("image/"):
+                    # 缺失 content-type 一律拒绝:否则无 content-type 的内网端点
+                    # 响应会被兜底为 image/png 存储并经签名 URL 回传(数据外带)。
+                    if not content_type_header.lower().startswith("image/"):
                         raise ValueError("远程资源不是图片")
                     declared_size = int(response.headers.get("content-length") or 0)
                     if declared_size > MAX_REMOTE_IMAGE_SIZE:
@@ -226,32 +285,6 @@ async def _materialize_remote_image_urls(
     return materialized
 
 
-async def _is_public_remote_url(raw_url: str) -> bool:
-    """Reject local/private targets before MinerU image materialization."""
-    try:
-        parsed = urlparse(raw_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            return False
-        if parsed.username or parsed.password:
-            return False
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        infos = await asyncio.get_running_loop().getaddrinfo(
-            parsed.hostname,
-            port,
-            type=socket.SOCK_STREAM,
-        )
-    except (OSError, ValueError):
-        return False
-    for info in infos:
-        try:
-            address = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            return False
-        if not address.is_global:
-            return False
-    return bool(infos)
-
-
 # ── 端点实现 ─────────────────────────────────────────────
 
 @router.post("/upload", response_model=dict)
@@ -259,7 +292,7 @@ async def upload_chat_files(
     request: Request,
     thread_id: str = Form(..., description="会话线程 ID"),
     parse_mode: str = Form("auto", description="解析方式：auto | mineru"),
-    files: List[UploadFile] = File(..., description="上传的文件列表"),
+    files: list[UploadFile] = File(..., description="上传的文件列表"),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ):
@@ -279,7 +312,7 @@ async def upload_chat_files(
         )
 
     index_manager = get_index_manager()
-    results: List[ChatFileUploadResult] = []
+    results: list[ChatFileUploadResult] = []
     effective_parse_mode = str(parse_mode or "auto").strip().lower()
     if effective_parse_mode not in {"auto", "mineru"}:
         raise HTTPException(status_code=400, detail="parse_mode 仅支持 auto 或 mineru")
@@ -329,7 +362,9 @@ async def upload_chat_files(
             if parse_result.category != "long_doc" or not parse_result.content:
                 return
             try:
-                index = index_manager.get_or_create(thread_id, user_id=user.user_id)
+                index = await index_manager.get_or_create_async(
+                    thread_id, user_id=user.user_id
+                )
                 chunk_count = await asyncio.to_thread(
                     index.add_document,
                     file_id=file_id,
@@ -589,8 +624,12 @@ async def get_chat_file_image(
     ):
         raise HTTPException(status_code=403, detail="图片访问签名无效或已过期")
 
+    # The DB-provided storage_object is the only untrusted candidate; a row
+    # whose metadata points outside this owner's prefixes must not be read
+    # (the two derived candidates below are owner-scoped by construction).
+    db_object = target.get("storage_object")
     candidate_objects = [
-        target.get("storage_object"),
+        db_object if _image_object_owned_by(db_object, row.owner_user_id) else None,
         f"users/{row.owner_user_id}/threads/{row.thread_id}/chat-files/{file_id}/images/{image_name}",
         f"chat_files/{row.owner_user_id}/{file_id}/images/{image_name}",
     ]
@@ -616,6 +655,6 @@ async def get_chat_file_image(
         media_type=media_type,
         headers={
             "Cache-Control": "public, max-age=86400",
-            "Content-Disposition": f'inline; filename="{image_name}"',
+            "Content-Disposition": f'inline; filename="{(image_name or "").replace(chr(34), chr(39)).replace(chr(92), "_")}"',
         },
     )

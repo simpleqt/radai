@@ -234,6 +234,9 @@ class SkillManagementService:
         object_name = (
             f"skills/packages/{skill.skill_id}/{version_id}/{package.skill_key}-{package.version}.zip"
         )
+        # zip 上传 MinIO 是秒级网络 IO：先提交当前状态归还池连接，期间不钉
+        # 住 MySQL 连接（expire_on_commit=False，已加载对象仍可用）。
+        await session.commit()
         await self.storage.upload(object_name=object_name, content=content)
         manifest = dict(package.manifest)
         manifest["package_root_prefix"] = package.root_prefix
@@ -361,7 +364,7 @@ class SkillManagementService:
             )
         if version.skill_id != skill.skill_id:
             raise SkillManagementError("版本不属于当前 Skill", status_code=404)
-        url = self.storage.presigned_download(
+        url = await self.storage.presigned_download(
             bucket=version.package_bucket,
             object_name=version.package_object,
         )
